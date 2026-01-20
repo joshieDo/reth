@@ -4,5 +4,8 @@ mod invariants;
 mod metrics;
 mod provider;
 
-pub(crate) use provider::{PendingRocksDBBatches, RocksDBWriteCtx};
+#[allow(unused_imports)]
+pub(crate) use provider::{
+    PendingHistory, PendingHistoryWrites, PendingRocksDBBatches, RocksDBWriteCtx,
+};
 pub use provider::{RocksDBBatch, RocksDBBuilder, RocksDBProvider, RocksTx};

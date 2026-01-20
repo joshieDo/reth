@@ -14,6 +14,13 @@ use std::{path::Path, sync::Arc};
 /// Pending `RocksDB` batches type alias (stub - uses unit type).
 pub(crate) type PendingRocksDBBatches = Arc<Mutex<Vec<()>>>;
 
+/// Pending history writes (stub - empty struct).
+#[derive(Debug, Default)]
+pub(crate) struct PendingHistoryWrites;
+
+/// Pending history writes type alias (stub).
+pub(crate) type PendingHistory = Arc<Mutex<PendingHistoryWrites>>;
+
 /// Context for `RocksDB` block writes (stub).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -26,6 +33,8 @@ pub(crate) struct RocksDBWriteCtx {
     pub storage_settings: StorageSettings,
     /// Pending batches (stub - unused).
     pub pending_batches: PendingRocksDBBatches,
+    /// Pending history writes (stub - unused).
+    pub pending_history: PendingHistory,
 }
 
 /// A stub `RocksDB` provider.
