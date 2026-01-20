@@ -2,7 +2,6 @@
 
 use clap::Args;
 use reth_config::config::{BlocksPerFileConfig, StaticFilesConfig};
-use reth_provider::StorageSettings;
 
 /// Blocks per static file when running in `--minimal` node.
 ///
@@ -93,13 +92,5 @@ impl StaticFilesArgs {
                     .or(config.blocks_per_file.account_change_sets),
             },
         }
-    }
-
-    /// Converts the static files arguments into [`StorageSettings`].
-    pub const fn to_settings(&self) -> StorageSettings {
-        StorageSettings::legacy()
-            .with_receipts_in_static_files(self.receipts)
-            .with_transaction_senders_in_static_files(self.transaction_senders)
-            .with_account_changesets_in_static_files(self.account_changesets)
     }
 }
