@@ -591,7 +591,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 ctx.receipts_prune_mode
                     .is_some_and(|mode| mode.should_prune(block_number, ctx.tip))
             {
-                continue
+                continue;
             }
 
             for (i, receipt) in block.execution_outcome().receipts.iter().enumerate() {
