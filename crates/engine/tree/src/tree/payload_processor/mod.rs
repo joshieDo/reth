@@ -480,6 +480,12 @@ where
     ///
     /// The cache enables subsequent blocks to reuse account, storage, and bytecode data without
     /// hitting the database, maintaining performance consistency.
+    #[tracing::instrument(
+        name = "engine.cache.on_inserted_executed_block",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     pub fn on_inserted_executed_block(
         &self,
         block_with_parent: BlockWithParent,
@@ -530,6 +536,12 @@ where
 
 /// Converts transactions sequentially and sends them to the execute channel, and to the prewarm
 /// channel if there is one. Returns false on conversion failure or disconnection.
+#[tracing::instrument(
+    name = "engine.cache.convert_serial",
+    target = "lifecycle",
+    level = "debug",
+    skip_all
+)]
 fn convert_serial<RawTx, Tx, TxEnv, InnerTx, Recovered, Err, C>(
     iter: impl Iterator<Item = RawTx>,
     convert: &C,

@@ -232,6 +232,12 @@ where
         &self.provider
     }
 
+    #[tracing::instrument(
+        name = "state.overlay.state_trie_overlay",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn state_trie_overlay(&self) -> ProviderResult<&StateTrieOverlay>
     where
         Provider::Target: StageCheckpointReader
@@ -273,6 +279,12 @@ where
         Ok(self.state_trie_overlay.get().expect("state trie overlay was just initialized"))
     }
 
+    #[tracing::instrument(
+        name = "state.overlay.build_overlay",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn build_overlay(&self, input: TrieInputSorted) -> ProviderResult<TrieInputSorted>
     where
         Provider::Target: StageCheckpointReader
@@ -301,6 +313,12 @@ where
         Ok(TrieInputSorted::new(nodes, state, prefix_sets))
     }
 
+    #[tracing::instrument(
+        name = "state.overlay.execution_overlay",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn execution_overlay(
         &self,
     ) -> ProviderResult<(&Arc<ExecutionOverlay>, Option<&HistoricalFallback>)>

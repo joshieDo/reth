@@ -344,6 +344,12 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
     /// This returns the latest hash that has been saved, allowing removal of that block and any
     /// previous blocks from in-memory data structures. This value is returned in the receiver end
     /// of the sender argument.
+    #[tracing::instrument(
+        name = "storage.save_blocks",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     pub fn save_blocks(
         &self,
         input: SaveBlocksInput<T>,

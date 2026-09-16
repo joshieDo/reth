@@ -10728,10 +10728,13 @@ dependencies = [
 name = "reth-tracing"
 version = "2.5.2"
 dependencies = [
+ "blake3",
  "clap",
  "eyre",
+ "libc",
  "reth-tracing-otlp",
  "rolling-file",
+ "serde_json",
  "tracing",
  "tracing-appender",
  "tracing-chrome",

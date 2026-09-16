@@ -27,6 +27,9 @@ tracing-tracy = { workspace = true, optional = true }
 tracy-client = { workspace = true, optional = true }
 
 # misc
+blake3 = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true, features = ["std"] }
+libc = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"], optional = true }
 eyre = { workspace = true, optional = true }
 rolling-file = { workspace = true, optional = true }
@@ -34,6 +37,9 @@ rolling-file = { workspace = true, optional = true }
 [features]
 default = ["std", "otlp"]
 std = [
+    "dep:blake3",
+    "dep:serde_json",
+    "dep:libc",
     "tracing-subscriber",
     "tracing-appender",
     "tracing-chrome",
@@ -45,6 +51,7 @@ std = [
     "rolling-file",
     "tracing/std",
     "tracing-subscriber?/std",
+    "serde_json?/std",
 ]
 otlp = ["reth-tracing-otlp"]
 otlp-logs = ["reth-tracing-otlp/otlp-logs"]

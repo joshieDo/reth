@@ -342,6 +342,12 @@ where
     /// 2. Storage prefetch on the prewarming pool to populate the execution cache, unless BAL batch
     ///    I/O is disabled.
     #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
+    #[tracing::instrument(
+        name = "engine.prewarm.run_bal_prewarm",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn run_bal_prewarm(
         &self,
         decoded_bal: Arc<DecodedBal>,
@@ -456,6 +462,12 @@ where
         level = "debug",
         target = "engine::tree::payload_processor::prewarm",
         name = "prewarm and caching",
+        skip_all
+    )]
+    #[tracing::instrument(
+        name = "engine.prewarm.run",
+        target = "lifecycle",
+        level = "debug",
         skip_all
     )]
     pub fn run<Tx>(self, mode: PrewarmMode<Tx>, actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>)

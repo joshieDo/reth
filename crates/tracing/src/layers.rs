@@ -23,6 +23,7 @@ pub type FileWorkerGuard = tracing_appender::non_blocking::WorkerGuard;
 pub struct TracingGuards {
     _file: Option<FileWorkerGuard>,
     _chrome: Option<tracing_chrome::FlushGuard>,
+    _lifecycle: Option<crate::lifecycle::LifecycleGuard>,
 }
 
 impl fmt::Debug for TracingGuards {
@@ -35,12 +36,20 @@ impl fmt::Debug for TracingGuards {
 }
 
 impl TracingGuards {
+    pub(crate) fn with_lifecycle(
+        mut self,
+        guard: Option<crate::lifecycle::LifecycleGuard>,
+    ) -> Self {
+        self._lifecycle = guard;
+        self
+    }
+
     /// Creates tracing guards from active layer guards.
     pub const fn new(
         file: Option<FileWorkerGuard>,
         chrome: Option<tracing_chrome::FlushGuard>,
     ) -> Self {
-        Self { _file: file, _chrome: chrome }
+        Self { _file: file, _chrome: chrome, _lifecycle: None }
     }
 }
 
@@ -51,7 +60,8 @@ pub(crate) type BoxedLayer<S> = Box<dyn Layer<S> + Send + Sync>;
 /// 1. Disable high-frequency debug logs from dependencies such as `hyper`, `hickory-resolver`,
 ///    `hickory_proto`, `discv5`, `jsonrpsee-server`, and `hyper_util::client::legacy::pool`.
 /// 2. Set noisy crates like `opentelemetry_*`, `rustls`, and `tungstenite` to `WARN`.
-const DEFAULT_ENV_FILTER_DIRECTIVES: [&str; 11] = [
+const DEFAULT_ENV_FILTER_DIRECTIVES: [&str; 12] = [
+    "lifecycle=off",
     "hyper::proto::h1=off",
     "hickory_resolver=off",
     "hickory_proto=off",

@@ -77,6 +77,8 @@ mod formatter;
 #[cfg(feature = "std")]
 mod layers;
 #[cfg(feature = "std")]
+mod lifecycle;
+#[cfg(feature = "std")]
 pub mod log_handle;
 #[cfg(feature = "std")]
 mod test_tracer;
@@ -273,6 +275,16 @@ pub trait Tracer: Sized {
 #[cfg(feature = "std")]
 impl Tracer for RethTracer {
     fn init_with_layers(self, mut layers: Layers) -> eyre::Result<TracingGuards> {
+        let lifecycle = lifecycle::LifecycleLayer::from_env()?;
+        let lifecycle_guard =
+            lifecycle.map(|(layer, guard)| {
+                use tracing_subscriber::Layer;
+                layers.add_layer(layer.with_filter(tracing_subscriber::filter::filter_fn(
+                    lifecycle::capture_metadata,
+                )));
+                guard
+            });
+
         // Configure stdout layer - reloadable if requested for runtime log level changes
         if let Some(handle) = layers.stdout(
             self.stdout.format,
@@ -318,7 +330,7 @@ impl Tracer for RethTracer {
         // so it's safe to ignore it
         let _ = tracing_subscriber::registry().with(layers.into_inner()).try_init();
 
-        Ok(TracingGuards::new(file_guard, chrome_guard))
+        Ok(TracingGuards::new(file_guard, chrome_guard).with_lifecycle(lifecycle_guard))
     }
 }
 

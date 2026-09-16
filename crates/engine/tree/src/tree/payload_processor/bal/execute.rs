@@ -83,6 +83,12 @@ where
 }
 
 #[expect(clippy::too_many_arguments, clippy::type_complexity)]
+#[tracing::instrument(
+    name = "engine.bal.execute_block_inner",
+    target = "lifecycle",
+    level = "debug",
+    skip_all
+)]
 fn execute_block_inner<'scope, Evm, Tx, Err, DB, MakeDb>(
     scope: &rayon::Scope<'scope>,
     evm_config: &'scope Evm,

@@ -478,7 +478,8 @@ where
         target = "engine::tree::payload_validator",
         skip_all,
         fields(
-            parent = ?input.parent_hash(),
+            block_hash = %input.hash(),
+            parent_hash = %input.parent_hash(),
             type_name = ?input.type_name(),
         )
     )]
@@ -1023,6 +1024,7 @@ where
         T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
+        tracing::info!(target: "lifecycle", stage = "replay_start", block_hash = %input.hash());
         debug!(target: "engine::tree::payload_validator", "Executing block");
 
         let has_bal = input.has_block_access_list();
@@ -1098,6 +1100,7 @@ where
         let output = BlockExecutionOutput { result, state: db.take_bundle() };
 
         let execution_duration = execution_start.elapsed();
+        tracing::info!(target: "lifecycle", stage = "replay_done", block_hash = %input.hash());
         self.metrics.record_block_execution(&output, execution_duration);
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
@@ -1160,6 +1163,7 @@ where
         T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
         V: PayloadValidator<T, Block = N::Block>,
     {
+        tracing::info!(target: "lifecycle", stage = "replay_start", block_hash = %input.hash());
         debug!(target: "engine::tree::payload_validator", "Executing block via BAL path");
 
         let (receipt_tx, result_rx) = self.spawn_receipt_root_task(env.transaction_count);
@@ -1188,6 +1192,7 @@ where
         )?;
         let execution_duration = execution_start.elapsed();
 
+        tracing::info!(target: "lifecycle", stage = "replay_done", block_hash = %input.hash());
         self.metrics.record_block_execution(&output, execution_duration);
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
         debug!(
@@ -1199,6 +1204,12 @@ where
         Ok((output, senders, result_rx, Some(built_bal)))
     }
 
+    #[tracing::instrument(
+        name = "engine.spawn_receipt_root_task",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn spawn_receipt_root_task(
         &self,
         receipts_len: usize,
@@ -1207,7 +1218,10 @@ where
         let (receipt_tx, receipt_rx) = crossbeam_channel::unbounded();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let task_handle = ReceiptRootTaskHandle::new(receipt_rx, result_tx);
-        self.runtime.spawn_blocking_named("receipt-root", move || task_handle.run(receipts_len));
+        let cause = tracing::Span::current();
+        self.runtime.spawn_blocking_named("receipt-root", move || {
+            cause.in_scope(|| task_handle.run(receipts_len))
+        });
 
         (receipt_tx, result_rx)
     }
@@ -1221,6 +1235,12 @@ where
     /// - Collecting transaction senders for later use
     ///
     /// Returns the executor (for finalization) and the collected senders.
+    #[tracing::instrument(
+        name = "engine.execute_transactions",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn execute_transactions<'a, E, Tx, InnerTx, Err, DB>(
         &self,
         mut executor: E,
@@ -1258,12 +1278,18 @@ where
         // In that case, invoking the callback on every transaction would resend the previous
         // receipt with the same index and can panic the ordered root builder.
         let mut last_sent_len = 0usize;
+        let mut execution_ns = 0u64;
+        let mut wait_ns = 0u64;
+        let mut receipt_ns = 0u64;
+        let accounting = tracing::enabled!(target: "lifecycle", Level::INFO);
         loop {
             // Measure time spent waiting for next transaction from iterator
             // (e.g., parallel signature recovery)
             let wait_start = Instant::now();
             let Some(tx_result) = transactions.next() else { break };
-            self.metrics.record_transaction_wait(wait_start.elapsed());
+            let waited = wait_start.elapsed();
+            wait_ns += waited.as_nanos() as u64;
+            self.metrics.record_transaction_wait(waited);
 
             let tx = tx_result.map_err(BlockValidationError::other)?;
             let tx_signer = *<Tx as alloy_evm::RecoveredTx<InnerTx>>::signer(&tx);
@@ -1284,7 +1310,9 @@ where
 
             let tx_start = Instant::now();
             executor.execute_transaction(tx)?;
-            self.metrics.record_transaction_execution(tx_start.elapsed());
+            let executed = tx_start.elapsed();
+            execution_ns += executed.as_nanos() as u64;
+            self.metrics.record_transaction_execution(executed);
 
             // advance the shared counter so prewarm workers skip already-executed txs
             executed_tx_index.store(senders.len(), Ordering::Relaxed);
@@ -1295,7 +1323,11 @@ where
                 // Send the latest receipt to the background task for incremental root computation.
                 if let Some(receipt) = executor.receipts().last() {
                     let tx_index = current_len - 1;
+                    let receipt_start = accounting.then(Instant::now);
                     let _ = receipt_tx.send(IndexedReceipt::new(tx_index, receipt.clone()));
+                    if let Some(start) = receipt_start {
+                        receipt_ns += start.elapsed().as_nanos() as u64;
+                    }
                 }
             }
             // Bump BAL index after each transaction (EIP-7928)
@@ -1304,6 +1336,7 @@ where
             }
         }
 
+        tracing::info!(target: "lifecycle", stage = "execution_totals", execution_ns, wait_ns, receipt_ns, transactions = senders.len() as u64);
         drop(exec_span);
 
         Ok((executor, senders))
@@ -1422,6 +1455,12 @@ where
     /// Creates an overlay state provider factory for the given parent hash.
     ///
     /// Returns `None` when the parent is neither in memory nor persisted.
+    #[tracing::instrument(
+        name = "engine.overlay_state_provider_factory",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn overlay_state_provider_factory(
         &self,
         hash: B256,
