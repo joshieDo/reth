@@ -414,6 +414,8 @@ const STAGES: &[&str] = &[
     "proposal_failed",
     "marshal_enqueued",
     "marshal_dequeued",
+    "operation_completed",
+    "operation_abandoned",
 ];
 
 fn canonical_field(name: &str) -> &str {
@@ -431,7 +433,12 @@ fn numeric_field(name: &str) -> bool {
     let name = canonical_field(name);
     matches!(
         name,
-        "height" |
+        "queued_jobs" |
+            "in_flight_proof_batches" |
+            "pending_updates" |
+            "pending_targets" |
+            "result_count" |
+            "height" |
             "number" |
             "block_number" |
             "proposal_height" |
@@ -541,6 +548,8 @@ mod tests {
             let _entered = span.enter();
             tracing::info!(target:"lifecycle", stage="marshal_enqueued", block_hash="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
             tracing::info!(target:"lifecycle", stage="DO_NOT_EXPORT", payload="PRIVATE_TRANSACTION", private_key="DO_NOT_EXPORT");
+            tracing::info!(target: "lifecycle", stage = "operation_completed", queued_jobs = 3u64);
+            tracing::info!(target: "lifecycle", stage = "operation_abandoned");
             tracing::info!("DO_NOT_EXPORT");
         });
         drop(guard);
@@ -557,6 +566,11 @@ mod tests {
         assert!(values
             .iter()
             .any(|v| v["fields"]["block_count"] == 7 && v["fields"]["persisted_height"] == 41));
+        assert!(values
+            .iter()
+            .any(|v| v["fields"]["stage"] == "operation_completed" &&
+                v["fields"]["queued_jobs"] == 3));
+        assert!(values.iter().any(|v| v["fields"]["stage"] == "operation_abandoned"));
         assert_eq!(values.last().unwrap()["dropped"], 0);
         assert_eq!(
             values.iter().filter(|v| v["type"] == "start").count(),
