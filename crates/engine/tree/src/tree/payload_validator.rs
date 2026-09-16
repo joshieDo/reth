@@ -1340,10 +1340,20 @@ where
         }
 
         if let Some(timer) = loop_timer {
-            let (execution_loop_ns, execution_thread_cpu_ns) = timer.finish();
+            let measured = timer.finish();
+            let execution_loop_ns = measured.wall_ns;
+            let execution_thread_cpu_ns = measured.cpu_ns;
+            let resources = measured.resources;
             tracing::info!(target: "lifecycle", stage = "execution_totals", execution_ns,
                 wait_ns, receipt_ns, execution_loop_ns, execution_thread_cpu_ns,
                 execution_cpu_measured = u64::from(execution_thread_cpu_ns.is_some()),
+                execution_resources_measured = u64::from(resources.is_some()),
+                execution_voluntary_context_switches = resources.map(|r| r.voluntary_context_switches),
+                execution_involuntary_context_switches = resources.map(|r| r.involuntary_context_switches),
+                execution_minor_page_faults = resources.map(|r| r.minor_page_faults),
+                execution_major_page_faults = resources.map(|r| r.major_page_faults),
+                execution_block_input_operations = resources.map(|r| r.block_input_operations),
+                execution_block_output_operations = resources.map(|r| r.block_output_operations),
                 transactions = senders.len() as u64);
         }
         drop(exec_span);

@@ -10,6 +10,19 @@ pub(super) struct ExecutionLoopTimer {
     wall: Instant,
 }
 
+/// Matching measurements from the same two resource snapshots.
+pub(super) struct ExecutionLoopMeasurement {
+    pub(super) wall_ns: u64,
+    pub(super) cpu_ns: Option<u64>,
+    pub(super) resources: Option<ThreadResourceUsageDelta>,
+}
+
+impl ExecutionLoopMeasurement {
+    fn new(wall_ns: u64, resources: Option<ThreadResourceUsageDelta>) -> Self {
+        Self { wall_ns, cpu_ns: cpu_nanos(resources), resources }
+    }
+}
+
 impl ExecutionLoopTimer {
     pub(super) fn start(enabled: bool) -> Option<Self> {
         enabled.then(|| Self { cpu: ThreadResourceUsage::now(), wall: Instant::now() })
@@ -21,9 +34,10 @@ impl ExecutionLoopTimer {
     /// CPU counters have microsecond units; neither value is an exact off-CPU
     /// attribution. Other worker threads and block initialization/finalization
     /// are outside this measurement.
-    pub(super) fn finish(self) -> (u64, Option<u64>) {
+    pub(super) fn finish(self) -> ExecutionLoopMeasurement {
         let wall = nanos(self.wall.elapsed());
-        (wall, cpu_nanos(self.cpu.elapsed()))
+        // Reuse the CPU sample's resource deltas; do not resample per counter.
+        ExecutionLoopMeasurement::new(wall, self.cpu.elapsed())
     }
 }
 
@@ -51,6 +65,31 @@ mod tests {
     }
 
     #[test]
+    fn resources_retain_counts_and_distinguish_missing_from_zero() {
+        let usage = ThreadResourceUsageDelta {
+            user_cpu_time: Duration::from_micros(2),
+            system_cpu_time: Duration::from_micros(3),
+            voluntary_context_switches: 7,
+            involuntary_context_switches: 11,
+            minor_page_faults: 13,
+            major_page_faults: 17,
+            block_input_operations: 19,
+            block_output_operations: u64::MAX,
+        };
+        let measured = ExecutionLoopMeasurement::new(23_000, Some(usage));
+        assert_eq!(measured.wall_ns, 23_000);
+        assert_eq!(measured.cpu_ns, Some(5000));
+        assert_eq!(measured.resources, Some(usage));
+        let zero = ExecutionLoopMeasurement::new(0, Some(ThreadResourceUsageDelta::default()));
+        assert_eq!(zero.cpu_ns, Some(0));
+        assert_eq!(zero.resources, Some(ThreadResourceUsageDelta::default()));
+        let unavailable = ExecutionLoopMeasurement::new(23_000, None);
+        assert_eq!(unavailable.wall_ns, 23_000);
+        assert_eq!(unavailable.cpu_ns, None);
+        assert_eq!(unavailable.resources, None);
+    }
+
+    #[test]
     fn cpu_sum_and_nanosecond_conversion_saturate() {
         let usage = |user_cpu_time, system_cpu_time| {
             Some(ThreadResourceUsageDelta { user_cpu_time, system_cpu_time, ..Default::default() })
@@ -68,9 +107,10 @@ mod tests {
     fn sleep_is_elapsed_wall_not_thread_cpu() {
         let timer = ExecutionLoopTimer::start(true).unwrap();
         std::thread::sleep(Duration::from_millis(50));
-        let (wall, cpu) = timer.finish();
-        assert!(wall >= 50_000_000);
-        assert!(cpu.unwrap() < wall);
+        let measured = timer.finish();
+        assert!(measured.wall_ns >= 50_000_000);
+        assert!(measured.cpu_ns.unwrap() < measured.wall_ns);
+        assert!(measured.resources.is_some());
     }
 
     #[test]
@@ -82,14 +122,14 @@ mod tests {
             value = std::hint::black_box(value).wrapping_mul(3).wrapping_add(1);
         }
         std::hint::black_box(value);
-        let (_, cpu) = timer.finish();
-        assert!(cpu.unwrap() > 0);
+        assert!(timer.finish().cpu_ns.unwrap() > 0);
     }
 
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn unsupported_cpu_is_unmeasured() {
-        let (_, cpu) = ExecutionLoopTimer::start(true).unwrap().finish();
-        assert_eq!(cpu, None);
+        let measured = ExecutionLoopTimer::start(true).unwrap().finish();
+        assert_eq!(measured.cpu_ns, None);
+        assert_eq!(measured.resources, None);
     }
 }
