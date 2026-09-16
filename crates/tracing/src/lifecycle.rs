@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     fs::{File, OpenOptions},
-    io::{BufWriter, Write},
+    io::{self, BufWriter, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
@@ -115,8 +115,49 @@ impl Visit for MilestoneStage {
     fn record_debug(&mut self, _: &Field, _: &dyn fmt::Debug) {}
 }
 
+// Keep the frequent fixed-shape records inline. The producer captures all timing
+// and identity before enqueueing; only JSON formatting moves to the writer.
+#[derive(Debug)]
+enum CaptureRecord {
+    Json(Value),
+    Enter { id: u64, ts: u64, thread: u64 },
+    Exit { id: u64, ts: u64, thread: u64 },
+    End { id: u64, ts: u64, thread: u64 },
+}
+
+impl From<Value> for CaptureRecord {
+    fn from(value: Value) -> Self {
+        Self::Json(value)
+    }
+}
+
+impl CaptureRecord {
+    fn write_json(&self, out: &mut impl Write) -> io::Result<()> {
+        let (kind, id, ts, thread) = match self {
+            Self::Json(value) => return serde_json::to_writer(out, value).map_err(io::Error::other),
+            Self::Enter { id, ts, thread } => ("enter", id, ts, thread),
+            Self::Exit { id, ts, thread } => ("exit", id, ts, thread),
+            Self::End { id, ts, thread } => ("end", id, ts, thread),
+        };
+        // Only fixed literals and unsigned integers are interpolated. Match the
+        // existing sorted JSON keys without allocating a temporary object.
+        write!(out, "{{\"id\":{id},\"thread\":{thread},\"ts\":{ts},\"type\":\"{kind}\"}}")
+    }
+
+    fn is_backpressure(&self) -> bool {
+        matches!(self, Self::Json(value) if value["fields"]["stage"] == "backpressure_start")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StampKind {
+    Enter,
+    Exit,
+    End,
+}
+
 struct Writer {
-    tx: mpsc::SyncSender<Option<Value>>,
+    tx: mpsc::SyncSender<Option<CaptureRecord>>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -207,14 +248,13 @@ impl LifecycleLayer {
             let mut written = 0u64;
             let mut failed = false;
             while let Ok(Some(value)) = rx.recv() {
-                if serde_json::to_writer(&mut out, &value).is_err() || out.write_all(b"\n").is_err()
-                {
+                if value.write_json(&mut out).is_err() || out.write_all(b"\n").is_err() {
                     failed = true;
                     // Continue draining so shutdown never waits on a full queue after an I/O error.
                     continue
                 }
                 // Make the stop boundary visible even when the stream is otherwise idle.
-                if value["fields"]["stage"] == "backpressure_start" && out.flush().is_err() {
+                if value.is_backpressure() && out.flush().is_err() {
                     failed = true;
                 }
                 written += 1;
@@ -256,8 +296,8 @@ impl LifecycleLayer {
 }
 
 impl Writer {
-    fn send(&self, value: Value) {
-        if self.tx.try_send(Some(value)).is_err() {
+    fn send(&self, value: impl Into<CaptureRecord>) {
+        if self.tx.try_send(Some(value.into())).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -355,7 +395,7 @@ where
         {
             // A full queue must not drop the first stop boundary. This can block only
             // after the measured pre-backpressure interval has already ended.
-            if self.writer.tx.send(Some(value)).is_err() {
+            if self.writer.tx.send(Some(value.into())).is_err() {
                 self.writer.dropped.fetch_add(1, Ordering::Relaxed);
             }
         } else {
@@ -365,12 +405,12 @@ where
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
         if self.detail == CaptureDetail::Full {
-            self.span_event("enter", id, ctx);
+            self.span_event(StampKind::Enter, id, ctx);
         }
     }
     fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
         if self.detail == CaptureDetail::Full {
-            self.span_event("exit", id, ctx);
+            self.span_event(StampKind::Exit, id, ctx);
         }
     }
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
@@ -393,7 +433,7 @@ where
                 flush_aggregates(&self.writer, captured.id, &captured.aggregates);
             }
         }
-        self.span_event("end", &id, ctx);
+        self.span_event(StampKind::End, &id, ctx);
     }
     fn on_follows_from(&self, id: &Id, follows: &Id, ctx: Context<'_, S>) {
         let (Some(span), Some(other)) = (ctx.span(id), ctx.span(follows)) else { return };
@@ -407,14 +447,22 @@ where
 }
 
 impl LifecycleLayer {
-    fn span_event<S>(&self, kind: &str, id: &Id, ctx: Context<'_, S>)
+    fn span_event<S>(&self, kind: StampKind, id: &Id, ctx: Context<'_, S>)
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
     {
         if let Some(span) = ctx.span(id) {
             if let Some(span) = span.extensions().get::<CapturedSpan>() {
                 if span.sample.is_none() {
-                    self.writer.send(self.stamp(kind, span.id));
+                    let id = span.id;
+                    let ts = monotonic_ns().saturating_sub(self.epoch);
+                    let thread = thread_id();
+                    let record = match kind {
+                        StampKind::Enter => CaptureRecord::Enter { id, ts, thread },
+                        StampKind::Exit => CaptureRecord::Exit { id, ts, thread },
+                        StampKind::End => CaptureRecord::End { id, ts, thread },
+                    };
+                    self.writer.send(record);
                 }
             }
         }
@@ -648,6 +696,103 @@ mod tests {
     // temporary registries isolated from concurrent interest-cache rebuilds.
     static CAPTURE_TEST: Mutex<()> = Mutex::new(());
 
+    fn as_value(record: CaptureRecord) -> Value {
+        let mut bytes = Vec::new();
+        record.write_json(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn typed_stamps_match_json_bytes_and_queue_size() {
+        for value in [0, 1, u64::MAX] {
+            for (kind, record) in [
+                ("enter", CaptureRecord::Enter { id: value, ts: value, thread: value }),
+                ("exit", CaptureRecord::Exit { id: value, ts: value, thread: value }),
+                ("end", CaptureRecord::End { id: value, ts: value, thread: value }),
+            ] {
+                let expected = json!({"type":kind,"id":value,"ts":value,"thread":value});
+                let mut bytes = Vec::new();
+                record.write_json(&mut bytes).unwrap();
+                assert_eq!(bytes, serde_json::to_vec(&expected).unwrap());
+                assert_eq!(as_value(record), expected);
+            }
+        }
+        // Bound any inline enum overhead independently of the queue capacity.
+        assert!(
+            std::mem::size_of::<Option<CaptureRecord>>() <=
+                std::mem::size_of::<Option<Value>>() + std::mem::size_of::<u64>()
+        );
+        eprintln!(
+            "queue element bytes: JSON={}, typed={}",
+            std::mem::size_of::<Option<Value>>(),
+            std::mem::size_of::<Option<CaptureRecord>>()
+        );
+    }
+
+    #[test]
+    fn typed_stamps_keep_fifo_and_count_queue_failures() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer = Writer { tx, dropped: Arc::clone(&dropped) };
+        writer.send(CaptureRecord::Enter { id: 9, ts: 10, thread: 11 });
+        writer.send(json!({"type":"event","id":9,"ts":12}));
+        writer.send(CaptureRecord::Exit { id: 9, ts: 13, thread: 11 });
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(as_value(rx.recv().unwrap().unwrap())["ts"], 10);
+        assert_eq!(as_value(rx.recv().unwrap().unwrap())["ts"], 12);
+        drop(rx);
+        writer.send(CaptureRecord::End { id: 9, ts: 14, thread: 11 });
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn typed_stamps_preserve_active_intervals_and_retained_lifetime() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        let path = std::env::temp_dir().join(format!("lifecycle-active-{}.jsonl", monotonic_ns()));
+        let (layer, guard) = LifecycleLayer::start(
+            File::create(&path).unwrap(),
+            [7; 32],
+            monotonic_ns(),
+            CaptureDetail::Full,
+        )
+        .unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(target: "lifecycle", "retained_operation");
+            let retained = span.clone();
+            span.in_scope(|| tracing::info!(target: "lifecycle", stage="operation_completed"));
+            span.in_scope(|| {});
+            drop(span);
+            tracing::info!(target: "lifecycle", stage="load_end");
+            drop(retained);
+        });
+        drop(guard);
+        let data = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let rows: Vec<Value> = data.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        let kinds: Vec<_> = rows.iter().map(|r| r["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "header", "start", "enter", "event", "exit", "enter", "exit", "event", "end",
+                "footer"
+            ]
+        );
+        let id = rows[1]["id"].clone();
+        for index in [2, 3, 4, 5, 6, 8] {
+            assert_eq!(rows[index]["id"], id);
+            assert_eq!(rows[index]["thread"], rows[1]["thread"]);
+        }
+        for pair in rows[1..9].windows(2) {
+            assert!(pair[0]["ts"].as_u64().unwrap() <= pair[1]["ts"].as_u64().unwrap());
+        }
+        assert_eq!(rows[3]["fields"]["stage"], "operation_completed");
+        assert_eq!(rows[9]["written"], 9);
+        assert_eq!(rows[9]["dropped"], 0);
+        assert_eq!(rows[9]["io_error"], false);
+    }
+
     #[test]
     fn detail_mode_rejects_unknown_values() {
         assert_eq!(CaptureDetail::parse(None).unwrap(), CaptureDetail::Full);
@@ -820,7 +965,7 @@ mod tests {
         let _serial = CAPTURE_TEST.lock().unwrap();
         for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
             let (tx, rx) = mpsc::sync_channel(1);
-            tx.send(Some(json!({"type":"header"}))).unwrap();
+            tx.send(Some(CaptureRecord::Json(json!({"type":"header"})))).unwrap();
             let dropped = Arc::new(AtomicU64::new(0));
             let layer = LifecycleLayer {
                 detail,
@@ -836,13 +981,13 @@ mod tests {
             ));
             let reader = thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(30));
-                assert_eq!(rx.recv().unwrap().unwrap()["type"], "header");
+                assert_eq!(as_value(rx.recv().unwrap().unwrap())["type"], "header");
                 rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap()
             });
             tracing::subscriber::with_default(subscriber, || {
                 tracing::info!(target: "lifecycle", stage="backpressure_start", backlog=42u64);
             });
-            let boundary = reader.join().unwrap();
+            let boundary = as_value(reader.join().unwrap());
             assert_eq!(boundary["fields"]["stage"], "backpressure_start");
             assert_eq!(boundary["fields"]["backlog"], 42);
             assert_eq!(dropped.load(Ordering::Relaxed), 0);
