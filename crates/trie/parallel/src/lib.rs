@@ -23,3 +23,6 @@ pub(crate) mod value_encoder;
 /// Proof task manager metrics.
 #[cfg(feature = "metrics")]
 pub mod proof_task_metrics;
+
+#[cfg(feature = "metrics")]
+mod worker_cpu;

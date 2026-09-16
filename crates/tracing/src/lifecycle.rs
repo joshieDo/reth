@@ -570,6 +570,8 @@ const STAGES: &[&str] = &[
     "frame_receive",
     "durable",
     "execution_totals",
+    "proof_storage_worker_totals",
+    "proof_account_worker_totals",
     "backpressure_start",
     "proposal_failed",
     "marshal_enqueued",
@@ -614,6 +616,10 @@ fn numeric_field(name: &str) -> bool {
             "execution_loop_ns" |
             "execution_thread_cpu_ns" |
             "execution_cpu_measured" |
+            "worker_run_ns" |
+            "worker_thread_cpu_ns" |
+            "worker_cpu_measured" |
+            "worker_success" |
             "receipt_ns" |
             "bookkeeping_ns" |
             "wait_ns" |
@@ -803,6 +809,61 @@ mod tests {
         assert_eq!(CaptureDetail::parse(Some("milestones")).unwrap(), CaptureDetail::Milestones);
         assert!(CaptureDetail::parse(Some("off")).is_err());
         assert!(CaptureDetail::parse(Some("")).is_err());
+    }
+
+    #[test]
+    fn proof_worker_totals_preserve_explicit_parent_and_optional_cpu() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        let path = std::env::temp_dir().join(format!("worker-cpu-{}.jsonl", monotonic_ns()));
+        let (layer, guard) = LifecycleLayer::start(
+            File::create(&path).unwrap(),
+            [7; 32],
+            monotonic_ns(),
+            CaptureDetail::Full,
+        )
+        .unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+            .with(layer.with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                CaptureDetail::Full.capture_metadata(meta)
+            })));
+        tracing::subscriber::with_default(subscriber, || {
+            let parent =
+                tracing::debug_span!(target: "engine::tree::payload_validator", "execute_block");
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let worker = tracing::debug_span!(target: "trie::proof_task", parent: &parent, "storage_worker");
+                    // The explicit event parent must work without a thread-local entered span.
+                    assert!(tracing::Span::current().is_none());
+                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64, native_tid=77777u64);
+                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64);
+                });
+            }).join().unwrap();
+        });
+        drop(guard);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(!text.contains("native_tid"));
+        let rows: Vec<Value> = text.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        let parent = rows.iter().find(|r| r["name"] == "execute_block").unwrap();
+        let worker = rows.iter().find(|r| r["name"] == "storage_worker").unwrap();
+        assert_eq!(worker["parent"], parent["id"]);
+        let storage =
+            rows.iter().find(|r| r["fields"]["stage"] == "proof_storage_worker_totals").unwrap();
+        assert_eq!(storage["id"], worker["id"]);
+        assert_eq!(storage["fields"]["worker_run_ns"], 50);
+        assert_eq!(storage["fields"]["worker_thread_cpu_ns"], 0);
+        assert_eq!(storage["fields"]["worker_cpu_measured"], 1);
+        assert_eq!(storage["fields"]["worker_success"], 1);
+        let account =
+            rows.iter().find(|r| r["fields"]["stage"] == "proof_account_worker_totals").unwrap();
+        assert_eq!(account["id"], worker["id"]);
+        assert_eq!(account["fields"]["worker_run_ns"], 60);
+        assert_eq!(account["fields"]["worker_cpu_measured"], 0);
+        assert_eq!(account["fields"]["worker_success"], 0);
+        assert!(account["fields"].get("worker_thread_cpu_ns").is_none());
+        assert_eq!(rows.last().unwrap()["dropped"], 0);
     }
 
     #[test]

@@ -231,7 +231,15 @@ impl ProofWorkerHandle {
                     #[cfg(feature = "metrics")]
                     cursor_metrics,
                 );
-                if let Err(error) = worker.run() {
+                #[cfg(feature = "metrics")]
+                let cpu_timer = crate::worker_cpu::WorkerCpuTimer::start();
+                let result = worker.run();
+                #[cfg(feature = "metrics")]
+                if let Some(timer) = cpu_timer {
+                    let parent = if span.is_disabled() { &storage_parent_span } else { &span };
+                    timer.record(parent, "proof_storage_worker_totals", result.is_ok());
+                }
+                if let Err(error) = result {
                     error!(
                         target: "trie::proof_task",
                         worker_id,
@@ -278,7 +286,15 @@ impl ProofWorkerHandle {
                     #[cfg(feature = "metrics")]
                     cursor_metrics,
                 );
-                if let Err(error) = worker.run() {
+                #[cfg(feature = "metrics")]
+                let cpu_timer = crate::worker_cpu::WorkerCpuTimer::start();
+                let result = worker.run();
+                #[cfg(feature = "metrics")]
+                if let Some(timer) = cpu_timer {
+                    let parent = if span.is_disabled() { &account_parent_span } else { &span };
+                    timer.record(parent, "proof_account_worker_totals", result.is_ok());
+                }
+                if let Err(error) = result {
                     error!(
                         target: "trie::proof_task",
                         worker_id,
