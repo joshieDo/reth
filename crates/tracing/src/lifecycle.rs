@@ -20,7 +20,10 @@ use tracing::{
 };
 use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
 
-const QUEUE_CAPACITY: usize = 65_536;
+// Proof/update bursts can briefly outrun the disk writer. Keep capture bounded
+// without dropping valid measurements during short scheduling or I/O stalls.
+const QUEUE_CAPACITY: usize = 262_144;
+const WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 static NEXT_THREAD: AtomicU64 = AtomicU64::new(1);
 thread_local! { static THREAD: Cell<u64> = const { Cell::new(0) }; }
 
@@ -108,7 +111,7 @@ impl LifecycleLayer {
         let dropped = Arc::new(AtomicU64::new(0));
         let writer = Arc::new(Writer { tx, dropped: Arc::clone(&dropped) });
         let worker = thread::Builder::new().name("lifecycle-writer".into()).spawn(move || {
-            let mut out = BufWriter::new(file);
+            let mut out = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
             let mut written = 0u64;
             let mut failed = false;
             while let Ok(Some(value)) = rx.recv() {
