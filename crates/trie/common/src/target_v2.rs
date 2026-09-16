@@ -142,20 +142,24 @@ impl MultiProofTargetsV2 {
             }
 
             let storage_len = account.storage.len();
-            let mut changed_slots =
-                account.storage.into_iter().filter(|(_, slot)| slot.is_changed());
-            let Some(first_changed) = changed_slots.next() else { continue };
-
-            // Avoid allocating a buffer for accounts whose loaded storage is unchanged.
-            // Keep the original capacity for nonempty targets, so mixed states do not reallocate.
-            let mut storage_slots = Vec::with_capacity(storage_len);
-            for (key, _) in core::iter::once(first_changed).chain(changed_slots) {
+            let mut storage_slots = Vec::new();
+            for (key, slot) in account.storage {
+                if !slot.is_changed() {
+                    continue
+                }
+                // Reserve once, only when a target is actually needed. Keep the original
+                // loaded-slot capacity without an extra iterator state for the first item.
+                if storage_slots.is_empty() {
+                    storage_slots.reserve_exact(storage_len);
+                }
                 let hashed_slot = keccak256(B256::new(key.to_be_bytes()));
                 storage_slots.push(ProofV2Target::from(hashed_slot));
             }
 
             storage_target_count += storage_slots.len();
-            targets.storage_targets.insert(hashed_address, storage_slots);
+            if !storage_slots.is_empty() {
+                targets.storage_targets.insert(hashed_address, storage_slots);
+            }
         }
 
         (targets, storage_target_count)
