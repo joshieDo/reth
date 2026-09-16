@@ -3,12 +3,13 @@
 use serde_json::{json, Map, Value};
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     fmt,
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
 };
@@ -29,6 +30,7 @@ pub(crate) struct LifecycleLayer {
     key: [u8; 32],
     epoch: u64,
     next_span: AtomicU64,
+    root_aggregates: Aggregates,
 }
 
 struct Writer {
@@ -40,10 +42,43 @@ struct Writer {
 pub(crate) struct LifecycleGuard {
     writer: Arc<Writer>,
     worker: Option<JoinHandle<()>>,
+    root_aggregates: Aggregates,
+}
+
+type Aggregates = Arc<Mutex<BTreeMap<&'static str, TimingSummary>>>;
+
+#[derive(Default)]
+struct TimingSummary {
+    count: u64,
+    elapsed_ns: u64,
+    first: u64,
+    last: u64,
 }
 
 struct CapturedSpan {
     id: u64,
+    aggregates: Aggregates,
+    // High-frequency accessors/proofs retain every call's elapsed time, grouped by owner.
+    sample: Option<(&'static str, u64)>,
+}
+
+fn aggregate_name(name: &str) -> bool {
+    matches!(
+        name,
+        "state.overlay.execution_overlay" |
+            "database_provider_ro" |
+            "state.overlay.state_trie_overlay" |
+            "Storage proof calculation" |
+            "Account multiproof calculation"
+    )
+}
+
+fn flush_aggregates(writer: &Writer, owner: u64, aggregates: &Aggregates) {
+    for (name, summary) in std::mem::take(&mut *aggregates.lock().unwrap()) {
+        writer.send(json!({"type":"aggregate", "id":owner, "name":name,
+            "ts":summary.first, "end":summary.last, "count":summary.count,
+            "elapsed_ns":summary.elapsed_ns, "category":if name.contains("proof") {"trie"} else {"state"}}));
+    }
 }
 
 impl LifecycleLayer {
@@ -91,8 +126,13 @@ impl LifecycleLayer {
             let _ = out.flush();
         })?;
         writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns"}));
-        let guard = LifecycleGuard { writer: Arc::clone(&writer), worker: Some(worker) };
-        Ok((Self { writer, key, epoch, next_span: AtomicU64::new(1) }, guard))
+        let root_aggregates = Aggregates::default();
+        let guard = LifecycleGuard {
+            writer: Arc::clone(&writer),
+            worker: Some(worker),
+            root_aggregates: Arc::clone(&root_aggregates),
+        };
+        Ok((Self { writer, key, epoch, next_span: AtomicU64::new(1), root_aggregates }, guard))
     }
 
     fn stamp(&self, kind: &str, id: u64) -> Value {
@@ -114,6 +154,7 @@ impl Writer {
 
 impl Drop for LifecycleGuard {
     fn drop(&mut self) {
+        flush_aggregates(&self.writer, 0, &self.root_aggregates);
         let _ = self.writer.tx.send(None);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -127,6 +168,20 @@ where
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(id) else { return };
+        if aggregate_name(attrs.metadata().name()) {
+            let (owner, aggregates) = span
+                .parent()
+                .and_then(|p| {
+                    p.extensions().get::<CapturedSpan>().map(|s| (s.id, Arc::clone(&s.aggregates)))
+                })
+                .unwrap_or_else(|| (0, Arc::clone(&self.root_aggregates)));
+            span.extensions_mut().insert(CapturedSpan {
+                id: owner,
+                aggregates,
+                sample: Some((attrs.metadata().name(), monotonic_ns().saturating_sub(self.epoch))),
+            });
+            return
+        }
         let capture_id = self.next_span.fetch_add(1, Ordering::Relaxed);
         let parent = span.parent().and_then(|p| p.extensions().get::<CapturedSpan>().map(|s| s.id));
         let mut fields = self.fields();
@@ -136,7 +191,11 @@ where
         value["category"] = category(attrs.metadata().target()).into();
         value["parent"] = parent.into();
         value["fields"] = Value::Object(fields.values);
-        span.extensions_mut().insert(CapturedSpan { id: capture_id });
+        span.extensions_mut().insert(CapturedSpan {
+            id: capture_id,
+            aggregates: Aggregates::default(),
+            sample: None,
+        });
         self.writer.send(value);
     }
 
@@ -144,6 +203,9 @@ where
         let Some(span) = ctx.span(id) else { return };
         let ext = span.extensions();
         let Some(span) = ext.get::<CapturedSpan>() else { return };
+        if span.sample.is_some() {
+            return
+        }
         let mut fields = self.fields();
         values.record(&mut fields);
         if !fields.values.is_empty() {
@@ -175,6 +237,25 @@ where
         self.span_event("exit", id, ctx);
     }
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(&id) {
+            if let Some(captured) = span.extensions().get::<CapturedSpan>() {
+                if let Some((name, start)) = captured.sample {
+                    let end = monotonic_ns().saturating_sub(self.epoch);
+                    let mut summaries = captured.aggregates.lock().unwrap();
+                    let summary = summaries.entry(name).or_default();
+                    if summary.count == 0 {
+                        summary.first = start;
+                    }
+                    summary.first = summary.first.min(start);
+                    summary.last = summary.last.max(end);
+                    summary.count += 1;
+                    summary.elapsed_ns =
+                        summary.elapsed_ns.saturating_add(end.saturating_sub(start));
+                    return
+                }
+                flush_aggregates(&self.writer, captured.id, &captured.aggregates);
+            }
+        }
         self.span_event("end", &id, ctx);
     }
     fn on_follows_from(&self, id: &Id, follows: &Id, ctx: Context<'_, S>) {
@@ -195,7 +276,9 @@ impl LifecycleLayer {
     {
         if let Some(span) = ctx.span(id) {
             if let Some(span) = span.extensions().get::<CapturedSpan>() {
-                self.writer.send(self.stamp(kind, span.id));
+                if span.sample.is_none() {
+                    self.writer.send(self.stamp(kind, span.id));
+                }
             }
         }
     }
@@ -439,5 +522,39 @@ mod tests {
             values.iter().filter(|v| v["type"] == "start").count(),
             values.iter().filter(|v| v["type"] == "end").count()
         );
+    }
+    #[test]
+    fn hot_accessors_preserve_counts_and_owner_without_queue_pressure() {
+        let path =
+            std::env::temp_dir().join(format!("lifecycle-aggregate-{}.jsonl", monotonic_ns()));
+        let (layer, guard) =
+            LifecycleLayer::start(File::create(&path).unwrap(), [1; 32], monotonic_ns()).unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
+        tracing::subscriber::with_default(subscriber, || {
+            let _owner = tracing::info_span!(target:"lifecycle", "block_work").entered();
+            for _ in 0..100_000 {
+                let _read =
+                    tracing::debug_span!(target:"lifecycle", "state.overlay.execution_overlay")
+                        .entered();
+                let _nested =
+                    tracing::debug_span!(target:"providers::state", "database_provider_ro")
+                        .entered();
+            }
+        });
+        drop(guard);
+        let data = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let values: Vec<Value> = data.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        let owner = values.iter().find(|v| v["name"] == "block_work").unwrap()["id"].clone();
+        let summaries: Vec<_> = values.iter().filter(|v| v["type"] == "aggregate").collect();
+        assert_eq!(summaries.len(), 2);
+        for summary in summaries {
+            assert_eq!(summary["id"], owner);
+            assert_eq!(summary["count"], 100_000);
+            assert!(summary["elapsed_ns"].as_u64().unwrap() > 0);
+        }
+        assert!(values.len() < 20);
+        assert_eq!(values.last().unwrap()["dropped"], 0);
     }
 }
