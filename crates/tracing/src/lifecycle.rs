@@ -614,6 +614,13 @@ fn numeric_field(name: &str) -> bool {
             "execution_loop_ns" |
             "execution_thread_cpu_ns" |
             "execution_cpu_measured" |
+            "execution_resources_measured" |
+            "execution_voluntary_context_switches" |
+            "execution_involuntary_context_switches" |
+            "execution_minor_page_faults" |
+            "execution_major_page_faults" |
+            "execution_block_input_operations" |
+            "execution_block_output_operations" |
             "receipt_ns" |
             "bookkeeping_ns" |
             "wait_ns" |
@@ -794,6 +801,69 @@ mod tests {
         assert_eq!(rows[9]["written"], 9);
         assert_eq!(rows[9]["dropped"], 0);
         assert_eq!(rows[9]["io_error"], false);
+    }
+
+    #[test]
+    fn loop_resource_counts_are_numeric_optional_in_both_details() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            let path =
+                std::env::temp_dir().join(format!("lifecycle-resources-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                detail,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+                tracing_subscriber::filter::filter_fn(move |meta| detail.capture_metadata(meta)),
+            ));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "lifecycle", stage="execution_totals",
+                    execution_resources_measured=1u64,
+                    execution_voluntary_context_switches=Some(0u64),
+                    execution_involuntary_context_switches=Some(1u64),
+                    execution_minor_page_faults=Some(2u64),
+                    execution_major_page_faults=Some(3u64),
+                    execution_block_input_operations=Some(4u64),
+                    execution_block_output_operations=Some(5u64));
+                tracing::info!(target: "lifecycle", stage="execution_totals",
+                    execution_resources_measured=0u64,
+                    execution_voluntary_context_switches=None::<u64>,
+                    execution_involuntary_context_switches=None::<u64>,
+                    execution_minor_page_faults=None::<u64>,
+                    execution_major_page_faults=None::<u64>,
+                    execution_block_input_operations=None::<u64>,
+                    execution_block_output_operations=None::<u64>);
+                tracing::info!(target: "lifecycle", stage="execution_totals",
+                    execution_minor_page_faults="must-not-export-private-text");
+            });
+            drop(guard);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let rows: Vec<Value> = text.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+            let measured =
+                rows.iter().find(|r| r["fields"]["execution_resources_measured"] == 1).unwrap();
+            let unavailable =
+                rows.iter().find(|r| r["fields"]["execution_resources_measured"] == 0).unwrap();
+            for (value, name) in [
+                "execution_voluntary_context_switches",
+                "execution_involuntary_context_switches",
+                "execution_minor_page_faults",
+                "execution_major_page_faults",
+                "execution_block_input_operations",
+                "execution_block_output_operations",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(measured["fields"][name], value as u64);
+                assert!(unavailable["fields"].get(name).is_none());
+            }
+            assert!(!text.contains("must-not-export-private-text"));
+            assert_eq!(rows.last().unwrap()["dropped"], 0);
+        }
     }
 
     #[test]
