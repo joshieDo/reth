@@ -589,6 +589,16 @@ const STAGES: &[&str] = &[
     "load_start",
     "load_end",
     "decode_done",
+    "message_origin",
+    "message_router_queue",
+    "message_peer_queue",
+    "message_inbound_queue",
+    "message_dequeued",
+    "message_decode",
+    "message_decode_result",
+    "message_decoded_queue",
+    "message_delivered",
+    "frame_authenticated",
     "frame_send",
     "frame_receive",
     "durable",
@@ -635,6 +645,9 @@ fn numeric_field(name: &str) -> bool {
             "workers" |
             "channel" |
             "sequence" |
+            "message_id" |
+            "receive_id" |
+            "accepted" |
             "execution_ns" |
             "execution_loop_ns" |
             "execution_thread_cpu_ns" |
@@ -1309,5 +1322,25 @@ mod tests {
         }
         assert!(values.len() < 20);
         assert_eq!(values.last().unwrap()["dropped"], 0);
+    }
+    #[test]
+    fn frame_lineage_fields_are_numeric_and_stages_are_closed() {
+        let key = [7; 32];
+        let mut fields = SafeFields { key: &key, values: Map::new() };
+        fields.text("message_id", &u64::MAX.to_string());
+        fields.text("receive_id", "12");
+        fields.text("accepted", "0");
+        fields.text("peer", "private peer identity");
+        fields.text("payload_bytes", "private payload");
+        fields.text("stage", "message_origin");
+        assert_eq!(fields.values["message_id"], u64::MAX);
+        assert_eq!(fields.values["receive_id"], 12);
+        assert_eq!(fields.values["accepted"], 0);
+        assert_eq!(fields.values["stage"], "message_origin");
+        assert_eq!(fields.values.len(), 4);
+        fields.text("message_id", "not a number");
+        fields.text("stage", "private arbitrary text");
+        assert_eq!(fields.values["message_id"], u64::MAX);
+        assert_eq!(fields.values["stage"], "message_origin");
     }
 }
