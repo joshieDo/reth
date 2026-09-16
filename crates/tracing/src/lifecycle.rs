@@ -563,6 +563,9 @@ fn numeric_field(name: &str) -> bool {
             "channel" |
             "sequence" |
             "execution_ns" |
+            "execution_loop_ns" |
+            "execution_thread_cpu_ns" |
+            "execution_cpu_measured" |
             "receipt_ns" |
             "bookkeeping_ns" |
             "wait_ns" |
@@ -692,7 +695,8 @@ mod tests {
             execution.in_scope(|| {
                 tracing::info!(target: "lifecycle", stage="replay_start", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
                 tracing::debug_span!(target: "engine::tree", "execution").in_scope(|| {
-                    tracing::info!(target: "lifecycle", stage="execution_totals", execution_ns=12u64, transactions=3u64);
+                    tracing::info!(target: "lifecycle", stage="execution_totals", execution_ns=12u64, transactions=3u64, execution_loop_ns=20u64, execution_thread_cpu_ns=Some(15u64), execution_cpu_measured=1u64);
+                    tracing::info!(target: "lifecycle", stage="execution_totals", execution_loop_ns=21u64, execution_thread_cpu_ns=None::<u64>, execution_cpu_measured=0u64);
                 });
                 tracing::info!(target: "lifecycle", stage="replay_done", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
             });
@@ -720,6 +724,12 @@ mod tests {
         assert_eq!(totals["id"], replay["id"]);
         assert_eq!(replay["fields"]["block_hash"], ready["fields"]["block_hash"]);
         assert_eq!(totals["fields"]["transactions"], 3);
+        assert_eq!(totals["fields"]["execution_loop_ns"], 20);
+        assert_eq!(totals["fields"]["execution_thread_cpu_ns"], 15);
+        assert_eq!(totals["fields"]["execution_cpu_measured"], 1);
+        let unmeasured = rows.iter().find(|r| r["fields"]["execution_cpu_measured"] == 0).unwrap();
+        assert_eq!(unmeasured["fields"]["execution_loop_ns"], 21);
+        assert!(unmeasured["fields"].get("execution_thread_cpu_ns").is_none());
         let cancelled = rows.iter().find(|r| r["fields"]["stage"] == "cancelled").unwrap();
         assert_ne!(cancelled["id"], proposal["id"]);
         assert!(rows.iter().any(|r| r["id"] == cancelled["id"] && r["name"] == "handle_propose"));

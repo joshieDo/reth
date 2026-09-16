@@ -100,6 +100,7 @@ use crate::tree::{
         BlockAccessListDecodeError, InsertBlockError, InsertBlockErrorKind, InsertPayloadError,
     },
     instrumented_state::{InstrumentedStateProvider, StateProviderMetrics, StateProviderStats},
+    lifecycle_execution::ExecutionLoopTimer,
     payload_processor::PayloadProcessor,
     precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap},
     txpool_prewarm,
@@ -1283,6 +1284,7 @@ where
         let mut wait_ns = 0u64;
         let mut receipt_ns = 0u64;
         let accounting = tracing::enabled!(target: "lifecycle", Level::INFO);
+        let loop_timer = ExecutionLoopTimer::start(accounting);
         loop {
             // Measure time spent waiting for next transaction from iterator
             // (e.g., parallel signature recovery)
@@ -1337,7 +1339,13 @@ where
             }
         }
 
-        tracing::info!(target: "lifecycle", stage = "execution_totals", execution_ns, wait_ns, receipt_ns, transactions = senders.len() as u64);
+        if let Some(timer) = loop_timer {
+            let (execution_loop_ns, execution_thread_cpu_ns) = timer.finish();
+            tracing::info!(target: "lifecycle", stage = "execution_totals", execution_ns,
+                wait_ns, receipt_ns, execution_loop_ns, execution_thread_cpu_ns,
+                execution_cpu_measured = u64::from(execution_thread_cpu_ns.is_some()),
+                transactions = senders.len() as u64);
+        }
         drop(exec_span);
 
         Ok((executor, senders))

@@ -64,6 +64,7 @@ mod block_buffer;
 pub mod error;
 pub mod instrumented_state;
 mod invalid_headers;
+mod lifecycle_execution;
 mod metrics;
 pub mod payload_processor;
 pub mod payload_validator;
