@@ -8,7 +8,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -30,6 +30,7 @@ pub(crate) struct LifecycleLayer {
     key: [u8; 32],
     epoch: u64,
     next_span: AtomicU64,
+    backpressure_seen: AtomicBool,
     root_aggregates: Aggregates,
 }
 
@@ -117,6 +118,10 @@ impl LifecycleLayer {
                     // Continue draining so shutdown never waits on a full queue after an I/O error.
                     continue
                 }
+                // Make the stop boundary visible even when the stream is otherwise idle.
+                if value["fields"]["stage"] == "backpressure_start" && out.flush().is_err() {
+                    failed = true;
+                }
                 written += 1;
             }
             let footer = json!({"type":"footer", "written":written,
@@ -132,7 +137,17 @@ impl LifecycleLayer {
             worker: Some(worker),
             root_aggregates: Arc::clone(&root_aggregates),
         };
-        Ok((Self { writer, key, epoch, next_span: AtomicU64::new(1), root_aggregates }, guard))
+        Ok((
+            Self {
+                writer,
+                key,
+                epoch,
+                next_span: AtomicU64::new(1),
+                backpressure_seen: AtomicBool::new(false),
+                root_aggregates,
+            },
+            guard,
+        ))
     }
 
     fn stamp(&self, kind: &str, id: u64) -> Value {
@@ -227,7 +242,17 @@ where
         event.record(&mut fields);
         let mut value = self.stamp("event", parent.unwrap_or(0));
         value["fields"] = Value::Object(fields.values);
-        self.writer.send(value);
+        if value["fields"]["stage"] == "backpressure_start" &&
+            !self.backpressure_seen.swap(true, Ordering::Relaxed)
+        {
+            // A full queue must not drop the first stop boundary. This can block only
+            // after the measured pre-backpressure interval has already ended.
+            if self.writer.tx.send(Some(value)).is_err() {
+                self.writer.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            self.writer.send(value);
+        }
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
@@ -385,6 +410,7 @@ const STAGES: &[&str] = &[
     "frame_receive",
     "durable",
     "execution_totals",
+    "backpressure_start",
 ];
 
 fn canonical_field(name: &str) -> &str {
@@ -523,6 +549,33 @@ mod tests {
             values.iter().filter(|v| v["type"] == "end").count()
         );
     }
+    #[test]
+    fn backpressure_boundary_is_visible_before_shutdown() {
+        let path =
+            std::env::temp_dir().join(format!("lifecycle-boundary-{}.jsonl", monotonic_ns()));
+        let (layer, guard) =
+            LifecycleLayer::start(File::create(&path).unwrap(), [1; 32], monotonic_ns()).unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "lifecycle", stage = "backpressure_start");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let data = std::fs::read_to_string(&path).unwrap();
+            if data.lines().any(|line| {
+                serde_json::from_str::<Value>(line)
+                    .is_ok_and(|v| v["fields"]["stage"] == "backpressure_start")
+            }) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "boundary stayed buffered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(guard);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn hot_accessors_preserve_counts_and_owner_without_queue_pressure() {
         let path =

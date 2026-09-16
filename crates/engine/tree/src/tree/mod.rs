@@ -573,6 +573,7 @@ where
             }
 
             let event = if self.should_backpressure() {
+                tracing::info!(target: "lifecycle", stage = "backpressure_start");
                 self.metrics.engine.backpressure_active.set(1.0);
                 let stall_start = Instant::now();
                 let event = self.wait_for_persistence_event();
