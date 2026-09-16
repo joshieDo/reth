@@ -346,7 +346,11 @@ impl ProofWorkerHandle {
     ) -> Result<(), ProviderError> {
         let hashed_address = input.hashed_address;
         self.storage_work_tx
-            .send(StorageWorkerJob::StorageProof { input, proof_result_sender })
+            .send(StorageWorkerJob::StorageProof {
+                input,
+                proof_result_sender,
+                trace: ProofJobTrace::storage(self.storage_work_tx.len()),
+            })
             .map_err(|err| {
                 let StorageWorkerJob::StorageProof { proof_result_sender, .. } = err.0;
                 let _ = proof_result_sender.send(StorageProofResultMessage {
@@ -368,12 +372,15 @@ impl ProofWorkerHandle {
         input: AccountMultiproofInput,
     ) -> Result<(), ProviderError> {
         self.account_work_tx
-            .send(AccountWorkerJob::AccountMultiproof { input: Box::new(input) })
+            .send(AccountWorkerJob::AccountMultiproof {
+                input: Box::new(input),
+                trace: ProofJobTrace::account(self.account_work_tx.len()),
+            })
             .map_err(|err| {
                 let error =
                     ProviderError::other(std::io::Error::other("account workers unavailable"));
 
-                let AccountWorkerJob::AccountMultiproof { input } = err.0;
+                let AccountWorkerJob::AccountMultiproof { input, .. } = err.0;
                 let ProofResultContext { sender: result_tx, state, start_time: start } =
                     input.into_proof_result_sender();
 
@@ -564,6 +571,69 @@ pub struct StorageProofResultMessage {
     pub(crate) result: Result<StorageProofResult, StateProofError>,
 }
 
+/// Capture-only job metadata. Queue spans have no children, so dropping them at dequeue
+/// measures queue residence rather than the lifetime of references held by later work.
+#[derive(Debug)]
+pub(crate) struct ProofJobTrace {
+    queue: tracing::Span,
+    parent: tracing::Span,
+}
+
+impl ProofJobTrace {
+    fn storage(queued_jobs: usize) -> Self {
+        Self {
+            queue: debug_span!(target: "lifecycle", "proof.storage.queue_wait", queued_jobs),
+            parent: tracing::Span::current(),
+        }
+    }
+
+    fn account(queued_jobs: usize) -> Self {
+        Self {
+            queue: debug_span!(target: "lifecycle", "proof.account.queue_wait", queued_jobs),
+            parent: tracing::Span::current(),
+        }
+    }
+
+    fn start_storage(self) -> ProofServiceTrace {
+        let Self { queue, parent } = self;
+        drop(queue);
+        ProofServiceTrace {
+            span: debug_span!(target: "lifecycle", parent: parent, "proof.storage.work").entered(),
+            completed: false,
+        }
+    }
+
+    fn start_account(self) -> ProofServiceTrace {
+        let Self { queue, parent } = self;
+        drop(queue);
+        ProofServiceTrace {
+            span: debug_span!(target: "lifecycle", parent: parent, "proof.account.work").entered(),
+            completed: false,
+        }
+    }
+}
+
+/// Ends worker service independently of span references retained by dispatched storage work.
+struct ProofServiceTrace {
+    span: tracing::span::EnteredSpan,
+    completed: bool,
+}
+
+impl ProofServiceTrace {
+    fn complete(mut self) {
+        self.completed = true;
+        tracing::info!(target: "lifecycle", parent: &self.span, stage = "operation_completed");
+    }
+}
+
+impl Drop for ProofServiceTrace {
+    fn drop(&mut self) {
+        if !self.completed {
+            tracing::info!(target: "lifecycle", parent: &self.span, stage = "operation_abandoned");
+        }
+    }
+}
+
 /// Internal message for storage workers.
 #[derive(Debug)]
 pub(crate) enum StorageWorkerJob {
@@ -573,6 +643,8 @@ pub(crate) enum StorageWorkerJob {
         input: StorageProofInput,
         /// Context for sending the proof result.
         proof_result_sender: CrossbeamSender<StorageProofResultMessage>,
+        /// Queue interval and originating operation, independent of worker lifetime.
+        trace: ProofJobTrace,
     },
 }
 
@@ -680,6 +752,8 @@ where
 
             // Mark worker as busy.
             self.availability.mark_busy(self.worker_id);
+            let StorageWorkerJob::StorageProof { input, proof_result_sender, trace } = job;
+            let work = trace.start_storage();
 
             #[cfg(feature = "trie-debug")]
             if let Some(max_jitter) = self.task_ctx.proof_jitter {
@@ -694,17 +768,14 @@ where
                 std::thread::sleep(jitter);
             }
 
-            match job {
-                StorageWorkerJob::StorageProof { input, proof_result_sender } => {
-                    self.process_storage_proof(
-                        &proof_tx,
-                        &mut v2_calculator,
-                        input,
-                        proof_result_sender,
-                        &mut storage_proofs_processed,
-                    );
-                }
-            }
+            self.process_storage_proof(
+                &proof_tx,
+                &mut v2_calculator,
+                input,
+                proof_result_sender,
+                &mut storage_proofs_processed,
+            );
+            work.complete();
 
             // Mark worker as available again.
             self.availability.mark_idle(self.worker_id);
@@ -931,6 +1002,8 @@ where
 
             // Mark worker as busy.
             self.availability.mark_busy(self.worker_id);
+            let AccountWorkerJob::AccountMultiproof { input, trace } = job;
+            let work = trace.start_account();
 
             #[cfg(feature = "trie-debug")]
             if let Some(max_jitter) = self.task_ctx.proof_jitter {
@@ -945,18 +1018,15 @@ where
                 std::thread::sleep(jitter);
             }
 
-            match job {
-                AccountWorkerJob::AccountMultiproof { input } => {
-                    let value_encoder_stats = self.process_account_multiproof::<Factory::Provider>(
-                        &mut v2_account_calculator,
-                        v2_storage_calculator.clone(),
-                        *input,
-                        &mut account_proofs_processed,
-                    );
-                    total_idle_time += value_encoder_stats.storage_wait_time;
-                    value_encoder_stats_cache.extend(&value_encoder_stats);
-                }
-            }
+            let value_encoder_stats = self.process_account_multiproof::<Factory::Provider>(
+                &mut v2_account_calculator,
+                v2_storage_calculator.clone(),
+                *input,
+                &mut account_proofs_processed,
+            );
+            total_idle_time += value_encoder_stats.storage_wait_time;
+            value_encoder_stats_cache.extend(&value_encoder_stats);
+            work.complete();
 
             // Mark worker as available again.
             self.availability.mark_idle(self.worker_id);
@@ -1016,10 +1086,12 @@ where
             v2_storage_calculator,
         );
 
-        let account_proofs =
-            v2_account_calculator.proof(&mut value_encoder, &mut account_targets)?;
+        let account_proofs = debug_span!(target: "lifecycle", "proof.account.walk")
+            .in_scope(|| v2_account_calculator.proof(&mut value_encoder, &mut account_targets))?;
 
-        let (storage_proofs, value_encoder_stats) = value_encoder.finalize()?;
+        let (storage_proofs, value_encoder_stats) =
+            debug_span!(target: "lifecycle", "proof.account.collect_storage")
+                .in_scope(|| value_encoder.finalize())?;
 
         let proof = DecodedMultiProofV2 { account_proofs, storage_proofs };
 
@@ -1116,7 +1188,10 @@ fn dispatch_v2_storage_proofs(
         let input = StorageProofInput::new(hashed_address, targets, needs_root);
 
         storage_work_tx
-            .send(StorageWorkerJob::StorageProof { input, proof_result_sender: result_tx })
+            .send(StorageWorkerJob::StorageProof {
+                input, proof_result_sender: result_tx,
+                trace: ProofJobTrace::storage(storage_work_tx.len()),
+            })
             .map_err(|_| {
                 StateRootTaskError::Other(format!(
                     "Failed to queue storage proof for {hashed_address:?}: storage worker pool unavailable",
@@ -1170,6 +1245,8 @@ enum AccountWorkerJob {
     AccountMultiproof {
         /// Account multiproof input parameters
         input: Box<AccountMultiproofInput>,
+        /// Queue interval and originating operation, independent of worker lifetime.
+        trace: ProofJobTrace,
     },
 }
 
@@ -1179,6 +1256,108 @@ mod tests {
     use reth_chainspec::ChainSpec;
     use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
     use std::sync::Arc;
+
+    /// The capture subscriber closes spans when their last reference disappears. Queue
+    /// spans must therefore close before work starts, and must never parent that work.
+    #[test]
+    fn proof_queue_and_service_end_independently() {
+        use std::sync::Mutex;
+        use tracing::{
+            span::{Attributes, Id, Record},
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Default)]
+        struct Captured {
+            events: Vec<(&'static str, &'static str)>,
+            spans: Vec<(&'static str, usize)>,
+        }
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Captured>>);
+
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+                let mut capture = self.0.lock().unwrap();
+                let name = attrs.metadata().name();
+                capture.events.push(("start", name));
+                capture.spans.push((name, 1));
+                Id::from_u64(capture.spans.len() as u64)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                #[derive(Default)]
+                struct Stage(Option<&'static str>);
+                impl tracing::field::Visit for Stage {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "stage" {
+                            self.0 = match value {
+                                "operation_completed" => Some("operation_completed"),
+                                "operation_abandoned" => Some("operation_abandoned"),
+                                _ => None,
+                            };
+                        }
+                    }
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                let mut stage = Stage::default();
+                event.record(&mut stage);
+                if let Some(stage) = stage.0 {
+                    self.0.lock().unwrap().events.push(("event", stage));
+                }
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+            fn clone_span(&self, id: &Id) -> Id {
+                self.0.lock().unwrap().spans[id.into_u64() as usize - 1].1 += 1;
+                id.clone()
+            }
+            fn try_close(&self, id: Id) -> bool {
+                let mut capture = self.0.lock().unwrap();
+                let (name, refs) = &mut capture.spans[id.into_u64() as usize - 1];
+                *refs -= 1;
+                let (name, closed) = (*name, *refs == 0);
+                if closed {
+                    capture.events.push(("end", name));
+                }
+                closed
+            }
+        }
+
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let storage = ProofJobTrace::storage(2).start_storage();
+            let retained = storage.span.clone();
+            storage.complete();
+            assert_eq!(
+                capture.0.lock().unwrap().events.last(),
+                Some(&("event", "operation_completed"))
+            );
+            drop(retained);
+            let account = ProofJobTrace::account(3).start_account();
+            drop(account);
+        });
+        assert_eq!(
+            capture.0.lock().unwrap().events,
+            vec![
+                ("start", "proof.storage.queue_wait"),
+                ("end", "proof.storage.queue_wait"),
+                ("start", "proof.storage.work"),
+                ("event", "operation_completed"),
+                ("end", "proof.storage.work"),
+                ("start", "proof.account.queue_wait"),
+                ("end", "proof.account.queue_wait"),
+                ("start", "proof.account.work"),
+                ("event", "operation_abandoned"),
+                ("end", "proof.account.work"),
+            ]
+        );
+    }
 
     fn test_ctx<Factory>(factory: Factory) -> ProofTaskCtx<Factory> {
         ProofTaskCtx::new(factory)

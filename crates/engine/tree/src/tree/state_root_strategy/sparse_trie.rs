@@ -274,8 +274,14 @@ where
         // marker means they died without finishing the stream.
         while !self.finished_state_updates {
             let mut t = Instant::now();
+            let wait = debug_span!(target: "lifecycle", "proof.trie.wait_stream",
+                in_flight_proof_batches = self.in_flight_proof_batches,
+                pending_updates = self.pending_updates,
+                pending_targets = self.pending_targets.len())
+            .entered();
             crossbeam_channel::select_biased! {
                 recv(self.updates) -> message => {
+                    drop(wait);
                     let wake = Instant::now();
                     total_idle_time += wake.duration_since(idle_start);
                     self.metrics
@@ -291,6 +297,7 @@ where
                     self.pending_updates += 1;
                 }
                 recv(self.proof_result_rx) -> message => {
+                    drop(wait);
                     let wake = Instant::now();
                     total_idle_time += wake.duration_since(idle_start);
                     self.metrics
@@ -303,7 +310,10 @@ where
                     };
                     self.on_proof_results(result, &mut t)?;
                 },
-                recv(self.cancel_rx) -> _ => return Err(StateRootTaskError::Canceled),
+                recv(self.cancel_rx) -> _ => {
+                    drop(wait);
+                    return Err(StateRootTaskError::Canceled);
+                },
             }
 
             done = self.make_progress()?;
@@ -316,8 +326,12 @@ where
         // are ignored: with all updates known, prefetching has nothing left to help.
         while !done {
             let mut t = Instant::now();
+            let wait = debug_span!(target: "lifecycle", "proof.trie.wait_drain",
+                in_flight_proof_batches = self.in_flight_proof_batches)
+            .entered();
             crossbeam_channel::select_biased! {
                 recv(self.proof_result_rx) -> message => {
+                    drop(wait);
                     let wake = Instant::now();
                     total_idle_time += wake.duration_since(idle_start);
                     self.metrics
@@ -330,7 +344,10 @@ where
                     };
                     self.on_proof_results(result, &mut t)?;
                 },
-                recv(self.cancel_rx) -> _ => return Err(StateRootTaskError::Canceled),
+                recv(self.cancel_rx) -> _ => {
+                    drop(wait);
+                    return Err(StateRootTaskError::Canceled);
+                },
             }
 
             done = self.make_progress()?;
@@ -342,25 +359,28 @@ where
         debug!(target: "engine::root", "All proofs processed, ending calculation");
 
         let start = Instant::now();
-        let (state_root, trie_updates) = match self.trie.root_with_updates(self.new_epoch) {
-            Ok(result) => result,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    SparseStateTrieErrorKind::Sparse(SparseTrieErrorKind::Blind)
-                ) =>
+        let (state_root, trie_updates) =
+            match debug_span!(target: "lifecycle", "proof.trie.final_root")
+                .in_scope(|| self.trie.root_with_updates(self.new_epoch))
             {
-                // A still-blind account trie means this block never changed state, so preserve
-                // the cached parent root instead of fetching and revealing
-                // the unchanged root node.
-                (self.parent_state_root, TrieUpdates::default())
-            }
-            Err(err) => {
-                return Err(StateRootTaskError::Other(format!(
-                    "could not calculate state root: {err:?}"
-                )))
-            }
-        };
+                Ok(result) => result,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        SparseStateTrieErrorKind::Sparse(SparseTrieErrorKind::Blind)
+                    ) =>
+                {
+                    // A still-blind account trie means this block never changed state, so preserve
+                    // the cached parent root instead of fetching and revealing
+                    // the unchanged root node.
+                    (self.parent_state_root, TrieUpdates::default())
+                }
+                Err(err) => {
+                    return Err(StateRootTaskError::Other(format!(
+                        "could not calculate state root: {err:?}"
+                    )))
+                }
+            };
 
         let end = Instant::now();
         self.metrics.sparse_trie_final_update_duration_histogram.record(end.duration_since(start));
@@ -390,19 +410,27 @@ where
         message: ProofResultMessage,
         t: &mut Instant,
     ) -> Result<(), StateRootTaskError> {
+        let coalesce = debug_span!(target: "lifecycle", "proof.trie.coalesce_results",
+            result_count = tracing::field::Empty)
+        .entered();
+        let mut result_count = 1u64;
         let mut result = self.on_proof_result_message(message)?;
         while let Ok(next) = self.proof_result_rx.try_recv() {
             let res = self.on_proof_result_message(next)?;
             result.extend(res);
+            result_count += 1;
         }
 
+        coalesce.record("result_count", result_count);
+        drop(coalesce);
         let phase_end = Instant::now();
         self.metrics
             .sparse_trie_proof_coalesce_duration_histogram
             .record(phase_end.duration_since(*t));
         *t = phase_end;
 
-        self.on_proof_result(result)?;
+        debug_span!(target: "lifecycle", "proof.trie.reveal_results")
+            .in_scope(|| self.on_proof_result(result))?;
         self.metrics.sparse_trie_reveal_multiproof_duration_histogram.record(t.elapsed());
         Ok(())
     }
@@ -433,7 +461,8 @@ where
             // If there's still no pending updates spend some time pre-computing the account
             // trie upper hashes
             if self.proof_result_rx.is_empty() {
-                self.trie.calculate_subtries(self.new_epoch);
+                debug_span!(target: "lifecycle", "proof.trie.calculate_subtries")
+                    .in_scope(|| self.trie.calculate_subtries(self.new_epoch));
             }
         } else if !updates_queued {
             // If we don't have any pending updates, apply them to the trie,
