@@ -276,14 +276,14 @@ pub trait Tracer: Sized {
 impl Tracer for RethTracer {
     fn init_with_layers(self, mut layers: Layers) -> eyre::Result<TracingGuards> {
         let lifecycle = lifecycle::LifecycleLayer::from_env()?;
-        let lifecycle_guard =
-            lifecycle.map(|(layer, guard)| {
-                use tracing_subscriber::Layer;
-                layers.add_layer(layer.with_filter(tracing_subscriber::filter::filter_fn(
-                    lifecycle::capture_metadata,
-                )));
-                guard
-            });
+        let lifecycle_guard = lifecycle.map(|(layer, guard)| {
+            use tracing_subscriber::Layer;
+            let detail = layer.detail();
+            layers.add_layer(layer.with_filter(tracing_subscriber::filter::filter_fn(
+                move |meta| detail.capture_metadata(meta),
+            )));
+            guard
+        });
 
         // Configure stdout layer - reloadable if requested for runtime log level changes
         if let Some(handle) = layers.stdout(

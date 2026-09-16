@@ -29,12 +29,90 @@ thread_local! { static THREAD: Cell<u64> = const { Cell::new(0) }; }
 
 /// Captures a source-timestamped, privacy-filtered benchmark stream.
 pub(crate) struct LifecycleLayer {
+    detail: CaptureDetail,
     writer: Arc<Writer>,
     key: [u8; 32],
     epoch: u64,
     next_span: AtomicU64,
     backpressure_seen: AtomicBool,
     root_aggregates: Aggregates,
+}
+
+/// Runtime detail selection leaves cutoff and privacy handling unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CaptureDetail {
+    #[default]
+    Full,
+    Milestones,
+}
+
+impl CaptureDetail {
+    fn parse(value: Option<&str>) -> eyre::Result<Self> {
+        match value {
+            None | Some("full") => Ok(Self::Full),
+            Some("milestones") => Ok(Self::Milestones),
+            _ => eyre::bail!("TEMPO_LIFECYCLE_DETAIL must be full or milestones"),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Milestones => "milestones",
+        }
+    }
+
+    pub(crate) fn capture_metadata(self, meta: &tracing::Metadata<'_>) -> bool {
+        if self == Self::Full || meta.is_event() {
+            return capture_metadata(meta)
+        }
+        // These scopes carry otherwise implicit attempt/execution identities.
+        // Filtering at enablement avoids allocating detailed spans at all.
+        (meta.target().starts_with("tempo_consensus") &&
+            matches!(meta.name(), "handle_propose" | "handle_verify" | "verify")) ||
+            (meta.target() == "engine::tree::payload_validator" &&
+                matches!(meta.name(), "execute_block" | "execute_block_bal"))
+    }
+}
+
+#[derive(Default)]
+struct MilestoneStage {
+    keep: bool,
+}
+
+impl Visit for MilestoneStage {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() != "stage" {
+            return
+        }
+        self.keep = matches!(
+            value,
+            "proposal_start" |
+                "payload_built" |
+                "proposal_ready" |
+                "digest_released" |
+                "body_ready" |
+                "verify_start" |
+                "verify_done" |
+                "replay_start" |
+                "replay_done" |
+                "notarized" |
+                "finalized" |
+                "vote_sent" |
+                "notarize_vote_sent" |
+                "finalize_vote_sent" |
+                "finalization_received" |
+                "certified" |
+                "cancelled" |
+                "load_start" |
+                "load_end" |
+                "execution_totals" |
+                "backpressure_start" |
+                "proposal_failed"
+        );
+    }
+
+    fn record_debug(&mut self, _: &Field, _: &dyn fmt::Debug) {}
 }
 
 struct Writer {
@@ -88,6 +166,11 @@ fn flush_aggregates(writer: &Writer, owner: u64, aggregates: &Aggregates) {
 impl LifecycleLayer {
     pub(crate) fn from_env() -> eyre::Result<Option<(Self, LifecycleGuard)>> {
         let Some(path) = std::env::var_os("RETH_LIFECYCLE_FILE") else { return Ok(None) };
+        let detail = match std::env::var("TEMPO_LIFECYCLE_DETAIL") {
+            Ok(value) => CaptureDetail::parse(Some(&value))?,
+            Err(std::env::VarError::NotPresent) => CaptureDetail::Full,
+            Err(error) => return Err(error.into()),
+        };
         let key_path = std::env::var_os("RETH_LIFECYCLE_KEY_FILE")
             .ok_or_else(|| eyre::eyre!("lifecycle capture requires a key file"))?;
         let key: [u8; 32] = std::fs::read(key_path)?
@@ -103,10 +186,19 @@ impl LifecycleLayer {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        Ok(Some(Self::start(file, key, epoch)?))
+        Ok(Some(Self::start(file, key, epoch, detail)?))
     }
 
-    fn start(file: File, key: [u8; 32], epoch: u64) -> eyre::Result<(Self, LifecycleGuard)> {
+    pub(crate) const fn detail(&self) -> CaptureDetail {
+        self.detail
+    }
+
+    fn start(
+        file: File,
+        key: [u8; 32],
+        epoch: u64,
+        detail: CaptureDetail,
+    ) -> eyre::Result<(Self, LifecycleGuard)> {
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let writer = Arc::new(Writer { tx, dropped: Arc::clone(&dropped) });
@@ -133,7 +225,7 @@ impl LifecycleLayer {
             let _ = out.write_all(b"\n");
             let _ = out.flush();
         })?;
-        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns"}));
+        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label()}));
         let root_aggregates = Aggregates::default();
         let guard = LifecycleGuard {
             writer: Arc::clone(&writer),
@@ -142,6 +234,7 @@ impl LifecycleLayer {
         };
         Ok((
             Self {
+                detail,
                 writer,
                 key,
                 epoch,
@@ -239,6 +332,18 @@ where
         if event.metadata().target() != "lifecycle" {
             return
         }
+        if self.detail == CaptureDetail::Milestones {
+            // Inspect only the static stage before timestamps, formatting, JSON or
+            // queue allocation. Completion wrappers using Span::current can see
+            // a retained ancestor when their own scope is disabled. None of the
+            // retained identity scopes has a completion wrapper, so they remain
+            // span-lifetime context; only milestones determine phase durations.
+            let mut stage = MilestoneStage::default();
+            event.record(&mut stage);
+            if !stage.keep {
+                return
+            }
+        }
         let parent =
             ctx.event_span(event).and_then(|s| s.extensions().get::<CapturedSpan>().map(|s| s.id));
         let mut fields = self.fields();
@@ -259,10 +364,14 @@ where
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        self.span_event("enter", id, ctx);
+        if self.detail == CaptureDetail::Full {
+            self.span_event("enter", id, ctx);
+        }
     }
     fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
-        self.span_event("exit", id, ctx);
+        if self.detail == CaptureDetail::Full {
+            self.span_event("exit", id, ctx);
+        }
     }
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(&id) {
@@ -535,15 +644,141 @@ mod tests {
     use super::*;
     use tracing_subscriber::prelude::*;
 
+    // Different detail modes install different callsite interests. Keep these
+    // temporary registries isolated from concurrent interest-cache rebuilds.
+    static CAPTURE_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn detail_mode_rejects_unknown_values() {
+        assert_eq!(CaptureDetail::parse(None).unwrap(), CaptureDetail::Full);
+        assert_eq!(CaptureDetail::parse(Some("full")).unwrap(), CaptureDetail::Full);
+        assert_eq!(CaptureDetail::parse(Some("milestones")).unwrap(), CaptureDetail::Milestones);
+        assert!(CaptureDetail::parse(Some("off")).is_err());
+        assert!(CaptureDetail::parse(Some("")).is_err());
+    }
+
+    #[test]
+    fn milestones_preserve_identity_without_false_ancestor_completion() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("lifecycle-milestones-{}.jsonl", monotonic_ns()));
+        let detail = CaptureDetail::Milestones;
+        let (layer, guard) =
+            LifecycleLayer::start(File::create(&path).unwrap(), [7; 32], monotonic_ns(), detail)
+                .unwrap();
+        let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+            tracing_subscriber::filter::filter_fn(move |meta| detail.capture_metadata(meta)),
+        ));
+        tracing::subscriber::with_default(subscriber, || {
+            let proposal = tracing::info_span!(target: "tempo_consensus::consensus::application::actor", "handle_propose", epoch=1u64, view=2u64, block_hash=tracing::field::Empty);
+            proposal.in_scope(|| {
+                tracing::info!(target: "lifecycle", stage="proposal_start");
+                let child = tracing::debug_span!(target: "lifecycle", "proposal.persist");
+                assert!(child.is_disabled());
+                child.in_scope(|| {
+                    // Mirrors a future wrapper that captures Span::current after
+                    // entering a disabled child. Its completion is not the parent's.
+                    let captured_parent = tracing::Span::current();
+                    assert_eq!(captured_parent.id(), proposal.id());
+                    tracing::info!(target: "lifecycle", parent: &captured_parent, stage="operation_completed");
+                    tracing::info!(target: "lifecycle", parent: &captured_parent, stage="operation_abandoned");
+                    tracing::info!(target: "lifecycle", stage="proposal_ready", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                });
+                proposal.record("block_hash", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                tracing::info!(target: "lifecycle", stage="digest_released", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            });
+            let execution =
+                tracing::debug_span!(target: "engine::tree::payload_validator", "execute_block");
+            execution.in_scope(|| {
+                tracing::info!(target: "lifecycle", stage="replay_start", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                tracing::debug_span!(target: "engine::tree", "execution").in_scope(|| {
+                    tracing::info!(target: "lifecycle", stage="execution_totals", execution_ns=12u64, transactions=3u64);
+                });
+                tracing::info!(target: "lifecycle", stage="replay_done", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            });
+            tracing::info_span!(target: "tempo_consensus::consensus::application::actor", "handle_propose", epoch=1u64, view=3u64).in_scope(|| {
+                tracing::info!(target: "lifecycle", stage="proposal_start");
+                tracing::info!(target: "lifecycle", stage="cancelled");
+            });
+        });
+        drop(guard);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let rows: Vec<Value> = text.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(rows[0]["detail"], "milestones");
+        assert_eq!(rows.iter().filter(|r| r["type"] == "start").count(), 3);
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r["type"].as_str(), Some("enter" | "exit" | "aggregate"))));
+        assert!(!text.contains("operation_completed") && !text.contains("operation_abandoned"));
+        assert!(!text.contains("aaaaaaaaaaaaaaaa"));
+        let proposal = rows.iter().find(|r| r["name"] == "handle_propose").unwrap();
+        let ready = rows.iter().find(|r| r["fields"]["stage"] == "proposal_ready").unwrap();
+        assert_eq!(ready["id"], proposal["id"]);
+        let replay = rows.iter().find(|r| r["fields"]["stage"] == "replay_start").unwrap();
+        let totals = rows.iter().find(|r| r["fields"]["stage"] == "execution_totals").unwrap();
+        assert_eq!(totals["id"], replay["id"]);
+        assert_eq!(replay["fields"]["block_hash"], ready["fields"]["block_hash"]);
+        assert_eq!(totals["fields"]["transactions"], 3);
+        let cancelled = rows.iter().find(|r| r["fields"]["stage"] == "cancelled").unwrap();
+        assert_ne!(cancelled["id"], proposal["id"]);
+        assert!(rows.iter().any(|r| r["id"] == cancelled["id"] && r["name"] == "handle_propose"));
+        assert_eq!(rows.last().unwrap()["dropped"], 0);
+    }
+
+    #[test]
+    fn milestones_filter_hot_span_values_and_completion_fields() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        struct MustNotFormat;
+        impl fmt::Debug for MustNotFormat {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                panic!("excluded fields must not be formatted")
+            }
+        }
+        let path = std::env::temp_dir().join(format!("lifecycle-filter-{}.jsonl", monotonic_ns()));
+        let detail = CaptureDetail::Milestones;
+        let (layer, guard) =
+            LifecycleLayer::start(File::create(&path).unwrap(), [7; 32], monotonic_ns(), detail)
+                .unwrap();
+        let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+            tracing_subscriber::filter::filter_fn(move |meta| detail.capture_metadata(meta)),
+        ));
+        tracing::subscriber::with_default(subscriber, || {
+            let evaluations = Cell::new(0);
+            for _ in 0..100_000 {
+                let scope = tracing::debug_span!(target: "lifecycle", "proof.account.work", queued_jobs={evaluations.set(evaluations.get()+1); 1u64});
+                assert!(scope.is_disabled());
+                tracing::info!(target: "lifecycle", parent: &scope, stage="operation_completed", block_hash=?MustNotFormat);
+            }
+            tracing::info!(target: "lifecycle", stage="frame_send", frame_hash=?MustNotFormat);
+            assert_eq!(evaluations.get(), 0);
+        });
+        drop(guard);
+        let rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(rows.len(), 2, "only the header and footer should reach the writer");
+        assert_eq!(rows.last().unwrap()["dropped"], 0);
+    }
+
     #[test]
     fn capture_preserves_lifecycle_without_private_fields() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
         let path = std::env::temp_dir().join(format!(
             "lifecycle-test-{}-{}.jsonl",
             std::process::id(),
             monotonic_ns()
         ));
-        let (layer, guard) =
-            LifecycleLayer::start(File::create(&path).unwrap(), [7; 32], monotonic_ns()).unwrap();
+        let (layer, guard) = LifecycleLayer::start(
+            File::create(&path).unwrap(),
+            [7; 32],
+            monotonic_ns(),
+            CaptureDetail::Full,
+        )
+        .unwrap();
         let subscriber = tracing_subscriber::registry()
             .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
         tracing::subscriber::with_default(subscriber, || {
@@ -581,38 +816,87 @@ mod tests {
         );
     }
     #[test]
-    fn backpressure_boundary_is_visible_before_shutdown() {
-        let path =
-            std::env::temp_dir().join(format!("lifecycle-boundary-{}.jsonl", monotonic_ns()));
-        let (layer, guard) =
-            LifecycleLayer::start(File::create(&path).unwrap(), [1; 32], monotonic_ns()).unwrap();
-        let subscriber = tracing_subscriber::registry()
-            .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(target: "lifecycle", stage = "backpressure_start");
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let data = std::fs::read_to_string(&path).unwrap();
-            if data.lines().any(|line| {
-                serde_json::from_str::<Value>(line)
-                    .is_ok_and(|v| v["fields"]["stage"] == "backpressure_start")
-            }) {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "boundary stayed buffered");
-            std::thread::sleep(std::time::Duration::from_millis(5));
+    fn mandatory_boundary_survives_a_full_queue_in_both_modes() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(Some(json!({"type":"header"}))).unwrap();
+            let dropped = Arc::new(AtomicU64::new(0));
+            let layer = LifecycleLayer {
+                detail,
+                writer: Arc::new(Writer { tx, dropped: Arc::clone(&dropped) }),
+                key: [7; 32],
+                epoch: monotonic_ns(),
+                next_span: AtomicU64::new(1),
+                backpressure_seen: AtomicBool::new(false),
+                root_aggregates: Aggregates::default(),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+                tracing_subscriber::filter::filter_fn(move |meta| detail.capture_metadata(meta)),
+            ));
+            let reader = thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                assert_eq!(rx.recv().unwrap().unwrap()["type"], "header");
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap()
+            });
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "lifecycle", stage="backpressure_start", backlog=42u64);
+            });
+            let boundary = reader.join().unwrap();
+            assert_eq!(boundary["fields"]["stage"], "backpressure_start");
+            assert_eq!(boundary["fields"]["backlog"], 42);
+            assert_eq!(dropped.load(Ordering::Relaxed), 0);
         }
-        drop(guard);
-        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn backpressure_boundary_is_visible_before_shutdown() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            let path =
+                std::env::temp_dir().join(format!("lifecycle-boundary-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start(
+                File::create(&path).unwrap(),
+                [1; 32],
+                monotonic_ns(),
+                detail,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+                tracing_subscriber::filter::filter_fn(move |meta| detail.capture_metadata(meta)),
+            ));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "lifecycle", stage = "backpressure_start");
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let data = std::fs::read_to_string(&path).unwrap();
+                if data.lines().any(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .is_ok_and(|v| v["fields"]["stage"] == "backpressure_start")
+                }) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "boundary stayed buffered");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drop(guard);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
     fn hot_accessors_preserve_counts_and_owner_without_queue_pressure() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
         let path =
             std::env::temp_dir().join(format!("lifecycle-aggregate-{}.jsonl", monotonic_ns()));
-        let (layer, guard) =
-            LifecycleLayer::start(File::create(&path).unwrap(), [1; 32], monotonic_ns()).unwrap();
+        let (layer, guard) = LifecycleLayer::start(
+            File::create(&path).unwrap(),
+            [1; 32],
+            monotonic_ns(),
+            CaptureDetail::Full,
+        )
+        .unwrap();
         let subscriber = tracing_subscriber::registry()
             .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
         tracing::subscriber::with_default(subscriber, || {
