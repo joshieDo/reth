@@ -141,21 +141,21 @@ impl MultiProofTargetsV2 {
                 targets.account_targets.push(hashed_address.into());
             }
 
-            let mut storage_slots = Vec::with_capacity(account.storage.len());
-            for (key, slot) in account.storage {
-                // do nothing if unchanged
-                if !slot.is_changed() {
-                    continue
-                }
+            let storage_len = account.storage.len();
+            let mut changed_slots =
+                account.storage.into_iter().filter(|(_, slot)| slot.is_changed());
+            let Some(first_changed) = changed_slots.next() else { continue };
 
+            // Avoid allocating a buffer for accounts whose loaded storage is unchanged.
+            // Keep the original capacity for nonempty targets, so mixed states do not reallocate.
+            let mut storage_slots = Vec::with_capacity(storage_len);
+            for (key, _) in core::iter::once(first_changed).chain(changed_slots) {
                 let hashed_slot = keccak256(B256::new(key.to_be_bytes()));
                 storage_slots.push(ProofV2Target::from(hashed_slot));
             }
 
             storage_target_count += storage_slots.len();
-            if !storage_slots.is_empty() {
-                targets.storage_targets.insert(hashed_address, storage_slots);
-            }
+            targets.storage_targets.insert(hashed_address, storage_slots);
         }
 
         (targets, storage_target_count)
@@ -285,6 +285,162 @@ impl Iterator for ChunkedMultiProofTargetsV2 {
             None
         } else {
             Some(chunk)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, U256};
+    use revm::state::{Account, EvmStorageSlot, TransactionId};
+
+    fn account(changed: &[bool]) -> Account {
+        let mut account = Account::default();
+        account.mark_touch();
+        for (index, changed) in changed.iter().enumerate() {
+            let original = U256::from(index + 1);
+            let present = if *changed { original + U256::ONE } else { original };
+            account.storage.insert(
+                U256::from(index),
+                EvmStorageSlot::new_changed(original, present, TransactionId::ZERO),
+            );
+        }
+        account
+    }
+
+    // The previous eager implementation is an ordering/capacity oracle. Semantic expectations are
+    // checked independently below, including accounts with only account-info changes.
+    fn eager_from_state(state: EvmState) -> (MultiProofTargetsV2, usize) {
+        let mut targets = MultiProofTargetsV2::default();
+        targets.account_targets.reserve(state.len());
+        targets.storage_targets.reserve(state.len());
+        let mut count = 0;
+        for (addr, account) in state {
+            if !account.is_touched() || account.is_selfdestructed() {
+                continue
+            }
+            let hashed_address = keccak256(addr);
+            if account.info != account.original_info() {
+                targets.account_targets.push(hashed_address.into());
+            }
+            let mut slots = Vec::with_capacity(account.storage.len());
+            for (key, slot) in account.storage {
+                if slot.is_changed() {
+                    slots.push(keccak256(B256::new(key.to_be_bytes())).into());
+                }
+            }
+            count += slots.len();
+            if !slots.is_empty() {
+                targets.storage_targets.insert(hashed_address, slots);
+            }
+        }
+        (targets, count)
+    }
+
+    fn keys(targets: &[ProofV2Target]) -> Vec<(B256, ProofV2TargetParent)> {
+        targets.iter().map(|target| (target.key(), target.parent)).collect()
+    }
+
+    #[test]
+    fn from_state_empty_and_unchanged_storage() {
+        let (targets, count) = MultiProofTargetsV2::from_state(EvmState::default());
+        assert!(targets.is_empty());
+        assert_eq!(count, 0);
+        for changed in [vec![], vec![false; 64]] {
+            let state = core::iter::once((Address::ZERO, account(&changed))).collect();
+            let (targets, count) = MultiProofTargetsV2::from_state(state);
+            assert!(targets.is_empty());
+            assert_eq!(count, 0);
+        }
+    }
+
+    #[test]
+    fn from_state_account_info_survives_unchanged_storage() {
+        for changed in [vec![], vec![false; 64]] {
+            let mut account = account(&changed);
+            account.info.nonce = 1;
+            let state = core::iter::once((Address::ZERO, account)).collect();
+            let (targets, count) = MultiProofTargetsV2::from_state(state);
+            assert_eq!(
+                keys(&targets.account_targets),
+                [(keccak256(Address::ZERO), ProofV2TargetParent::NONE)]
+            );
+            assert!(targets.storage_targets.is_empty());
+            assert_eq!(count, 0);
+        }
+    }
+
+    #[test]
+    fn from_state_changed_storage_hashes_and_capacity() {
+        for changed in [vec![false, true, false, true], vec![true; 64]] {
+            let state = core::iter::once((Address::ZERO, account(&changed))).collect();
+            let (targets, count) = MultiProofTargetsV2::from_state(state);
+            assert!(targets.account_targets.is_empty());
+            assert_eq!(targets.storage_targets.len(), 1);
+            let slots = &targets.storage_targets[&keccak256(Address::ZERO)];
+            assert_eq!(slots.capacity(), changed.len());
+            assert_eq!(count, changed.iter().filter(|changed| **changed).count());
+            let mut expected: Vec<_> = changed
+                .iter()
+                .enumerate()
+                .filter(|(_, changed)| **changed)
+                .map(|(index, _)| keccak256(B256::new(U256::from(index).to_be_bytes())))
+                .collect();
+            let mut actual: Vec<_> = slots.iter().map(ProofV2Target::key).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+            assert!(slots.iter().all(|target| target.parent == ProofV2TargetParent::NONE));
+        }
+    }
+
+    #[test]
+    fn from_state_excludes_untouched_and_selfdestructed_accounts() {
+        let mut untouched = account(&[true, true]);
+        untouched.unmark_touch();
+        untouched.info.nonce = 1;
+        let mut destroyed = account(&[true, true]);
+        destroyed.mark_selfdestruct();
+        destroyed.info.nonce = 1;
+        let state = [(Address::ZERO, untouched), (Address::repeat_byte(1), destroyed)]
+            .into_iter()
+            .collect();
+        let (targets, count) = MultiProofTargetsV2::from_state(state);
+        assert!(targets.is_empty());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn from_state_matches_eager_targets_order_and_capacity() {
+        // Exercise every changed-slot subset, plus account-info changes and both exclusion rules.
+        for mask in 0..256_u16 {
+            let mut state = EvmState::default();
+            for index in 0..8_u8 {
+                let changed: Vec<_> = (0..8)
+                    .map(|bit| mask.rotate_left(u32::from(index)) & (1 << bit) != 0)
+                    .collect();
+                let mut account = account(&changed);
+                if index % 2 == 0 {
+                    account.info.nonce = 1;
+                }
+                if index == 6 {
+                    account.unmark_touch();
+                }
+                if index == 7 {
+                    account.mark_selfdestruct();
+                }
+                state.insert(Address::repeat_byte(index), account);
+            }
+            let (expected, expected_count) = eager_from_state(state.clone());
+            let (actual, actual_count) = MultiProofTargetsV2::from_state(state);
+            assert_eq!(actual_count, expected_count);
+            assert_eq!(keys(&actual.account_targets), keys(&expected.account_targets));
+            assert_eq!(actual.storage_targets.len(), expected.storage_targets.len());
+            for (address, slots) in expected.storage_targets {
+                assert_eq!(keys(&actual.storage_targets[&address]), keys(&slots));
+                assert_eq!(actual.storage_targets[&address].capacity(), slots.capacity());
+            }
         }
     }
 }
