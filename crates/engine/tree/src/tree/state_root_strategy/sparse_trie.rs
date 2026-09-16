@@ -1258,6 +1258,94 @@ mod tests {
         assert_eq!(account_rlp_buf, encoded);
     }
 
+    /// Chunking changes proof scheduling, but must preserve execution state and the root.
+    #[test]
+    fn proof_chunk_sizes_preserve_account_and_storage_root() {
+        use reth_provider::StateRootProvider;
+
+        let provider_factory = create_test_provider_factory();
+        let anchor_hash = init_genesis(&provider_factory).expect("initialize genesis");
+        let mut initial = HashedPostState::default();
+        let mut next = HashedPostState::default();
+        for index in 0u64..64 {
+            let address = keccak256(index.to_be_bytes());
+            initial.accounts.insert(
+                address,
+                Some(Account { nonce: 1, balance: U256::from(index + 100), bytecode_hash: None }),
+            );
+            let mut storage = reth_trie::HashedStorage::default();
+            for slot in 0u64..16 {
+                storage.storage.insert(keccak256(slot.to_be_bytes()), U256::from(slot + 1));
+            }
+            initial.storages.insert(address, storage);
+            if index % 2 == 0 {
+                next.accounts.insert(
+                    address,
+                    Some(Account {
+                        nonce: 2,
+                        balance: U256::from(index + 200),
+                        bytecode_hash: None,
+                    }),
+                );
+                let mut storage = reth_trie::HashedStorage::default();
+                // Overwrite and remove slots before the final state marker.
+                storage.storage.insert(keccak256(0u64.to_be_bytes()), U256::ZERO);
+                storage.storage.insert(keccak256(1u64.to_be_bytes()), U256::from(999));
+                next.storages.insert(address, storage);
+            }
+        }
+        let mut final_state = initial.clone();
+        final_state.extend(next.clone());
+        let expected_root =
+            provider_factory.latest().unwrap().state_root(final_state.clone()).unwrap();
+
+        for chunk_size in [5, 32] {
+            let runtime = reth_tasks::Runtime::test();
+            let state_provider_factory = OverlayStateProviderFactory::new(
+                provider_factory.clone(),
+                OverlayManager::<reth_chain_state::EthPrimitives>::default()
+                    .overlay_builder(anchor_hash),
+            );
+            let (proof_result_tx, proof_result_rx) = crossbeam_channel::unbounded();
+            let proof_worker_handle = ProofWorkerHandle::new(
+                &runtime,
+                ProofTaskCtx::new(state_provider_factory),
+                false,
+                proof_result_tx.clone(),
+            );
+            let default_trie = RevealableSparseTrie::blind_from(ArenaParallelSparseTrie::default());
+            let trie = SparseStateTrie::default()
+                .with_accounts_trie(default_trie.clone())
+                .with_default_storage_trie(default_trie)
+                .with_updates(true);
+            let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+            let (_cancel_guard, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+            let mut task = SparseTrieCacheTask::new_with_trie(
+                &runtime,
+                updates_rx,
+                cancel_rx,
+                std::sync::mpsc::channel().0,
+                proof_worker_handle,
+                proof_result_tx,
+                proof_result_rx,
+                SparseTrieTaskMetrics::default(),
+                trie,
+                B256::ZERO,
+                TrieNodeEpoch::UNMODIFIED,
+                chunk_size,
+            );
+            updates_tx.send(StateRootMessage::HashedStateUpdate(initial.clone())).unwrap();
+            updates_tx.send(StateRootMessage::HashedStateUpdate(next.clone())).unwrap();
+            updates_tx.send(StateRootMessage::FinishedStateUpdates).unwrap();
+            drop(updates_tx);
+            let outcome = task.run().expect("proof stream must drain");
+            assert_eq!(outcome.state_root, expected_root, "chunk size {chunk_size}");
+            assert_eq!(*outcome.hashed_state, final_state, "chunk size {chunk_size}");
+            drop(task);
+            drain_sparse_trie_tasks(&runtime);
+        }
+    }
+
     #[test]
     fn first_leaf_batch_starts_proofs_before_input_queue_drains() {
         let runtime = reth_tasks::Runtime::test();
