@@ -100,11 +100,14 @@ impl<TC, HC> Drop for AsyncAccountDeferredValueEncoder<TC, HC> {
                 let rx = proof_result_rx?;
 
                 let wait_start = Instant::now();
-                let msg = rx.recv().map_err(|_| {
-                    StateProofError::Database(DatabaseError::Other(format!(
-                        "Storage proof channel closed for {hashed_address:?}",
-                    )))
-                })?;
+                let msg =
+                    tracing::debug_span!(target: "lifecycle", "proof.storage.wait_deferred_drop")
+                        .in_scope(|| rx.recv())
+                        .map_err(|_| {
+                            StateProofError::Database(DatabaseError::Other(format!(
+                                "Storage proof channel closed for {hashed_address:?}",
+                            )))
+                        })?;
                 let result = msg.result?;
 
                 stats.borrow_mut().storage_wait_time += wait_start.elapsed();
@@ -145,14 +148,16 @@ where
                     .take()
                     .expect("encode called on already-consumed Dispatched encoder");
                 let wait_start = Instant::now();
-                let result = proof_result_rx?
-                    .recv()
-                    .map_err(|_| {
-                        StateProofError::Database(DatabaseError::Other(format!(
-                            "Storage proof channel closed for {hashed_address:?}",
-                        )))
-                    })?
-                    .result?;
+                let rx = proof_result_rx?;
+                let result =
+                    tracing::debug_span!(target: "lifecycle", "proof.storage.wait_deferred_encode")
+                        .in_scope(|| rx.recv())
+                        .map_err(|_| {
+                            StateProofError::Database(DatabaseError::Other(format!(
+                                "Storage proof channel closed for {hashed_address:?}",
+                            )))
+                        })?
+                        .result?;
                 stats.borrow_mut().storage_wait_time += wait_start.elapsed();
 
                 storage_proof_results.borrow_mut().insert(hashed_address, result.proof);
@@ -272,8 +277,8 @@ impl<TC, HC> AsyncAccountValueEncoder<TC, HC> {
         // These are proofs that were pre-dispatched but not consumed during proof calculation.
         for (hashed_address, rx) in &self.dispatched {
             let wait_start = Instant::now();
-            let result = rx
-                .recv()
+            let result = tracing::debug_span!(target: "lifecycle", "proof.storage.wait_finalize")
+                .in_scope(|| rx.recv())
                 .map_err(|_| {
                     StateProofError::Database(DatabaseError::Other(format!(
                         "Storage proof channel closed for {hashed_address:?}",
