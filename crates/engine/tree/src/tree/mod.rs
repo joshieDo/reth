@@ -573,7 +573,10 @@ where
             }
 
             let event = if self.should_backpressure() {
-                tracing::info!(target: "lifecycle", stage = "backpressure_start");
+                tracing::info!(target: "lifecycle", stage = "backpressure_start",
+                    canonical_height = self.state.tree_state.canonical_block_number(),
+                    persisted_height = self.persistence_state.last_persisted_block.number,
+                    backlog = self.persistence_backpressure_gap());
                 self.metrics.engine.backpressure_active.set(1.0);
                 let stall_start = Instant::now();
                 let event = self.wait_for_persistence_event();

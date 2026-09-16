@@ -142,7 +142,9 @@ impl PayloadExecutionCache {
     where
         F: FnOnce(&mut Option<SavedCache>),
     {
-        let mut guard = self.inner.lock();
+        let mut guard =
+            tracing::debug_span!(target: "lifecycle", "execution.cache.acquire_update_lock")
+                .in_scope(|| self.inner.lock());
         update_fn(&mut guard);
     }
 }

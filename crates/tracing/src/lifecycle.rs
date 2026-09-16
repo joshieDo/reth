@@ -411,6 +411,9 @@ const STAGES: &[&str] = &[
     "durable",
     "execution_totals",
     "backpressure_start",
+    "proposal_failed",
+    "marshal_enqueued",
+    "marshal_dequeued",
 ];
 
 fn canonical_field(name: &str) -> &str {
@@ -444,7 +447,15 @@ fn numeric_field(name: &str) -> bool {
             "receipt_ns" |
             "bookkeeping_ns" |
             "wait_ns" |
-            "head_block_height"
+            "head_block_height" |
+            "block_count" |
+            "state_trie_block_count" |
+            "first_block_number" |
+            "last_block_number" |
+            "canonical_height" |
+            "persisted_height" |
+            "state_trie_height" |
+            "backlog"
     )
 }
 
@@ -526,9 +537,9 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
         tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!(target:"lifecycle", "proposal", height=42u64, block_hash="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", secret="DO_NOT_EXPORT", ip="192.0.2.1", error=?"credential");
+            let span = tracing::info_span!(target:"lifecycle", "proposal", height=42u64, block_count=7u64, persisted_height=41u64, block_hash="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", secret="DO_NOT_EXPORT", ip="192.0.2.1", error=?"credential");
             let _entered = span.enter();
-            tracing::info!(target:"lifecycle", stage="body_ready", block_hash="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            tracing::info!(target:"lifecycle", stage="marshal_enqueued", block_hash="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
             tracing::info!(target:"lifecycle", stage="DO_NOT_EXPORT", payload="PRIVATE_TRANSACTION", private_key="DO_NOT_EXPORT");
             tracing::info!("DO_NOT_EXPORT");
         });
@@ -542,7 +553,10 @@ mod tests {
         }
         let values: Vec<Value> = data.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
         assert!(values.iter().any(|v| v["fields"]["height"] == 42));
-        assert!(values.iter().any(|v| v["fields"]["stage"] == "body_ready"));
+        assert!(values.iter().any(|v| v["fields"]["stage"] == "marshal_enqueued"));
+        assert!(values
+            .iter()
+            .any(|v| v["fields"]["block_count"] == 7 && v["fields"]["persisted_height"] == 41));
         assert_eq!(values.last().unwrap()["dropped"], 0);
         assert_eq!(
             values.iter().filter(|v| v["type"] == "start").count(),

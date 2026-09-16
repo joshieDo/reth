@@ -828,7 +828,8 @@ where
 
         let root_start = Instant::now();
         let root_outcome = ensure_ok_post_block!(
-            state_root_job.finish(&block, output.clone(), &hashed_state),
+            tracing::debug_span!(target: "lifecycle", "execution.state_root.finish", block_hash = %block.hash())
+                .in_scope(|| state_root_job.finish(&block, output.clone(), &hashed_state)),
             block
         );
         let root_elapsed = root_start.elapsed();

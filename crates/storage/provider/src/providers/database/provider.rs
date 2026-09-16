@@ -284,7 +284,8 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
         if storage_v2 {
             let batches = std::mem::take(&mut *self.pending_rocksdb_batches.lock());
             for batch in batches {
-                self.rocksdb_provider.commit_batch(batch)?;
+                tracing::debug_span!(target: "lifecycle", "persistence.rocksdb_commit")
+                    .in_scope(|| self.rocksdb_provider.commit_batch(batch))?;
             }
         }
 
@@ -555,6 +556,12 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         )
     }
 
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "persistence.provider_save",
+        level = "debug",
+        skip_all
+    )]
     fn save_blocks_inner(
         &self,
         blocks: &[ExecutedBlock<N::Primitives>],
@@ -623,6 +630,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 s.spawn(|_| {
                     let _guard = span.enter();
                     let start = Instant::now();
+                    let _write = tracing::debug_span!(target: "lifecycle", "persistence.static_file_write").entered();
                     let sf_ctx =
                         sf_ctx.expect("static file context exists when blocks are persisted");
                     sf_result = Some(
@@ -638,6 +646,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 s.spawn(|_| {
                     let _guard = span.enter();
                     let start = Instant::now();
+                    let _write = tracing::debug_span!(target: "lifecycle", "persistence.rocksdb_write").entered();
                     let rocksdb_ctx =
                         rocksdb_ctx.clone().expect("RocksDB context exists when enabled");
                     rocksdb_result = Some(
@@ -690,7 +699,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 let recovered_block = block.recovered_block();
 
                 let start = Instant::now();
-                self.insert_block_mdbx_only(recovered_block, tx_nums[i])?;
+                tracing::debug_span!(target: "lifecycle", "persistence.write_block", block_hash = %recovered_block.hash(), block_number = recovered_block.number())
+                    .in_scope(|| self.insert_block_mdbx_only(recovered_block, tx_nums[i]))?;
                 timings.insert_block += start.elapsed();
 
                 if save_mode.with_state() {
@@ -702,6 +712,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                     // Must be written after blocks because of the receipt lookup.
                     // Skip receipts/account changesets if they're being written to static files.
                     let start = Instant::now();
+                    let state_span = tracing::debug_span!(target: "lifecycle", "persistence.write_state", block_hash = %recovered_block.hash(), block_number = recovered_block.number()).entered();
                     self.write_state(
                         WriteStateInput::Single {
                             outcome: execution_output,
@@ -714,6 +725,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                             write_storage_changesets: !sf_ctx.write_storage_changesets,
                         },
                     )?;
+                    drop(state_span);
                     timings.write_state += start.elapsed();
                 }
             }
@@ -722,6 +734,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             // This reduces cursor open/close overhead from N calls to 1.
             if save_mode.with_state() && !state_trie_blocks.is_empty() {
                 let start = Instant::now();
+                let state_span = tracing::debug_span!(target: "lifecycle", "persistence.write_hashed_state").entered();
                 let batch = ExecutedBlock::hashed_state_refs(state_trie_blocks);
                 let mask = ExecutedBlock::hashed_state_refs(state_trie_masking_blocks);
                 let merged_hashed_state =
@@ -729,9 +742,11 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 if !merged_hashed_state.is_empty() {
                     self.write_hashed_state(&merged_hashed_state)?;
                 }
+                drop(state_span);
                 timings.write_hashed_state += start.elapsed();
 
                 let start = Instant::now();
+                let trie_span = tracing::debug_span!(target: "lifecycle", "persistence.write_trie_updates").entered();
                 let batch = ExecutedBlock::trie_updates_refs(state_trie_blocks);
                 let mask = ExecutedBlock::trie_updates_refs(state_trie_masking_blocks);
                 let merged_trie =
@@ -739,6 +754,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 if !merged_trie.is_empty() {
                     self.write_trie_updates_sorted(&merged_trie)?;
                 }
+                drop(trie_span);
                 timings.write_trie_updates += start.elapsed();
             }
 
@@ -747,7 +763,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 let Some(first_number) = first_number
             {
                 let start = Instant::now();
-                self.update_history_indices(first_number..=last_block_number)?;
+                tracing::debug_span!(target: "lifecycle", "persistence.update_history")
+                    .in_scope(|| self.update_history_indices(first_number..=last_block_number))?;
                 timings.update_history_indices = start.elapsed();
             }
 
@@ -3928,18 +3945,21 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
             let mut timings = metrics::CommitTimings::default();
 
             let start = Instant::now();
-            self.static_file_provider.finalize()?;
+            tracing::debug_span!(target: "lifecycle", "persistence.static_file_finalize")
+                .in_scope(|| self.static_file_provider.finalize())?;
             timings.sf = start.elapsed();
 
             let start = Instant::now();
             let batches = std::mem::take(&mut *self.pending_rocksdb_batches.lock());
             for batch in batches {
-                self.rocksdb_provider.commit_batch(batch)?;
+                tracing::debug_span!(target: "lifecycle", "persistence.rocksdb_commit")
+                    .in_scope(|| self.rocksdb_provider.commit_batch(batch))?;
             }
             timings.rocksdb = start.elapsed();
 
             let start = Instant::now();
-            self.tx.commit()?;
+            tracing::debug_span!(target: "lifecycle", "persistence.mdbx_commit")
+                .in_scope(|| self.tx.commit())?;
             timings.mdbx = start.elapsed();
 
             self.metrics.record_commit(&timings);

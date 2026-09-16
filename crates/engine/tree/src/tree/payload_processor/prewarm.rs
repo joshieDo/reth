@@ -306,7 +306,10 @@ where
 
                 // Insert state into cache while holding the lock
                 // Access the BundleState through the shared ExecutionOutcome
-                if new_cache.cache().insert_state(&execution_outcome.state).is_err() {
+                if tracing::debug_span!(target: "lifecycle", "execution.cache.insert_state")
+                    .in_scope(|| new_cache.cache().insert_state(&execution_outcome.state))
+                    .is_err()
+                {
                     // Clear the cache on error to prevent having a polluted cache
                     *cached = None;
                     debug!(target: "engine::caching", "cleared execution cache on update error");
@@ -315,7 +318,10 @@ where
 
                 new_cache.update_metrics(cache_state_metrics.as_ref());
 
-                if valid_block_rx.recv().is_ok() {
+                if tracing::debug_span!(target: "lifecycle", "execution.cache.wait_validation")
+                    .in_scope(|| valid_block_rx.recv())
+                    .is_ok()
+                {
                     // Replace the shared cache with the new one; the previous cache (if any) is
                     // dropped.
                     *cached = Some(new_cache);
