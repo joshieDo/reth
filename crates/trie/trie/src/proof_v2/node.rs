@@ -38,6 +38,23 @@ pub(crate) enum ProofTrieBranchChild<RF> {
     },
 }
 
+/// Mask metadata preserved while a child is consumed by its existing encoding path.
+pub(crate) enum EncodedChildMasks {
+    /// Leaf, extension and already-encoded nodes retain their existing mask bits.
+    Fixed(bool, bool),
+    /// A direct branch contributes a hash exactly when its encoded node is hashed.
+    DirectBranch { tree: bool },
+}
+
+impl EncodedChildMasks {
+    pub(crate) fn resolve(self, node: &RlpNode) -> (bool, bool) {
+        match self {
+            Self::Fixed(hash, tree) => (hash, tree),
+            Self::DirectBranch { tree } => (node.is_hash(), tree),
+        }
+    }
+}
+
 impl<RF: DeferredValueEncoder> ProofTrieBranchChild<RF> {
     /// Converts this child into its RLP node representation.
     ///
@@ -134,16 +151,21 @@ impl<RF: DeferredValueEncoder> ProofTrieBranchChild<RF> {
         }
     }
 
-    /// Returns this child's hash and tree mask contributions.
-    pub(crate) fn mask_bits(&self) -> (bool, bool) {
+    /// Preserves mask metadata; resolve it after the child's existing RLP conversion.
+    /// Direct branches reuse that conversion's hash decision instead of scanning their length.
+    pub(crate) fn mask_bits(&self) -> EncodedChildMasks {
         match self {
-            Self::Leaf { .. } => (false, false),
-            Self::Branch { node, masks } => (
-                node.key.is_empty() && node.length() >= 32,
-                masks.is_some_and(|masks| !masks.is_empty()),
-            ),
+            Self::Leaf { .. } => EncodedChildMasks::Fixed(false, false),
+            Self::Branch { node, masks } => {
+                let tree = masks.is_some_and(|masks| !masks.is_empty());
+                if node.key.is_empty() {
+                    EncodedChildMasks::DirectBranch { tree }
+                } else {
+                    EncodedChildMasks::Fixed(false, tree)
+                }
+            }
             Self::RlpNode { short_key, hash_mask_bit, tree_mask_bit, .. } => {
-                (*hash_mask_bit && short_key.is_empty(), *tree_mask_bit)
+                EncodedChildMasks::Fixed(*hash_mask_bit && short_key.is_empty(), *tree_mask_bit)
             }
         }
     }
@@ -193,6 +215,109 @@ pub(crate) fn trim_nibbles_prefix(n: &Nibbles, len: usize) -> Nibbles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct TestValue;
+
+    impl DeferredValueEncoder for TestValue {
+        fn encode(self, buf: &mut Vec<u8>) -> Result<(), StateProofError> {
+            buf.push(1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn encoded_branch_masks_preserve_inline_hash_boundary_and_extensions() {
+        for (sizes, expected_len) in [([4, 5], 31), ([5, 5], 32), ([6, 6], 34)] {
+            let children = sizes.map(|size| {
+                let mut encoded = Vec::new();
+                LeafNode::new(Nibbles::new(), vec![1; size]).encode(&mut encoded);
+                RlpNode::from_rlp(&encoded)
+            });
+            for masks in [
+                None,
+                Some(BranchNodeMasks::default()),
+                Some(BranchNodeMasks {
+                    hash_mask: TrieMask::new(1),
+                    tree_mask: TrieMask::default(),
+                }),
+            ] {
+                for extension in [false, true] {
+                    let mut branch = BranchNodeV2::new(
+                        Nibbles::new(),
+                        children.to_vec(),
+                        TrieMask::new(3),
+                        None,
+                    );
+                    let mut branch_bytes = Vec::new();
+                    branch.encode(&mut branch_bytes);
+                    assert_eq!(branch_bytes.len(), expected_len);
+                    if extension {
+                        branch.key = Nibbles::from_nibbles([1]);
+                        branch.branch_rlp_node = Some(RlpNode::from_rlp(&branch_bytes));
+                    }
+                    let expected =
+                        (!extension && expected_len >= 32, masks.is_some_and(|m| !m.is_empty()));
+                    let child =
+                        ProofTrieBranchChild::<TestValue>::Branch { node: branch.clone(), masks };
+                    let pending = child.mask_bits();
+                    let mut encoded = Vec::new();
+                    let (actual, returned_stack) = child.into_rlp(&mut encoded).unwrap();
+                    assert_eq!(pending.resolve(&actual), expected);
+                    let mut oracle = Vec::new();
+                    branch.encode(&mut oracle);
+                    assert_eq!(encoded, oracle);
+                    assert_eq!(returned_stack.unwrap(), children);
+                    // The retained-proof conversion used by commit_last_child must agree too.
+                    let child = ProofTrieBranchChild::<TestValue>::Branch { node: branch, masks };
+                    let pending = child.mask_bits();
+                    let proof =
+                        child.into_proof_trie_node(Nibbles::new(), &mut Vec::new()).unwrap();
+                    let mut encoded = Vec::new();
+                    proof.node.encode(&mut encoded);
+                    assert_eq!(pending.resolve(&RlpNode::from_rlp(&encoded)), expected);
+                    assert_eq!(proof.masks, masks);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_masks_preserve_leaf_cached_flags_and_errors() {
+        for short_key in [Nibbles::new(), Nibbles::from_nibbles([1])] {
+            for hash_mask_bit in [false, true] {
+                for tree_mask_bit in [false, true] {
+                    let child = ProofTrieBranchChild::<TestValue>::RlpNode {
+                        node: RlpNode::word_rlp(&alloy_primitives::B256::ZERO),
+                        short_key,
+                        hash_mask_bit,
+                        tree_mask_bit,
+                    };
+                    let pending = child.mask_bits();
+                    // Fixed cached metadata is not inferred from encoded size.
+                    assert_eq!(
+                        pending.resolve(&RlpNode::default()),
+                        (hash_mask_bit && short_key.is_empty(), tree_mask_bit)
+                    );
+                }
+            }
+        }
+        let child = ProofTrieBranchChild::Leaf { short_key: Nibbles::new(), value: TestValue };
+        let pending = child.mask_bits();
+        let (encoded, _) = child.into_rlp(&mut Vec::new()).unwrap();
+        assert_eq!(pending.resolve(&encoded), (false, false));
+        struct FailingValue;
+        impl DeferredValueEncoder for FailingValue {
+            fn encode(self, _: &mut Vec<u8>) -> Result<(), StateProofError> {
+                Err(StateProofError::TrieInconsistency("sentinel".into()))
+            }
+        }
+        let child = ProofTrieBranchChild::Leaf { short_key: Nibbles::new(), value: FailingValue };
+        let _pending = child.mask_bits();
+        assert!(
+            matches!(child.into_rlp(&mut Vec::new()), Err(StateProofError::TrieInconsistency(s)) if s == "sentinel")
+        );
+    }
 
     #[test]
     fn test_trim_nibbles_prefix_basic() {

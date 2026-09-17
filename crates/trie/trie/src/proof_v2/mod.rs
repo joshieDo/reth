@@ -354,8 +354,9 @@ where
         // Only commit immediately if retained for the proof. Otherwise, defer conversion
         // to pop_branch() to give DeferredEncoder time for async work.
         if self.should_retain(targets, &child_path, true) {
-            let (hash_mask_bit, tree_mask_bit) = child.mask_bits();
+            let child_masks = child.mask_bits();
             let child_rlp_node = self.commit_child(child_path, child)?;
+            let (hash_mask_bit, tree_mask_bit) = child_masks.resolve(&child_rlp_node);
             trace!(target: TRACE_TARGET, ?child_rlp_node, "Pushing committed child RlpNode onto stack");
             self.child_stack.push(ProofTrieBranchChild::RlpNode {
                 node: child_rlp_node,
@@ -563,11 +564,11 @@ where
             .iter()
             .zip(self.child_stack.drain(self.child_stack.len() - num_children..))
         {
-            let (hash_mask_bit, tree_mask_bit) = child.mask_bits();
-            masks.set_child_bits(nibble, hash_mask_bit, tree_mask_bit);
-
+            let child_masks = child.mask_bits();
             self.rlp_encode_buf.clear();
             let (child_rlp_node, freed_buf) = child.into_rlp(&mut self.rlp_encode_buf)?;
+            let (hash_mask_bit, tree_mask_bit) = child_masks.resolve(&child_rlp_node);
+            masks.set_child_bits(nibble, hash_mask_bit, tree_mask_bit);
             if let Some(buf) = freed_buf {
                 self.rlp_nodes_bufs.push(buf);
             }
