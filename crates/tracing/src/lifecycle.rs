@@ -215,6 +215,14 @@ struct CapturedSpan {
     sample: Option<(&'static str, u64)>,
 }
 
+fn parse_cache_insert(value: Option<&str>) -> eyre::Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => eyre::bail!("TEMPO_LIFECYCLE_CACHE_INSERT must be 0 or 1"),
+    }
+}
+
 fn aggregate_name(name: &str) -> bool {
     matches!(
         name,
@@ -242,6 +250,15 @@ impl LifecycleLayer {
             Err(std::env::VarError::NotPresent) => CaptureDetail::Full,
             Err(error) => return Err(error.into()),
         };
+        let cache_insert = match std::env::var("TEMPO_LIFECYCLE_CACHE_INSERT") {
+            Ok(value) => parse_cache_insert(Some(&value))?,
+            Err(std::env::VarError::NotPresent) => false,
+            Err(error) => return Err(error.into()),
+        };
+        eyre::ensure!(
+            !cache_insert || detail == CaptureDetail::Full,
+            "cache insertion observations require full capture"
+        );
         let key_path = std::env::var_os("RETH_LIFECYCLE_KEY_FILE")
             .ok_or_else(|| eyre::eyre!("lifecycle capture requires a key file"))?;
         let key: [u8; 32] = std::fs::read(key_path)?
@@ -257,19 +274,34 @@ impl LifecycleLayer {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        Ok(Some(Self::start(file, key, epoch, detail)?))
+        Ok(Some(Self::start_observed(file, key, epoch, detail, cache_insert)?))
     }
 
     pub(crate) const fn detail(&self) -> CaptureDetail {
         self.detail
     }
 
+    #[cfg(test)]
     fn start(
         file: File,
         key: [u8; 32],
         epoch: u64,
         detail: CaptureDetail,
     ) -> eyre::Result<(Self, LifecycleGuard)> {
+        Self::start_observed(file, key, epoch, detail, false)
+    }
+
+    fn start_observed(
+        file: File,
+        key: [u8; 32],
+        epoch: u64,
+        detail: CaptureDetail,
+        cache_insert: bool,
+    ) -> eyre::Result<(Self, LifecycleGuard)> {
+        eyre::ensure!(
+            !cache_insert || detail == CaptureDetail::Full,
+            "cache insertion observations require full capture"
+        );
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let writer = Arc::new(Writer { tx, dropped: Arc::clone(&dropped) });
@@ -295,7 +327,8 @@ impl LifecycleLayer {
             let _ = out.write_all(b"\n");
             let _ = out.flush();
         })?;
-        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label()}));
+        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(),
+            "cache_insert": if cache_insert { "counts_v1" } else { "disabled" }}));
         let root_aggregates = Aggregates::default();
         let guard = LifecycleGuard {
             writer: Arc::clone(&writer),
@@ -853,6 +886,31 @@ mod tests {
         drop(rx);
         writer.send(CaptureRecord::End { id: 9, ts: 14, thread: 11 });
         assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn cache_insert_mode_header_is_explicit_and_closed() {
+        assert!(!parse_cache_insert(None).unwrap());
+        assert!(!parse_cache_insert(Some("0")).unwrap());
+        assert!(parse_cache_insert(Some("1")).unwrap());
+        assert!(parse_cache_insert(Some("private")).is_err());
+        for enabled in [false, true] {
+            let path =
+                std::env::temp_dir().join(format!("lifecycle-cache-mode-{}.jsonl", monotonic_ns()));
+            let (_, guard) = LifecycleLayer::start_observed(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                CaptureDetail::Full,
+                enabled,
+            )
+            .unwrap();
+            drop(guard);
+            let data = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let header: Value = serde_json::from_str(data.lines().next().unwrap()).unwrap();
+            assert_eq!(header["cache_insert"], if enabled { "counts_v1" } else { "disabled" });
+        }
     }
 
     #[test]
