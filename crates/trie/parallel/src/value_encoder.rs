@@ -32,10 +32,10 @@ pub(crate) struct ValueEncoderStats {
     pub(crate) dispatched_count: u64,
     /// Number of times the `FromCache` variant was used (storage root already cached).
     pub(crate) from_cache_count: u64,
-    /// Number of times the `Sync` variant was used (synchronous computation).
+    /// Number of times the `Sync` variant was selected after an initial cache miss.
     pub(crate) sync_count: u64,
-    /// Number of times a dispatched storage proof had no root node and fell back to sync
-    /// computation.
+    /// Number of times a dispatched storage proof had no root node and required a
+    /// cached-root or synchronous-computation fallback.
     pub(crate) dispatched_missing_root_count: u64,
 }
 
@@ -178,21 +178,25 @@ where
                         // to be encoded as part of general trie traversal, so we need to handle
                         // that case here.
                         stats.borrow_mut().dispatched_missing_root_count += 1;
+                        // A sibling may have computed this root while we waited
+                        // for the proof. Copy it before borrowing a cursor or
+                        // inserting into the map, releasing the DashMap guard.
+                        let cached_root =
+                            cached_storage_roots.get(&hashed_address).map(|root| *root);
                         if let Some(observer) = root_work {
-                            observer.observe(
-                                RootWorkKind::AccountMissing,
-                                cached_storage_roots.contains_key(&hashed_address),
-                            );
+                            observer.observe(RootWorkKind::AccountMissing, cached_root.is_some());
                         }
-
-                        let mut calculator = storage_calculator.borrow_mut();
-                        let root_node = calculator.storage_root_node(hashed_address)?;
-                        let storage_root = calculator
-                            .compute_root_hash(&[root_node])?
-                            .expect("storage_root_node returns a node at empty path");
-
-                        cached_storage_roots.insert(hashed_address, storage_root);
-                        storage_root
+                        if let Some(root) = cached_root {
+                            root
+                        } else {
+                            let mut calculator = storage_calculator.borrow_mut();
+                            let root_node = calculator.storage_root_node(hashed_address)?;
+                            let storage_root = calculator
+                                .compute_root_hash(&[root_node])?
+                                .expect("storage_root_node returns a node at empty path");
+                            cached_storage_roots.insert(hashed_address, storage_root);
+                            storage_root
+                        }
                     }
                 };
 
@@ -208,20 +212,24 @@ where
             } => {
                 let hashed_address = *hashed_address;
                 let account = *account;
+                // Recheck the same cache used by deferred_encoder: another
+                // worker may fill it between constructing and encoding this leaf.
+                let cached_root = cached_storage_roots.get(&hashed_address).map(|root| *root);
                 if let Some(observer) = root_work {
-                    observer.observe(
-                        RootWorkKind::AccountSync,
-                        cached_storage_roots.contains_key(&hashed_address),
-                    );
+                    observer.observe(RootWorkKind::AccountSync, cached_root.is_some());
                 }
-                let mut calculator = storage_calculator.borrow_mut();
-                let root_node = calculator.storage_root_node(hashed_address)?;
-                let storage_root = calculator
-                    .compute_root_hash(&[root_node])?
-                    .expect("storage_root_node returns a node at empty path");
-
-                cached_storage_roots.insert(hashed_address, storage_root);
-                (account, storage_root)
+                let root = if let Some(root) = cached_root {
+                    root
+                } else {
+                    let mut calculator = storage_calculator.borrow_mut();
+                    let root_node = calculator.storage_root_node(hashed_address)?;
+                    let storage_root = calculator
+                        .compute_root_hash(&[root_node])?
+                        .expect("storage_root_node returns a node at empty path");
+                    cached_storage_roots.insert(hashed_address, storage_root);
+                    storage_root
+                };
+                (account, root)
             }
         };
 
@@ -380,8 +388,143 @@ mod tests {
         trie_cursor::TrieCursorFactory,
     };
 
+    struct FailingStorageCursor<C> {
+        inner: C,
+        fail: Rc<std::cell::Cell<bool>>,
+        calls: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<C: reth_trie::hashed_cursor::HashedCursor<Value = alloy_primitives::U256>>
+        reth_trie::hashed_cursor::HashedCursor for FailingStorageCursor<C>
+    {
+        type Value = alloy_primitives::U256;
+        fn seek(&mut self, key: B256) -> Result<Option<(B256, Self::Value)>, DatabaseError> {
+            self.inner.seek(key)
+        }
+        fn next(&mut self) -> Result<Option<(B256, Self::Value)>, DatabaseError> {
+            self.inner.next()
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+    }
+
+    impl<C: HashedStorageCursor<Value = alloy_primitives::U256>> HashedStorageCursor
+        for FailingStorageCursor<C>
+    {
+        fn is_storage_empty(&mut self) -> Result<bool, DatabaseError> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail.get() {
+                return Err(DatabaseError::Other("root cursor fixture failure".into()));
+            }
+            self.inner.is_storage_empty()
+        }
+        fn set_hashed_address(&mut self, address: B256) {
+            self.inner.set_hashed_address(address);
+        }
+    }
+
     #[test]
-    fn root_opportunities_count_delayed_fallbacks_without_reusing_cache() {
+    fn cached_root_recheck_skips_walk_but_preserves_proofs_and_errors() {
+        let harness = TrieTestHarness::new(
+            [(B256::repeat_byte(0x10), alloy_primitives::U256::from(1))].into(),
+        );
+        let trie_factory = harness.trie_cursor_factory();
+        let hashed_factory = harness.hashed_cursor_factory();
+        let fail = Rc::new(std::cell::Cell::new(false));
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let calculator = Rc::new(RefCell::new(StorageProofCalculator::new_storage(
+            trie_factory.storage_trie_cursor(B256::ZERO).unwrap(),
+            FailingStorageCursor {
+                inner: hashed_factory.hashed_storage_cursor(B256::ZERO).unwrap(),
+                fail: fail.clone(),
+                calls: calls.clone(),
+            },
+        )));
+        let root_node = calculator.borrow_mut().storage_root_node(B256::ZERO).unwrap();
+        let root = calculator.borrow_mut().compute_root_hash(&[root_node]).unwrap().unwrap();
+        let mut expected = Vec::new();
+        Account::default().into_trie_account(root).encode(&mut expected);
+        let cache = Arc::new(DashMap::default());
+        for observed in [false, true] {
+            let observer = observed.then(|| Rc::new(RootWorkObserver::default()));
+            for dispatched in [false, true] {
+                for cached in [false, true] {
+                    cache.clear();
+                    let mut pending = B256Map::default();
+                    if dispatched {
+                        let (tx, rx) = crossbeam_channel::unbounded();
+                        tx.send(StorageProofResultMessage {
+                            hashed_address: B256::ZERO,
+                            result: Ok(StorageProofResult { proof: Vec::new(), root: None }),
+                        })
+                        .unwrap();
+                        pending.insert(B256::ZERO, rx);
+                    }
+                    let mut encoder = AsyncAccountValueEncoder::new(
+                        pending,
+                        cache.clone(),
+                        calculator.clone(),
+                        observer.clone(),
+                    );
+                    let deferred = encoder.deferred_encoder(B256::ZERO, Account::default());
+                    if cached {
+                        cache.insert(B256::ZERO, root);
+                    }
+                    fail.set(true);
+                    let before = calls.get();
+                    let mut actual = Vec::new();
+                    let result = deferred.encode(&mut actual);
+                    if cached {
+                        result.expect("a cached root must avoid the failing root-only cursor");
+                        assert_eq!(actual, expected);
+                        assert_eq!(calls.get(), before);
+                    } else {
+                        assert!(result.is_err(), "a cache miss must preserve the cursor error");
+                        assert_eq!(calls.get(), before + 1);
+                    }
+                    let (proofs, _) = encoder.finalize().unwrap();
+                    assert_eq!(
+                        proofs.contains_key(&B256::ZERO),
+                        dispatched,
+                        "dispatched proof results must still be consumed and retained"
+                    );
+                }
+            }
+            if let Some(observer) = observer {
+                assert_eq!(observer.snapshot().account_sync_roots, 2);
+                assert_eq!(observer.snapshot().account_sync_cached, 1);
+                assert_eq!(observer.snapshot().account_missing_roots, 2);
+                assert_eq!(observer.snapshot().account_missing_cached, 1);
+            }
+        }
+        // A successful cache lookup must not mask a failed dispatched proof.
+        cache.insert(B256::ZERO, root);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(StorageProofResultMessage {
+            hashed_address: B256::ZERO,
+            result: Err(StateProofError::Database(DatabaseError::Other(
+                "proof fixture failure".into(),
+            ))),
+        })
+        .unwrap();
+        let mut encoder = AsyncAccountValueEncoder::new(
+            std::iter::once((B256::ZERO, rx)).collect(),
+            cache,
+            calculator,
+            None,
+        );
+        let before = calls.get();
+        assert!(encoder
+            .deferred_encoder(B256::ZERO, Account::default())
+            .encode(&mut Vec::new())
+            .is_err());
+        assert_eq!(calls.get(), before);
+        assert!(encoder.finalize().unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn root_opportunities_count_delayed_fallback_decisions() {
         let harness = TrieTestHarness::new(
             [(B256::repeat_byte(0x10), alloy_primitives::U256::from(1))].into(),
         );
@@ -416,9 +559,9 @@ mod tests {
                 Some(observer.clone()),
             );
             let deferred = encoder.deferred_encoder(B256::ZERO, Account::default());
-            // Simulate a cache fill after the deferred encoder was created. A
-            // bogus root proves the diagnostic still computes the original result.
-            cache.insert(B256::ZERO, B256::repeat_byte(99));
+            // Simulate another worker caching this same snapshot's valid root
+            // after the deferred encoder was created.
+            cache.insert(B256::ZERO, root);
             let mut actual = Vec::new();
             deferred.encode(&mut actual).unwrap();
             assert_eq!(actual, expected);
