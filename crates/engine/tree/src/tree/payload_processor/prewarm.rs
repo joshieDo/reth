@@ -11,7 +11,9 @@
 //! 2. Prewarming tasks execute transactions in parallel using shared caches
 //! 3. When actual block execution happens, it benefits from the warmed cache
 
-use super::{bal_prewarm_pool::BalPrewarmPool, StateRootHintStream, StateRootUpdateStream};
+use super::{
+    bal_prewarm_pool::BalPrewarmPool, StateAccessHint, StateRootHintStream, StateRootUpdateStream,
+};
 use crate::tree::{
     precompile_cache::{CachedPrecompile, PrecompileCacheMap},
     CachedStateCacheMetrics, CachedStateMetrics, CachedStateProvider, ExecutionEnv,
@@ -259,10 +261,14 @@ where
             }
 
             if index > 0 {
-                let (targets, storage_targets) = MultiProofTargetsV2::from_state(res.state);
-                ctx.metrics.prefetch_storage_targets.record(storage_targets as f64);
                 if let Some(state_root_hint_stream) = state_root_hint_stream {
-                    state_root_hint_stream.on_access_hint(targets.into());
+                    let (hint, storage_targets) = StateAccessHint::from_state(res.state);
+                    ctx.metrics.prefetch_storage_targets.record(storage_targets as f64);
+                    state_root_hint_stream.on_access_hint(hint);
+                } else {
+                    // Without a hint consumer, retain the existing count-only target path.
+                    let (_targets, storage_targets) = MultiProofTargetsV2::from_state(res.state);
+                    ctx.metrics.prefetch_storage_targets.record(storage_targets as f64);
                 }
             }
 

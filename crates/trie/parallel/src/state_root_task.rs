@@ -304,6 +304,44 @@ pub struct StateAccessHint {
     pub storages: B256Map<Vec<B256>>,
 }
 
+impl StateAccessHint {
+    /// Hashes the changed state into access hints without an intermediate nibble representation.
+    ///
+    /// This selects the same targets as [`MultiProofTargetsV2::from_state`] and returns the number
+    /// of storage targets. Untouched and selfdestructed accounts do not contribute hints.
+    pub fn from_state(state: EvmState) -> (Self, usize) {
+        let mut hint = Self::default();
+        hint.accounts.reserve(state.len());
+        hint.storages.reserve(state.len());
+        let mut storage_target_count = 0;
+        for (address, account) in state {
+            if !account.is_touched() || account.is_selfdestructed() {
+                continue
+            }
+            let hashed_address = keccak256(address);
+            if account.info != account.original_info() {
+                hint.accounts.push(hashed_address);
+            }
+            let mut slots = Vec::with_capacity(account.storage.len());
+            for (key, slot) in account.storage {
+                if slot.is_changed() {
+                    slots.push(keccak256(B256::new(key.to_be_bytes())));
+                }
+            }
+            storage_target_count += slots.len();
+            if !slots.is_empty() {
+                slots.shrink_to_fit();
+                hint.storages.insert(hashed_address, slots);
+            }
+        }
+        // The former target-to-hint conversion collected only surviving entries. Avoid retaining
+        // its larger initial reservations when most accounts or slots did not change.
+        hint.accounts.shrink_to_fit();
+        hint.storages.shrink_to_fit();
+        (hint, storage_target_count)
+    }
+}
+
 impl From<MultiProofTargetsV2> for StateAccessHint {
     fn from(targets: MultiProofTargetsV2) -> Self {
         Self {
@@ -604,6 +642,143 @@ mod tests {
 
         fn on_updates_finished(&self) {
             self.finished_updates.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn direct_access_hints_match_target_roundtrip_for_state_shapes() {
+        for touched in [false, true] {
+            for destroyed in [false, true] {
+                for changed_info in [false, true] {
+                    for changed in
+                        [vec![], vec![false; 8], vec![true; 8], vec![false, true, false, true]]
+                    {
+                        let mut account = Account::default();
+                        if touched {
+                            account.mark_touch();
+                        }
+                        if destroyed {
+                            assert!(account.mark_created_locally());
+                            assert!(account.mark_selfdestructed_locally());
+                        }
+                        if changed_info {
+                            account.info.nonce = 1;
+                        }
+                        for (index, changed) in changed.iter().enumerate() {
+                            account.storage.insert(
+                                U256::from(index),
+                                EvmStorageSlot::new_changed(
+                                    U256::ZERO,
+                                    if *changed { U256::ONE } else { U256::ZERO },
+                                    TransactionId::ZERO,
+                                ),
+                            );
+                        }
+                        let address = Address::repeat_byte(0x31);
+                        let state = EvmState::from_iter([(address, account)]);
+                        let (targets, expected_count) =
+                            MultiProofTargetsV2::from_state(state.clone());
+                        let expected = StateAccessHint::from(targets);
+                        let (actual, count) = StateAccessHint::from_state(state);
+                        assert_eq!(actual.accounts, expected.accounts);
+                        assert_eq!(actual.storages, expected.storages);
+                        assert_eq!(count, expected_count);
+                        assert_eq!(
+                            count,
+                            if touched && !destroyed {
+                                changed.iter().filter(|v| **v).count()
+                            } else {
+                                0
+                            }
+                        );
+                        assert_eq!(
+                            actual.accounts,
+                            if touched && !destroyed && changed_info {
+                                vec![keccak256(address)]
+                            } else {
+                                vec![]
+                            }
+                        );
+                        let mut keys: Vec<_> =
+                            actual.storages.values().flatten().copied().collect();
+                        keys.sort_unstable();
+                        let mut expected_keys: Vec<_> = changed
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| **v && touched && !destroyed)
+                            .map(|(i, _)| keccak256(B256::new(U256::from(i).to_be_bytes())))
+                            .collect();
+                        expected_keys.sort_unstable();
+                        assert_eq!(keys, expected_keys);
+                    }
+                }
+            }
+        }
+        let (hint, count) = StateAccessHint::from_state(EvmState::default());
+        assert!(hint.accounts.is_empty() && hint.storages.is_empty());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn direct_access_hints_do_not_retain_filtered_capacity() {
+        for active in [0, 1, 64] {
+            let state = EvmState::from_iter((0..64u8).map(|index| {
+                let mut account = Account::default();
+                if usize::from(index) < active {
+                    account.mark_touch();
+                    account.info.nonce = 1;
+                }
+                for slot in 0..8 {
+                    account.storage.insert(
+                        U256::from(slot),
+                        EvmStorageSlot::new_changed(
+                            U256::ZERO,
+                            if slot % 2 == 0 { U256::ONE } else { U256::ZERO },
+                            TransactionId::ZERO,
+                        ),
+                    );
+                }
+                (Address::repeat_byte(index), account)
+            }));
+            let (targets, _) = MultiProofTargetsV2::from_state(state.clone());
+            let expected = StateAccessHint::from(targets);
+            let (actual, _) = StateAccessHint::from_state(state);
+            assert_eq!(actual.accounts, expected.accounts);
+            assert_eq!(actual.storages, expected.storages);
+            assert!(actual.accounts.capacity() <= expected.accounts.capacity());
+            assert!(actual.storages.capacity() <= expected.storages.capacity());
+            for (address, slots) in &actual.storages {
+                assert!(slots.capacity() <= expected.storages[address].capacity());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_access_hints_preserve_order_and_root_parent_metadata() {
+        let mut state = EvmState::default();
+        for index in 1..=16u8 {
+            let mut account = Account::default();
+            account.mark_touch();
+            account.info.nonce = u64::from(index);
+            for key in [3, 1, 9, 7] {
+                account.storage.insert(
+                    U256::from(key),
+                    EvmStorageSlot::new_changed(U256::ZERO, U256::ONE, TransactionId::ZERO),
+                );
+            }
+            state.insert(Address::repeat_byte(index), account);
+        }
+        let (expected, count) = MultiProofTargetsV2::from_state(state.clone());
+        let (hint, actual_count) = StateAccessHint::from_state(state);
+        assert_eq!(actual_count, count);
+        let actual = MultiProofTargetsV2::from(hint);
+        let keys = |targets: &[ProofV2Target]| {
+            targets.iter().map(|target| (target.key(), target.parent)).collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&actual.account_targets), keys(&expected.account_targets));
+        assert_eq!(actual.storage_targets.len(), expected.storage_targets.len());
+        for (address, slots) in expected.storage_targets {
+            assert_eq!(keys(&actual.storage_targets[&address]), keys(&slots));
         }
     }
 
