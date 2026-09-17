@@ -604,6 +604,7 @@ const STAGES: &[&str] = &[
     "frame_receive",
     "durable",
     "execution_totals",
+    "execution_cache_insert_totals",
     "proof_storage_worker_totals",
     "proof_account_worker_totals",
     "backpressure_start",
@@ -629,7 +630,18 @@ fn numeric_field(name: &str) -> bool {
     let name = canonical_field(name);
     matches!(
         name,
-        "queued_jobs" |
+        "cache_insert_measured" |
+            "cache_insert_accounts_seen" |
+            "cache_insert_accounts_skipped" |
+            "cache_insert_accounts_attempted" |
+            "cache_insert_accounts_removed" |
+            "cache_insert_contracts_attempted" |
+            "cache_insert_slots_attempted" |
+            "cache_insert_slots_changed" |
+            "cache_insert_slots_unchanged" |
+            "cache_insert_outcome" |
+            "cache_insert_counts_saturated" |
+            "queued_jobs" |
             "in_flight_proof_batches" |
             "pending_updates" |
             "pending_targets" |
@@ -841,6 +853,51 @@ mod tests {
         drop(rx);
         writer.send(CaptureRecord::End { id: 9, ts: 14, thread: 11 });
         assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn cache_insert_summary_preserves_numeric_fields_and_exact_parent() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("lifecycle-cache-insert-{}.jsonl", monotonic_ns()));
+        let (layer, guard) = LifecycleLayer::start(
+            File::create(&path).unwrap(),
+            [7; 32],
+            monotonic_ns(),
+            CaptureDetail::Full,
+        )
+        .unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
+        tracing::subscriber::with_default(subscriber, || {
+            let owner = tracing::debug_span!(target: "engine::caching", "insert_state");
+            let other = tracing::info_span!(target: "lifecycle", "unrelated");
+            other.in_scope(|| {
+                tracing::info!(target: "lifecycle", parent: &owner, stage="execution_cache_insert_totals",
+                    cache_insert_measured=1u64, cache_insert_accounts_seen=3u64,
+                    cache_insert_accounts_skipped=1u64, cache_insert_accounts_attempted=1u64,
+                    cache_insert_accounts_removed=1u64, cache_insert_contracts_attempted=0u64,
+                    cache_insert_slots_attempted=2u64, cache_insert_slots_changed=1u64,
+                    cache_insert_slots_unchanged=1u64, cache_insert_outcome=1u64,
+                    cache_insert_counts_saturated=0u64, private_address="SECRET-ADDRESS");
+            });
+        });
+        drop(guard);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(!text.contains("SECRET"));
+        let rows: Vec<Value> = text.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        let owner = rows.iter().find(|r| r["name"] == "insert_state").unwrap();
+        let events: Vec<_> = rows
+            .iter()
+            .filter(|r| r["fields"]["stage"] == "execution_cache_insert_totals")
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"], owner["id"]);
+        let fields = events[0]["fields"].as_object().unwrap();
+        assert_eq!(fields.len(), 12);
+        assert!(fields.iter().all(|(key, value)| key == "stage" || value.is_u64()));
+        assert_eq!(fields["cache_insert_slots_unchanged"], 1);
     }
 
     #[test]

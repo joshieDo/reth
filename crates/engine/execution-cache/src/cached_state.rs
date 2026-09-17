@@ -24,11 +24,11 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
-use tracing::{debug_span, instrument, trace, warn};
+use tracing::{debug_span, trace, warn};
 
 /// Alignment in bytes for entries in the fixed-cache.
 ///
@@ -1250,14 +1250,35 @@ impl ExecutionCache {
     /// ## Error Handling
     ///
     /// Returns an error if the state updates are inconsistent and should be discarded.
-    #[instrument(level = "debug", target = "engine::caching", skip_all)]
     #[expect(clippy::result_unit_err)]
     pub fn insert_state(&self, state_updates: &BundleState) -> Result<(), ()> {
+        let span = debug_span!(target: "engine::caching", "insert_state");
+        let _entered = span.enter();
+        let mut counts = CacheInsertCounts::start(&span);
+        let outcome = self.insert_state_observed(state_updates, &mut counts);
+        if let Some(counts) = counts {
+            counts.record(&span, outcome);
+        }
+        if outcome == CacheInsertOutcome::Invalid {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn insert_state_observed(
+        &self,
+        state_updates: &BundleState,
+        counts: &mut Option<CacheInsertCounts>,
+    ) -> CacheInsertOutcome {
         let _enter =
             debug_span!(target: "engine::tree", "contracts", len = state_updates.contracts.len())
                 .entered();
         // Insert bytecodes
         for (code_hash, bytecode) in &state_updates.contracts {
+            if let Some(counts) = counts {
+                counts.add(CacheInsertCounter::Contracts);
+            }
             self.insert_code(*code_hash, Some(Bytecode(bytecode.clone())));
         }
         drop(_enter);
@@ -1271,9 +1292,15 @@ impl ExecutionCache {
         )
         .entered();
         for (addr, account) in &state_updates.state {
+            if let Some(counts) = counts {
+                counts.add(CacheInsertCounter::AccountsSeen);
+            }
             // If the account was not modified, as in not changed and not destroyed, then we have
             // nothing to do w.r.t. this particular account and can move on
             if account.status.is_not_modified() {
+                if let Some(counts) = counts {
+                    counts.add(CacheInsertCounter::AccountsSkipped);
+                }
                 continue
             }
 
@@ -1297,9 +1324,12 @@ impl ExecutionCache {
                         );
                     });
                     self.clear();
-                    return Ok(())
+                    return CacheInsertOutcome::Cleared
                 }
 
+                if let Some(counts) = counts {
+                    counts.add(CacheInsertCounter::AccountsRemoved);
+                }
                 self.0.account_cache.remove(addr);
                 continue;
             }
@@ -1309,20 +1339,24 @@ impl ExecutionCache {
             // `None` current info, should be destroyed.
             let Some(ref account_info) = account.info else {
                 trace!(target: "engine::caching", ?account, "Account with None account info found in state updates");
-                return Err(())
+                return CacheInsertOutcome::Invalid
             };
 
             // Now we iterate over all storage and make updates to the cached storage values
             for (key, slot) in &account.storage {
+                CacheInsertCounts::observe_slot(counts, || slot.is_changed());
                 self.insert_storage(*addr, (*key).into(), Some(slot.present_value));
             }
 
             // Insert will update if present, so we just use the new account info as the new value
             // for the account cache
+            if let Some(counts) = counts {
+                counts.add(CacheInsertCounter::AccountsAttempted);
+            }
             self.insert_account(*addr, Some(Account::from(account_info)));
         }
 
-        Ok(())
+        CacheInsertOutcome::Complete
     }
 
     /// Clears storage and account caches, resetting them to empty state.
@@ -1354,6 +1388,91 @@ impl ExecutionCache {
         metrics.account_cache_capacity.set(self.0.account_stats.capacity() as f64);
         metrics.account_cache_collisions.set(self.0.account_stats.collisions() as f64);
         self.0.account_stats.reset_stats();
+    }
+}
+
+/// Counts attempted cache operations, not successful fixed-cache insertions.
+/// Fixed-cache can decline a write when a bucket is busy.
+#[derive(Debug, Default)]
+struct CacheInsertCounts {
+    values: [u64; 8],
+    saturated: bool,
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum CacheInsertCounter {
+    AccountsSeen,
+    AccountsSkipped,
+    AccountsAttempted,
+    AccountsRemoved,
+    Contracts,
+    Slots,
+    Changed,
+    Unchanged,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+enum CacheInsertOutcome {
+    Complete = 1,
+    Cleared = 2,
+    Invalid = 3,
+}
+
+impl CacheInsertCounts {
+    fn start(span: &tracing::Span) -> Option<Self> {
+        static REQUESTED: OnceLock<bool> = OnceLock::new();
+        let requested = *REQUESTED.get_or_init(|| {
+            let detail = std::env::var("TEMPO_LIFECYCLE_DETAIL");
+            let detail = match &detail {
+                Ok(value) => Some(value.as_str()),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => return false,
+            };
+            Self::requested(
+                std::env::var("TEMPO_LIFECYCLE_CACHE_INSERT").ok().as_deref(),
+                std::env::var_os("RETH_LIFECYCLE_FILE").is_some(),
+                detail,
+            )
+        });
+        (requested &&
+            !span.is_disabled() &&
+            tracing::event_enabled!(target: "lifecycle", tracing::Level::INFO))
+        .then(Self::default)
+    }
+
+    fn requested(setting: Option<&str>, file: bool, detail: Option<&str>) -> bool {
+        setting == Some("1") && file && matches!(detail, None | Some("full"))
+    }
+
+    const fn add(&mut self, counter: CacheInsertCounter) {
+        let value = &mut self.values[counter as usize];
+        let (next, overflow) = value.overflowing_add(1);
+        self.saturated |= overflow;
+        *value = if overflow { u64::MAX } else { next };
+    }
+
+    fn observe_slot(counts: &mut Option<Self>, changed: impl FnOnce() -> bool) {
+        if let Some(counts) = counts {
+            counts.add(CacheInsertCounter::Slots);
+            counts.add(if changed() {
+                CacheInsertCounter::Changed
+            } else {
+                CacheInsertCounter::Unchanged
+            });
+        }
+    }
+
+    fn record(self, parent: &tracing::Span, outcome: CacheInsertOutcome) {
+        let [seen, skipped, attempted, removed, contracts, slots, changed, unchanged] = self.values;
+        tracing::info!(target: "lifecycle", parent: parent, stage = "execution_cache_insert_totals",
+            cache_insert_measured = 1u64, cache_insert_accounts_seen = seen,
+            cache_insert_accounts_skipped = skipped, cache_insert_accounts_attempted = attempted,
+            cache_insert_accounts_removed = removed, cache_insert_contracts_attempted = contracts,
+            cache_insert_slots_attempted = slots, cache_insert_slots_changed = changed,
+            cache_insert_slots_unchanged = unchanged, cache_insert_outcome = outcome as u64,
+            cache_insert_counts_saturated = u64::from(self.saturated));
     }
 }
 
@@ -1424,6 +1543,123 @@ mod tests {
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_revm::db::{AccountStatus, BundleAccount};
     use revm::state::AccountInfo;
+
+    #[test]
+    fn cache_insert_observer_gate_and_disabled_slot_work() {
+        assert!(!CacheInsertCounts::requested(None, true, Some("full")));
+        assert!(!CacheInsertCounts::requested(Some("1"), false, Some("full")));
+        assert!(!CacheInsertCounts::requested(Some("1"), true, Some("milestones")));
+        assert!(!CacheInsertCounts::requested(Some("0"), true, Some("full")));
+        assert!(CacheInsertCounts::requested(Some("1"), true, Some("full")));
+        CacheInsertCounts::observe_slot(&mut None, || panic!("disabled observer inspected slot"));
+        let mut counts = CacheInsertCounts::default();
+        counts.values[CacheInsertCounter::Slots as usize] = u64::MAX;
+        counts.add(CacheInsertCounter::Slots);
+        assert_eq!(counts.values[CacheInsertCounter::Slots as usize], u64::MAX);
+        assert!(counts.saturated);
+        counts.add(CacheInsertCounter::Changed);
+        assert!(counts.saturated);
+    }
+
+    #[test]
+    fn cache_insert_observer_preserves_warming_and_counts_attempts() {
+        use reth_revm::db::states::StorageSlot;
+        let changed = Address::with_last_byte(1);
+        let skipped = Address::with_last_byte(2);
+        let removed = Address::with_last_byte(3);
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            changed,
+            BundleAccount::new(
+                Some(AccountInfo::default()),
+                Some(AccountInfo::default()),
+                HashMap::from_iter([
+                    (U256::from(1), StorageSlot::new_changed(U256::from(2), U256::from(3))),
+                    (U256::from(2), StorageSlot::new(U256::from(4))),
+                ]),
+                AccountStatus::Changed,
+            ),
+        );
+        bundle.state.insert(
+            skipped,
+            BundleAccount::new(
+                Some(AccountInfo::default()),
+                Some(AccountInfo::default()),
+                Default::default(),
+                AccountStatus::Loaded,
+            ),
+        );
+        bundle.state.insert(
+            removed,
+            BundleAccount::new(
+                Some(AccountInfo::default()),
+                None,
+                Default::default(),
+                AccountStatus::Destroyed,
+            ),
+        );
+        let observed = ExecutionCache::new(1000);
+        let ordinary = ExecutionCache::new(1000);
+        for cache in [&observed, &ordinary] {
+            cache.insert_account(removed, Some(Account::default()));
+            // Unchanged bundle values still repair arbitrary previous contents.
+            cache.insert_storage(changed, U256::from(2).into(), Some(U256::from(99)));
+        }
+        let mut counts = Some(CacheInsertCounts::default());
+        assert_eq!(
+            observed.insert_state_observed(&bundle, &mut counts),
+            CacheInsertOutcome::Complete
+        );
+        assert_eq!(
+            ordinary.insert_state_observed(&bundle, &mut None),
+            CacheInsertOutcome::Complete
+        );
+        assert_eq!(counts.unwrap().values, [3, 1, 1, 1, 0, 2, 1, 1]);
+        for slot in [U256::from(1), U256::from(2)] {
+            assert_eq!(
+                observed.0.storage_cache.get(&(changed, slot.into())),
+                ordinary.0.storage_cache.get(&(changed, slot.into()))
+            );
+        }
+        assert_eq!(
+            observed.0.storage_cache.get(&(changed, U256::from(2).into())),
+            Some(U256::from(4))
+        );
+        assert!(observed.0.account_cache.get(&removed).is_none());
+        assert_eq!(observed.0.account_stats.size(), ordinary.0.account_stats.size());
+        assert_eq!(observed.0.storage_stats.size(), ordinary.0.storage_stats.size());
+    }
+
+    #[test]
+    fn cache_insert_observer_retains_invalid_and_clear_outcomes() {
+        for (original, status, expected) in [
+            (Some(AccountInfo::default()), AccountStatus::Changed, CacheInsertOutcome::Invalid),
+            (
+                Some(AccountInfo { code_hash: B256::with_last_byte(1), ..Default::default() }),
+                AccountStatus::Destroyed,
+                CacheInsertOutcome::Cleared,
+            ),
+        ] {
+            let mut bundle = BundleState::default();
+            bundle.state.insert(
+                Address::ZERO,
+                BundleAccount::new(original, None, Default::default(), status),
+            );
+            let cache = ExecutionCache::new(1000);
+            cache.insert_storage(Address::ZERO, B256::ZERO, Some(U256::from(99)));
+            let mut counts = Some(CacheInsertCounts::default());
+            assert_eq!(cache.insert_state_observed(&bundle, &mut counts), expected);
+            assert_eq!(counts.unwrap().values, [1, 0, 0, 0, 0, 0, 0, 0]);
+            if expected == CacheInsertOutcome::Cleared {
+                assert!(cache.0.storage_cache.get(&(Address::ZERO, B256::ZERO)).is_none());
+            } else {
+                assert_eq!(
+                    cache.0.storage_cache.get(&(Address::ZERO, B256::ZERO)),
+                    Some(U256::from(99))
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_empty_storage_cached_state_provider() {
