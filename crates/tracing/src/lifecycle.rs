@@ -1,6 +1,6 @@
 //! Opt-in benchmark capture. Only structural metadata and allowlisted fields reach disk.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::{
     cell::Cell,
     collections::BTreeMap,
@@ -127,6 +127,11 @@ enum CaptureRecord {
     End { id: u64, ts: u64, thread: u64 },
 }
 
+/// Field names come from static tracing metadata or fixed canonical aliases.
+/// An ordered map preserves the existing sorted JSON without owning each key.
+/// Values retain the same privacy filtering and ownership as before.
+type FieldMap = BTreeMap<&'static str, Value>;
+
 /// Only the variable-size start record is boxed, keeping queue slots unchanged.
 /// Metadata strings are static; fields have already passed the privacy filter.
 #[derive(Debug)]
@@ -137,7 +142,7 @@ struct SpanStart {
     name: &'static str,
     category: &'static str,
     parent: Option<u64>,
-    fields: Map<String, Value>,
+    fields: FieldMap,
 }
 
 impl SpanStart {
@@ -162,7 +167,7 @@ struct FieldRecord {
     id: u64,
     ts: u64,
     thread: u64,
-    fields: Map<String, Value>,
+    fields: FieldMap,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -360,8 +365,8 @@ impl LifecycleLayer {
         json!({"type":kind, "id":id, "ts":monotonic_ns().saturating_sub(self.epoch), "thread":thread_id()})
     }
 
-    fn fields(&self) -> SafeFields<'_> {
-        SafeFields { key: &self.key, values: Map::new() }
+    const fn fields(&self) -> SafeFields<'_> {
+        SafeFields { key: &self.key, values: FieldMap::new() }
     }
 }
 
@@ -589,11 +594,11 @@ fn category(target: &str) -> &'static str {
 
 struct SafeFields<'a> {
     key: &'a [u8; 32],
-    values: Map<String, Value>,
+    values: FieldMap,
 }
 
 impl SafeFields<'_> {
-    fn text(&mut self, name: &str, value: &str) {
+    fn text(&mut self, name: &'static str, value: &str) {
         let name = canonical_field(name);
         if matches!(
             name,
@@ -613,14 +618,14 @@ impl SafeFields<'_> {
                 hex.bytes().all(|b| b.is_ascii_hexdigit())
             {
                 let hash = blake3::keyed_hash(self.key, hex.to_ascii_lowercase().as_bytes());
-                self.values.insert(name.into(), hash.to_hex()[..24].to_string().into());
+                self.values.insert(name, hash.to_hex()[..24].to_string().into());
             }
         } else if numeric_field(name) {
             if let Ok(number) = value.parse::<u64>() {
-                self.values.insert(name.into(), number.into());
+                self.values.insert(name, number.into());
             }
         } else if name == "stage" && STAGES.contains(&value) {
-            self.values.insert(name.into(), value.into());
+            self.values.insert(name, value.into());
         }
     }
 }
@@ -740,7 +745,7 @@ fn numeric_field(name: &str) -> bool {
 impl Visit for SafeFields<'_> {
     fn record_u64(&mut self, field: &Field, value: u64) {
         if numeric_field(field.name()) {
-            self.values.insert(canonical_field(field.name()).into(), value.into());
+            self.values.insert(canonical_field(field.name()), value.into());
         }
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
@@ -814,13 +819,102 @@ mod tests {
     }
 
     #[test]
+    fn static_field_keys_match_owned_sorted_maps_across_tree_nodes() {
+        let keys = [
+            "worker_jobs_targets_33_plus",
+            "stage",
+            "backlog",
+            "height",
+            "transactions",
+            "queued_jobs",
+            "bytes",
+            "gas_used",
+            "view",
+            "epoch",
+            "workers",
+            "channel",
+            "sequence",
+            "execution_ns",
+            "wait_ns",
+            "receipt_ns",
+            "number",
+            "block_count",
+        ];
+        for length in [0, 1, 2, 11, 12, keys.len()] {
+            let mut fields = FieldMap::new();
+            let mut owned = serde_json::Map::new();
+            for (index, key) in keys[..length].iter().copied().enumerate() {
+                let value = if key == "stage" {
+                    Value::String("backpressure_start".into())
+                } else {
+                    Value::from(u64::MAX - index as u64)
+                };
+                fields.insert(key, value.clone());
+                owned.insert(key.to_owned(), value);
+            }
+            // Repeated metadata fields overwrite the value, never duplicate the key.
+            if length > 0 {
+                fields.insert(keys[0], 0u64.into());
+                owned.insert(keys[0].to_owned(), 0u64.into());
+            }
+            assert_eq!(serde_json::to_vec(&fields).unwrap(), serde_json::to_vec(&owned).unwrap());
+            for (kind, name) in
+                [(FieldRecordKind::Event, "event"), (FieldRecordKind::Fields, "fields")]
+            {
+                let expected = json!({"fields":owned,"id":5,"thread":6,"ts":7,"type":name});
+                let record = CaptureRecord::Fields(Box::new(FieldRecord {
+                    kind,
+                    id: 5,
+                    thread: 6,
+                    ts: 7,
+                    fields: fields.clone(),
+                }));
+                let mut bytes = Vec::new();
+                record.write_json(&mut bytes).unwrap();
+                assert_eq!(bytes, serde_json::to_vec(&expected).unwrap());
+                assert_eq!(record.is_backpressure(), length > 1);
+            }
+        }
+        assert_eq!(
+            std::mem::size_of::<FieldMap>(),
+            std::mem::size_of::<serde_json::Map<String, Value>>()
+        );
+    }
+
+    #[test]
+    fn static_field_aliases_preserve_privacy_and_owned_values() {
+        let fields = {
+            let key = [9; 32];
+            let mut visitor = SafeFields { key: &key, values: FieldMap::new() };
+            let private =
+                "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+            visitor.text("proposal.digest", &private);
+            visitor.text("block.digest", &private.to_lowercase());
+            visitor.text("proposal.height", "1");
+            visitor.text("block.height", "2");
+            visitor.text("height", "3");
+            visitor.text("stage", "backpressure_start");
+            visitor.text("stage", "DO_NOT_EXPORT");
+            visitor.text("worker_jobs", "-1");
+            visitor.text("worker_target_max", "18446744073709551616");
+            visitor.text("private_key", "DO_NOT_EXPORT");
+            visitor.values
+        };
+        let expected_hash = blake3::keyed_hash(&[9; 32], "a".repeat(64).as_bytes());
+        let expected = json!({"block_hash":&expected_hash.to_hex()[..24], "height":3,
+            "stage":"backpressure_start"});
+        assert_eq!(serde_json::to_vec(&fields).unwrap(), serde_json::to_vec(&expected).unwrap());
+        assert_eq!(fields.len(), 3);
+    }
+
+    #[test]
     fn typed_start_preserves_json_escaping_and_optional_parent() {
         for id in [0, 1, u64::MAX] {
             for parent in [None, Some(0), Some(u64::MAX)] {
                 for name in ["storage_worker", "quoted\"\\\n\t\u{0000}λ"] {
-                    let fields = Map::from_iter([
-                        ("block_hash".into(), Value::String("pseudonymous".into())),
-                        ("transactions".into(), id.into()),
+                    let fields = FieldMap::from_iter([
+                        ("block_hash", Value::String("pseudonymous".into())),
+                        ("transactions", id.into()),
                     ]);
                     let expected = json!({"type":"start", "id":id, "ts":id,
                         "thread":id, "name":name, "category":"trie", "parent":parent,
@@ -852,7 +946,7 @@ mod tests {
             name: "storage_worker",
             category: "trie",
             parent: None,
-            fields: Map::new(),
+            fields: FieldMap::new(),
         }));
         // Fail both in a literal and in a serde-escaped value, never accept truncation.
         for capacity in [0, 14, 22, 70] {
@@ -868,9 +962,9 @@ mod tests {
                 [(FieldRecordKind::Event, "event"), (FieldRecordKind::Fields, "fields")]
             {
                 for stage in [None, Some("backpressure_start"), Some("quoted\"\\\n\t\u{0000}λ")] {
-                    let mut fields = Map::from_iter([("transactions".into(), id.into())]);
+                    let mut fields = FieldMap::from_iter([("transactions", id.into())]);
                     if let Some(stage) = stage {
-                        fields.insert("stage".into(), stage.into());
+                        fields.insert("stage", stage.into());
                     }
                     let expected = json!({"type":name,"id":id,"ts":id,"thread":id,"fields":fields});
                     let record = CaptureRecord::Fields(Box::new(FieldRecord {
