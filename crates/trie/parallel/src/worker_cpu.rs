@@ -19,7 +19,7 @@ impl WorkerCpuTimer {
         static CAPTURE: OnceLock<bool> = OnceLock::new();
         // Both modes retain coarse worker identity spans, so the explicit parent
         // remains visible to the lifecycle layer even with other subscribers.
-        let enabled = *CAPTURE.get_or_init(|| {
+        let requested = *CAPTURE.get_or_init(|| {
             let detail = std::env::var("TEMPO_LIFECYCLE_DETAIL");
             let detail = match &detail {
                 Ok(value) => Some(value.as_str()),
@@ -27,8 +27,15 @@ impl WorkerCpuTimer {
                 Err(std::env::VarError::NotUnicode(_)) => return false,
             };
             capture_requested(std::env::var_os("RETH_LIFECYCLE_FILE").is_some(), detail)
-        }) && tracing::enabled!(target: "lifecycle", tracing::Level::INFO);
-        Self::start_enabled(enabled)
+        });
+        Self::start_requested(requested)
+    }
+
+    fn start_requested(requested: bool) -> Option<Self> {
+        // This enables event accounting, not a span or an untyped HINT callsite.
+        Self::start_enabled(
+            requested && tracing::event_enabled!(target: "lifecycle", tracing::Level::INFO),
+        )
     }
 
     fn start_enabled(enabled: bool) -> Option<Self> {
@@ -63,6 +70,32 @@ fn cpu_nanos(usage: Option<ThreadResourceUsageDelta>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_gate_accepts_event_only_subscriber() {
+        struct EventsOnly;
+        impl tracing::Subscriber for EventsOnly {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.is_event() && meta.target() == "lifecycle"
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                unreachable!("event-only subscriber cannot create spans")
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        tracing::subscriber::with_default(EventsOnly, || {
+            assert!(!tracing::enabled!(target: "lifecycle", tracing::Level::INFO));
+            assert!(WorkerCpuTimer::start_requested(true).is_some());
+            assert!(WorkerCpuTimer::start_requested(false).is_none());
+        });
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            assert!(WorkerCpuTimer::start_requested(true).is_none());
+        });
+    }
 
     #[test]
     fn sampling_requires_coarse_or_full_capture() {
