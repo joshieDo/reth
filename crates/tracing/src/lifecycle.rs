@@ -71,6 +71,7 @@ impl CaptureDetail {
         // Filtering at enablement avoids allocating detailed spans at all.
         (meta.target().starts_with("tempo_consensus") &&
             matches!(meta.name(), "handle_propose" | "handle_verify" | "verify")) ||
+            (meta.target() == "payload_builder" && meta.name() == "build_payload") ||
             (meta.target() == "engine::tree::payload_validator" &&
                 matches!(
                     meta.name(),
@@ -1807,6 +1808,86 @@ mod tests {
                 .filter(|r| r["type"] == "event")
                 .all(|r| r["id"] == identity["id"]));
             assert_eq!(rows.last().unwrap()["dropped"], 0);
+        }
+    }
+
+    #[test]
+    fn builder_prewarm_context_retains_late_payload_identity() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            for mixed in [false, true] {
+                let path = std::env::temp_dir()
+                    .join(format!("builder-prewarm-parent-{}.jsonl", monotonic_ns()));
+                let (layer, guard) = LifecycleLayer::start_prewarm(
+                    File::create(&path).unwrap(),
+                    [7; 32],
+                    monotonic_ns(),
+                    detail,
+                    true,
+                )
+                .unwrap();
+                let subscriber = tracing_subscriber::registry()
+                    .with(
+                        mixed.then(|| tracing_subscriber::fmt::layer().with_writer(std::io::sink)),
+                    )
+                    .with(layer.with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                        detail.capture_metadata(meta)
+                    })));
+                tracing::subscriber::with_default(subscriber, || {
+                    for produced in [true, false] {
+                        // Actual builder callsite: no retained consensus parent on
+                        // this worker, and the block hash is known only at the end.
+                        let build = tracing::info_span!(target: "payload_builder", "build_payload",
+                            block_hash = tracing::field::Empty);
+                        build.in_scope(|| {
+                            {
+                                let _setup = tracing::debug_span!(target: "payload_builder", "state_setup").entered();
+                            }
+                            let context = tracing::debug_span!(target: "lifecycle", parent: &tracing::Span::current(),
+                                "prewarm.context", prewarm_role = 2u64, prewarm_mode = 1u64);
+                            tracing::info!(target: "lifecycle", parent: &context, stage="prewarm_context_started",
+                                prewarm_role=2u64, prewarm_mode=1u64);
+                            tracing::info!(target: "lifecycle", parent: &context, stage="prewarm_context_completed",
+                                prewarm_dispatched=0u64, prewarm_started=0u64, prewarm_completed=0u64,
+                                prewarm_context_outcome=0u64);
+                            drop(context);
+                            if produced {
+                                tracing::Span::current().record("block_hash", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                            }
+                        });
+                    }
+                });
+                drop(guard);
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::remove_file(path).unwrap();
+                let rows: Vec<Value> =
+                    text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+                let builds: Vec<_> = rows.iter().filter(|r| r["name"] == "build_payload").collect();
+                let contexts: Vec<_> =
+                    rows.iter().filter(|r| r["name"] == "prewarm.context").collect();
+                assert_eq!(builds.len(), 2);
+                assert_eq!(contexts.len(), 2);
+                for (build, context) in builds.iter().zip(&contexts) {
+                    assert_eq!(context["parent"], build["id"]);
+                }
+                let hashes: Vec<_> = rows
+                    .iter()
+                    .filter(|r| r["type"] == "fields" && r["fields"]["block_hash"].is_string())
+                    .collect();
+                assert_eq!(hashes.len(), 1);
+                assert_eq!(hashes[0]["id"], builds[0]["id"]);
+                let context_end = rows
+                    .iter()
+                    .position(|r| r["type"] == "end" && r["id"] == contexts[0]["id"])
+                    .unwrap();
+                let late_hash = rows.iter().position(|r| std::ptr::eq(r, hashes[0])).unwrap();
+                assert!(context_end < late_hash);
+                assert!(!text.contains("aaaaaaaaaaaaaaaa"));
+                assert_eq!(rows.last().unwrap()["dropped"], 0);
+                if detail == CaptureDetail::Milestones {
+                    assert!(!rows.iter().any(|r| r["name"] == "state_setup"));
+                }
+            }
         }
     }
 
