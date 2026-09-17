@@ -17,6 +17,8 @@ pub(crate) struct JobCounts {
     pub(crate) storage_groups: u64,
     pub(crate) storage_only_single_group: u64,
     pub(crate) root_requests: u64,
+    pub(crate) forward_attempts: u64,
+    pub(crate) pressure_fallback_attempts: u64,
     pub(crate) saturated: bool,
 }
 
@@ -38,8 +40,23 @@ impl JobCounts {
             storage_groups: 0,
             storage_only_single_group: 0,
             root_requests: 0,
+            forward_attempts: 0,
+            pressure_fallback_attempts: 0,
             saturated: false,
         }
+    }
+
+    /// Record the route selected for an eligible account job, before send/processing.
+    /// Failed dispatch and canceled result receivers remain attempts, not successes.
+    pub(crate) fn observe_forward(counts: Option<&mut Self>, pressured: bool) {
+        let Some(counts) = counts else { return };
+        debug_assert_eq!(counts.kind, JobKind::Account);
+        let total = if pressured {
+            &mut counts.pressure_fallback_attempts
+        } else {
+            &mut counts.forward_attempts
+        };
+        add(total, 1, &mut counts.saturated);
     }
 
     /// The closure is not called without a capture observer. Counts precede processing;
@@ -153,6 +170,23 @@ mod tests {
             needs_root: false,
         });
         assert!(account.saturated);
+    }
+
+    #[test]
+    fn forwarding_attempt_counts_are_gated_and_saturate() {
+        JobCounts::observe_forward(None, false);
+        let mut counts = JobCounts::new(JobKind::Account);
+        JobCounts::observe_forward(Some(&mut counts), false);
+        JobCounts::observe_forward(Some(&mut counts), true);
+        assert_eq!((counts.forward_attempts, counts.pressure_fallback_attempts), (1, 1));
+        counts.forward_attempts = u64::MAX;
+        JobCounts::observe_forward(Some(&mut counts), false);
+        assert_eq!(counts.forward_attempts, u64::MAX);
+        assert!(counts.saturated);
+        counts.pressure_fallback_attempts = u64::MAX;
+        JobCounts::observe_forward(Some(&mut counts), true);
+        assert_eq!(counts.pressure_fallback_attempts, u64::MAX);
+        assert!(counts.saturated);
     }
 
     #[test]

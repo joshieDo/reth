@@ -1123,6 +1123,7 @@ where
                 v2_storage_calculator.clone(),
                 *input,
                 &mut account_proofs_processed,
+                job_counts.as_deref_mut(),
             );
             total_idle_time += value_encoder_stats.storage_wait_time;
             value_encoder_stats_cache.extend(&value_encoder_stats);
@@ -1207,13 +1208,14 @@ where
         v2_storage_calculator: Rc<RefCell<V2StorageProofCalculator<'a, Provider>>>,
         input: AccountMultiproofInput,
         account_proofs_processed: &mut u64,
+        job_counts: Option<&mut JobCounts>,
     ) -> ValueEncoderStats
     where
         Provider: TrieCursorFactory + HashedCursorFactory + 'a,
     {
         let proof_start = Instant::now();
 
-        let Some(input) = forward_storage_only_job(&self.storage_work_tx, input) else {
+        let Some(input) = forward_storage_only_job(&self.storage_work_tx, input, job_counts) else {
             *account_proofs_processed += 1;
             return ValueEncoderStats::default();
         };
@@ -1261,10 +1263,12 @@ where
 fn forward_storage_only_job(
     storage_work_tx: &CrossbeamSender<StorageWorkerJob>,
     input: AccountMultiproofInput,
+    job_counts: Option<&mut JobCounts>,
 ) -> Option<AccountMultiproofInput> {
     if !input.targets.account_targets.is_empty() || input.targets.storage_targets.len() != 1 {
         return Some(input)
     }
+    JobCounts::observe_forward(job_counts, false);
     let AccountMultiproofInput { targets, proof_result_sender } = input;
     let (hashed_address, targets) = targets.storage_targets.into_iter().next().expect("one group");
     // An empty account proof never invokes the value encoder, so no storage root is
@@ -1566,7 +1570,8 @@ mod tests {
             }
             let expected_accounts = input.targets.account_targets.clone();
             let expected_storage = input.targets.storage_targets.clone();
-            let input = forward_storage_only_job(&tx, input).expect("must retain ordinary path");
+            let input =
+                forward_storage_only_job(&tx, input, None).expect("must retain ordinary path");
             assert_eq!(
                 input
                     .targets
@@ -1591,6 +1596,22 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_decision_is_an_attempt_even_if_dispatch_fails() {
+        let mut counts = JobCounts::new(crate::job_counts::JobKind::Account);
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let (input, result) = storage_only_input(B256::ZERO, Vec::new(), 1);
+        assert!(forward_storage_only_job(&tx, input, Some(&mut counts)).is_none());
+        assert_eq!(counts.forward_attempts, 1);
+        assert_eq!(counts.pressure_fallback_attempts, 0);
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().result.is_err());
+        let (mut input, _) = storage_only_input(B256::ZERO, Vec::new(), 2);
+        input.targets.account_targets.push(ProofV2Target::new(B256::ZERO));
+        assert!(forward_storage_only_job(&tx, input, Some(&mut counts)).is_some());
+        assert_eq!(counts.forward_attempts, 1);
+    }
+
+    #[test]
     fn forwarded_closed_dispatch_and_dropped_work_keep_error_completion() {
         let address = B256::repeat_byte(7);
         let (tx, rx) = unbounded();
@@ -1599,7 +1620,7 @@ mod tests {
             dispatch_v2_storage_proofs(&tx, &[], B256Map::from_iter([(address, Vec::new())]))
                 .unwrap_err();
         let (input, result) = storage_only_input(address, Vec::new(), 1);
-        assert!(forward_storage_only_job(&tx, input).is_none());
+        assert!(forward_storage_only_job(&tx, input, None).is_none());
         let message = result.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(message.result.unwrap_err().to_string(), old_error.to_string());
         assert_eq!(message.state.accounts[&B256::ZERO].unwrap().nonce, 1);
@@ -1607,7 +1628,7 @@ mod tests {
 
         let (tx, rx) = unbounded();
         let (input, result) = storage_only_input(address, Vec::new(), 2);
-        assert!(forward_storage_only_job(&tx, input).is_none());
+        assert!(forward_storage_only_job(&tx, input, None).is_none());
         drop(rx.recv().unwrap());
         let message = result.recv_timeout(Duration::from_secs(1)).unwrap();
         let expected: StateRootTaskError = StateProofError::Database(DatabaseError::Other(
@@ -1621,7 +1642,7 @@ mod tests {
         // A canceled consumer must neither block storage shutdown nor panic on the drop error.
         let (input, result) = storage_only_input(address, Vec::new(), 3);
         drop(result);
-        assert!(forward_storage_only_job(&tx, input).is_none());
+        assert!(forward_storage_only_job(&tx, input, None).is_none());
         drop(rx.recv().unwrap());
     }
 
@@ -1631,7 +1652,7 @@ mod tests {
         for tag in 1..=3 {
             let (input, result) =
                 storage_only_input(B256::repeat_byte(tag), Vec::new(), u64::from(tag));
-            assert!(forward_storage_only_job(&tx, input).is_none());
+            assert!(forward_storage_only_job(&tx, input, None).is_none());
             let StorageWorkerJob::StorageProof { input, proof_result_sender, .. } =
                 rx.recv().unwrap();
             assert!(!input.needs_root);
@@ -1685,13 +1706,13 @@ mod tests {
             )
             .unwrap();
             let (input, result) = storage_only_input(address, targets, tag);
-            assert!(forward_storage_only_job(&tx, input).is_none());
+            assert!(forward_storage_only_job(&tx, input, None).is_none());
             pairs.push((tag, nested, result));
         }
         // Cancel another result receiver; the proof still follows the normal compute/cache path.
         let (input, canceled) = storage_only_input(address, Vec::new(), 4);
         drop(canceled);
-        assert!(forward_storage_only_job(&tx, input).is_none());
+        assert!(forward_storage_only_job(&tx, input, None).is_none());
         drop(tx);
         let roots = Arc::new(DashMap::<B256, B256>::default());
         let worker = StorageProofWorker::new(
@@ -1749,7 +1770,7 @@ mod tests {
         // Forward another job without touching the already-used account calculator, then reuse it.
         let (tx, rx) = unbounded();
         let (input, receiver) = storage_only_input(address, Vec::new(), 5);
-        assert!(forward_storage_only_job(&tx, input).is_none());
+        assert!(forward_storage_only_job(&tx, input, None).is_none());
         drop(rx.recv().unwrap());
         assert!(receiver.recv().unwrap().result.is_err());
         let mut encoder =

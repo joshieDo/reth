@@ -665,6 +665,8 @@ fn numeric_field(name: &str) -> bool {
             "worker_jobs" |
             "worker_account_targets" |
             "worker_storage_targets" |
+            "worker_forward_attempts" |
+            "worker_pressure_fallback_attempts" |
             "worker_storage_groups" |
             "worker_jobs_storage_only_single_group" |
             "worker_root_requests" |
@@ -1010,7 +1012,7 @@ mod tests {
                     // The explicit event parent must work without a thread-local entered span.
                     assert!(tracing::Span::current().is_none());
                     tracing::info!(target: "lifecycle", parent: &worker, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64, worker_job_counts_measured=1u64, worker_jobs=Some(1u64), worker_storage_targets=Some(0u64), worker_account_targets=None::<u64>, worker_storage_groups=None::<u64>, worker_root_requests=Some(1u64), worker_target_max=Some(0u64), worker_jobs_targets_0=Some(1u64), worker_jobs_targets_1=Some(0u64), worker_jobs_targets_2_8=Some(0u64), worker_jobs_targets_9_32=Some(0u64), worker_jobs_targets_33_plus=Some(0u64), worker_job_counts_saturated=Some(0u64), native_tid=77777u64);
-                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64, worker_job_counts_measured=1u64, worker_jobs=Some(0u64), worker_account_targets=Some(0u64), worker_storage_groups=Some(0u64), worker_jobs_storage_only_single_group=Some(0u64), worker_storage_targets=None::<u64>, worker_root_requests=None::<u64>);
+                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64, worker_job_counts_measured=1u64, worker_jobs=Some(0u64), worker_account_targets=Some(0u64), worker_storage_groups=Some(0u64), worker_jobs_storage_only_single_group=Some(0u64), worker_forward_attempts=Some(0u64), worker_pressure_fallback_attempts=Some(0u64), worker_storage_targets=None::<u64>, worker_root_requests=None::<u64>);
                 });
             }).join().unwrap();
         });
@@ -1047,6 +1049,8 @@ mod tests {
         assert!(storage["fields"].get("worker_account_targets").is_none());
         assert!(storage["fields"].get("worker_storage_groups").is_none());
         assert!(storage["fields"].get("worker_jobs_storage_only_single_group").is_none());
+        assert!(storage["fields"].get("worker_forward_attempts").is_none());
+        assert!(storage["fields"].get("worker_pressure_fallback_attempts").is_none());
         let account =
             rows.iter().find(|r| r["fields"]["stage"] == "proof_account_worker_totals").unwrap();
         assert_eq!(account["id"], worker["id"]);
@@ -1057,6 +1061,8 @@ mod tests {
         assert_eq!(account["fields"]["worker_account_targets"], 0);
         assert_eq!(account["fields"]["worker_storage_groups"], 0);
         assert_eq!(account["fields"]["worker_jobs_storage_only_single_group"], 0);
+        assert_eq!(account["fields"]["worker_forward_attempts"], 0);
+        assert_eq!(account["fields"]["worker_pressure_fallback_attempts"], 0);
         assert!(account["fields"].get("worker_storage_targets").is_none());
         assert!(account["fields"].get("worker_root_requests").is_none());
         assert!(account["fields"].get("worker_thread_cpu_ns").is_none());
