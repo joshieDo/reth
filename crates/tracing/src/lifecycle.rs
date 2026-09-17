@@ -9,7 +9,7 @@ use std::{
     io::{self, BufWriter, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
 };
@@ -210,7 +210,9 @@ struct TimingSummary {
 
 struct CapturedSpan {
     id: u64,
-    aggregates: Aggregates,
+    // Most scopes never own an aggregated accessor. Allocate their shared map
+    // only when such a child is created, and avoid locking an empty map on close.
+    aggregates: OnceLock<Aggregates>,
     // High-frequency accessors/proofs retain every call's elapsed time, grouped by owner.
     sample: Option<(&'static str, u64)>,
 }
@@ -353,12 +355,14 @@ where
             let (owner, aggregates) = span
                 .parent()
                 .and_then(|p| {
-                    p.extensions().get::<CapturedSpan>().map(|s| (s.id, Arc::clone(&s.aggregates)))
+                    p.extensions()
+                        .get::<CapturedSpan>()
+                        .map(|s| (s.id, Arc::clone(s.aggregates.get_or_init(Aggregates::default))))
                 })
                 .unwrap_or_else(|| (0, Arc::clone(&self.root_aggregates)));
             span.extensions_mut().insert(CapturedSpan {
                 id: owner,
-                aggregates,
+                aggregates: OnceLock::from(aggregates),
                 sample: Some((attrs.metadata().name(), monotonic_ns().saturating_sub(self.epoch))),
             });
             return
@@ -378,7 +382,7 @@ where
         }));
         span.extensions_mut().insert(CapturedSpan {
             id: capture_id,
-            aggregates: Aggregates::default(),
+            aggregates: OnceLock::new(),
             sample: None,
         });
         self.writer.send(value);
@@ -452,7 +456,12 @@ where
             if let Some(captured) = span.extensions().get::<CapturedSpan>() {
                 if let Some((name, start)) = captured.sample {
                     let end = monotonic_ns().saturating_sub(self.epoch);
-                    let mut summaries = captured.aggregates.lock().unwrap();
+                    let mut summaries = captured
+                        .aggregates
+                        .get()
+                        .expect("aggregate sample retains its owner's map")
+                        .lock()
+                        .unwrap();
                     let summary = summaries.entry(name).or_default();
                     if summary.count == 0 {
                         summary.first = start;
@@ -464,7 +473,9 @@ where
                         summary.elapsed_ns.saturating_add(end.saturating_sub(start));
                     return
                 }
-                flush_aggregates(&self.writer, captured.id, &captured.aggregates);
+                if let Some(aggregates) = captured.aggregates.get() {
+                    flush_aggregates(&self.writer, captured.id, aggregates);
+                }
             }
         }
         self.span_event(StampKind::End, &id, ctx);
@@ -1251,6 +1262,76 @@ mod tests {
             drop(guard);
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn concurrent_aggregate_children_keep_one_map_per_owner() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("lifecycle-concurrent-aggregate-{}.jsonl", monotonic_ns()));
+        let (layer, guard) = LifecycleLayer::start(
+            File::create(&path).unwrap(),
+            [1; 32],
+            monotonic_ns(),
+            CaptureDetail::Full,
+        )
+        .unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(layer.with_filter(tracing_subscriber::filter::filter_fn(capture_metadata)));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            let owners = [
+                tracing::info_span!(target: "lifecycle", "owner_a"),
+                tracing::info_span!(target: "lifecycle", "owner_b"),
+            ];
+            let ready = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                for worker in 0..8 {
+                    let owner = owners[worker % 2].clone();
+                    let (dispatch, ready) = (&dispatch, &ready);
+                    scope.spawn(move || {
+                        tracing::dispatcher::with_default(dispatch, || {
+                            let _owner = owner.entered();
+                            ready.wait();
+                            for _ in 0..1000 {
+                                let _read = tracing::debug_span!(target: "lifecycle", "state.overlay.execution_overlay").entered();
+                                let _nested = tracing::debug_span!(target: "providers::state", "database_provider_ro").entered();
+                            }
+                        });
+                    });
+                }
+            });
+            drop(owners);
+            // Root samples still flush at guard shutdown, independently of owners.
+            let _root =
+                tracing::debug_span!(target: "providers::state", "database_provider_ro").entered();
+        });
+        drop(dispatch);
+        drop(guard);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let rows: Vec<Value> =
+            text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let owner_ids: Vec<_> = rows
+            .iter()
+            .filter(|row| matches!(row["name"].as_str(), Some("owner_a" | "owner_b")))
+            .map(|row| row["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(owner_ids.len(), 2);
+        let summaries: Vec<_> = rows.iter().filter(|row| row["type"] == "aggregate").collect();
+        assert_eq!(summaries.len(), 5);
+        for owner in owner_ids {
+            let owned: Vec<_> = summaries.iter().filter(|row| row["id"] == owner).collect();
+            assert_eq!(owned.len(), 2);
+            for row in owned {
+                assert_eq!(row["count"], 4000);
+                assert!(row["elapsed_ns"].as_u64().unwrap() > 0);
+            }
+        }
+        let root = summaries.iter().find(|row| row["id"] == 0).unwrap();
+        assert_eq!(root["count"], 1);
+        assert_eq!(rows.last().unwrap()["dropped"], 0);
+        assert_eq!(rows.last().unwrap()["io_error"], false);
     }
 
     #[test]
