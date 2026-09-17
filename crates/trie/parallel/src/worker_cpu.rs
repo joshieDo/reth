@@ -18,8 +18,8 @@ pub(crate) struct WorkerCpuTimer {
 impl WorkerCpuTimer {
     pub(crate) fn start() -> Option<Self> {
         static CAPTURE: OnceLock<bool> = OnceLock::new();
-        // Milestone mode intentionally omits worker spans and these measurements.
-        // Full mode retains the explicit worker parent even with other subscribers.
+        // Both modes retain coarse worker identity spans, so the explicit parent
+        // remains visible to the lifecycle layer even with other subscribers.
         let requested = *CAPTURE.get_or_init(|| {
             let detail = std::env::var("TEMPO_LIFECYCLE_DETAIL");
             let detail = match &detail {
@@ -27,7 +27,7 @@ impl WorkerCpuTimer {
                 Err(std::env::VarError::NotPresent) => None,
                 Err(std::env::VarError::NotUnicode(_)) => return false,
             };
-            full_capture_requested(std::env::var_os("RETH_LIFECYCLE_FILE").is_some(), detail)
+            capture_requested(std::env::var_os("RETH_LIFECYCLE_FILE").is_some(), detail)
         });
         Self::start_requested(requested)
     }
@@ -76,8 +76,8 @@ impl WorkerCpuTimer {
     }
 }
 
-fn full_capture_requested(file_present: bool, detail: Option<&str>) -> bool {
-    file_present && matches!(detail, None | Some("full"))
+fn capture_requested(file_present: bool, detail: Option<&str>) -> bool {
+    file_present && matches!(detail, None | Some("full" | "milestones"))
 }
 
 fn nanos(duration: Duration) -> u64 {
@@ -119,14 +119,14 @@ mod tests {
     }
 
     #[test]
-    fn sampling_requires_full_capture() {
-        assert!(!full_capture_requested(false, None));
-        assert!(!full_capture_requested(false, Some("full")));
-        assert!(!full_capture_requested(true, Some("milestones")));
-        assert!(!full_capture_requested(false, Some("milestones")));
-        assert!(!full_capture_requested(true, Some("unknown")));
-        assert!(full_capture_requested(true, None));
-        assert!(full_capture_requested(true, Some("full")));
+    fn sampling_requires_coarse_or_full_capture() {
+        assert!(!capture_requested(false, None));
+        assert!(!capture_requested(false, Some("full")));
+        assert!(capture_requested(true, Some("milestones")));
+        assert!(!capture_requested(false, Some("milestones")));
+        assert!(!capture_requested(true, Some("unknown")));
+        assert!(capture_requested(true, None));
+        assert!(capture_requested(true, Some("full")));
     }
 
     #[test]
