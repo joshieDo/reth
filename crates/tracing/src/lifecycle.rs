@@ -25,10 +25,16 @@ use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
 const QUEUE_CAPACITY: usize = 262_144;
 const WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 static NEXT_THREAD: AtomicU64 = AtomicU64::new(1);
-thread_local! { static THREAD: Cell<u64> = const { Cell::new(0) }; }
+thread_local! {
+    static THREAD: Cell<u64> = const { Cell::new(0) };
+    static REGISTERED_EPOCH: Cell<u64> = const { Cell::new(0) };
+    #[cfg(test)]
+    static REGISTRATION_CALLS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Captures a source-timestamped, privacy-filtered benchmark stream.
 pub(crate) struct LifecycleLayer {
+    scheduler_epoch: Option<u64>,
     detail: CaptureDetail,
     prewarm_cpu: bool,
     writer: Arc<Writer>,
@@ -319,6 +325,12 @@ impl LifecycleLayer {
             .map_err(|_| eyre::eyre!("lifecycle key must contain exactly 32 bytes"))?;
         let epoch = std::env::var("RETH_LIFECYCLE_EPOCH_NS")?.parse::<u64>()?;
         eyre::ensure!(epoch <= monotonic_ns(), "lifecycle epoch is in the future");
+        let scheduler_value = std::env::var("TEMPO_LIFECYCLE_SCHEDULER");
+        let scheduler_epoch = match scheduler_value {
+            Err(std::env::VarError::NotPresent) => None,
+            Ok(value) => scheduler_epoch(Some(&value), epoch)?,
+            Err(error) => return Err(error.into()),
+        };
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -327,7 +339,14 @@ impl LifecycleLayer {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        Ok(Some(Self::start_prewarm(file, key, epoch, detail, prewarm_cpu)?))
+        Ok(Some(Self::start_with_scheduler(
+            file,
+            key,
+            epoch,
+            detail,
+            prewarm_cpu,
+            scheduler_epoch,
+        )?))
     }
 
     pub(crate) const fn detail(&self) -> CaptureDetail {
@@ -344,12 +363,24 @@ impl LifecycleLayer {
         Self::start_prewarm(file, key, epoch, detail, false)
     }
 
+    #[cfg(test)]
     fn start_prewarm(
         file: File,
         key: [u8; 32],
         epoch: u64,
         detail: CaptureDetail,
         prewarm_cpu: bool,
+    ) -> eyre::Result<(Self, LifecycleGuard)> {
+        Self::start_with_scheduler(file, key, epoch, detail, prewarm_cpu, None)
+    }
+
+    fn start_with_scheduler(
+        file: File,
+        key: [u8; 32],
+        epoch: u64,
+        detail: CaptureDetail,
+        prewarm_cpu: bool,
+        scheduler_epoch: Option<u64>,
     ) -> eyre::Result<(Self, LifecycleGuard)> {
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -384,7 +415,7 @@ impl LifecycleLayer {
             let _ = out.write_all(b"\n");
             let _ = out.flush();
         })?;
-        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(), "prewarm_cpu":if prewarm_cpu { "leaf_v1" } else { "disabled" }}));
+        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(), "prewarm_cpu":if prewarm_cpu { "leaf_v1" } else { "disabled" }, "scheduler":if scheduler_epoch.is_some() { "registered_threads_v1" } else { "disabled" }}));
         let root_aggregates = Aggregates::default();
         let guard = LifecycleGuard {
             writer: Arc::clone(&writer),
@@ -393,6 +424,7 @@ impl LifecycleLayer {
         };
         Ok((
             Self {
+                scheduler_epoch,
                 detail,
                 prewarm_cpu,
                 writer,
@@ -407,7 +439,7 @@ impl LifecycleLayer {
     }
 
     fn stamp(&self, kind: &str, id: u64) -> Value {
-        json!({"type":kind, "id":id, "ts":monotonic_ns().saturating_sub(self.epoch), "thread":thread_id()})
+        json!({"type":kind, "id":id, "ts":monotonic_ns().saturating_sub(self.epoch), "thread":thread_id(self.scheduler_epoch)})
     }
 
     const fn fields(&self) -> SafeFields<'_> {
@@ -463,7 +495,7 @@ where
         let value = CaptureRecord::Start(Box::new(SpanStart {
             id: capture_id,
             ts: monotonic_ns().saturating_sub(self.epoch),
-            thread: thread_id(),
+            thread: thread_id(self.scheduler_epoch),
             name: attrs.metadata().name(),
             category: category(attrs.metadata().target()),
             parent,
@@ -491,7 +523,7 @@ where
                 kind: FieldRecordKind::Fields,
                 id: span.id,
                 ts: monotonic_ns().saturating_sub(self.epoch),
-                thread: thread_id(),
+                thread: thread_id(self.scheduler_epoch),
                 fields: fields.values,
             })));
         }
@@ -536,7 +568,7 @@ where
             kind: FieldRecordKind::Event,
             id: parent.unwrap_or(0),
             ts: monotonic_ns().saturating_sub(self.epoch),
-            thread: thread_id(),
+            thread: thread_id(self.scheduler_epoch),
             fields: fields.values,
         }));
         if value.is_backpressure() && !self.backpressure_seen.swap(true, Ordering::Relaxed) {
@@ -603,7 +635,7 @@ impl LifecycleLayer {
                 if span.sample.is_none() {
                     let id = span.id;
                     let ts = monotonic_ns().saturating_sub(self.epoch);
-                    let thread = thread_id();
+                    let thread = thread_id(self.scheduler_epoch);
                     let record = match kind {
                         StampKind::Enter => CaptureRecord::Enter { id, ts, thread },
                         StampKind::Exit => CaptureRecord::Exit { id, ts, thread },
@@ -884,10 +916,37 @@ impl Visit for SafeFields<'_> {
     }
 }
 
-fn thread_id() -> u64 {
+fn scheduler_epoch(value: Option<&str>, epoch: u64) -> eyre::Result<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some("registered_threads_v1") if epoch != 0 => Ok(Some(epoch)),
+        _ => eyre::bail!("TEMPO_LIFECYCLE_SCHEDULER must be registered_threads_v1"),
+    }
+}
+
+// The opt-in hook passes only a local ordinal and the phase clock origin. Native
+// process/thread identity is read by the attached kernel probe, never userspace.
+#[unsafe(no_mangle)]
+#[inline(never)]
+#[allow(clippy::missing_const_for_fn, reason = "uprobe marker must execute at runtime")]
+extern "C" fn reth_lifecycle_thread_register(ordinal: u64, epoch: u64) {
+    std::hint::black_box((ordinal, epoch));
+    #[cfg(test)]
+    REGISTRATION_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+fn thread_id(scheduler_epoch: Option<u64>) -> u64 {
     THREAD.with(|id| {
         if id.get() == 0 {
             id.set(NEXT_THREAD.fetch_add(1, Ordering::Relaxed));
+        }
+        if let Some(epoch) = scheduler_epoch {
+            REGISTERED_EPOCH.with(|registered| {
+                if registered.get() != epoch {
+                    reth_lifecycle_thread_register(id.get(), epoch);
+                    registered.set(epoch);
+                }
+            });
         }
         id.get()
     })
@@ -1093,6 +1152,74 @@ mod tests {
                     assert_eq!(as_value(record), expected);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn scheduler_registration_is_opt_in_once_per_thread_and_epoch() {
+        let first = std::thread::spawn(|| {
+            let id = thread_id(None);
+            assert_eq!(REGISTRATION_CALLS.with(Cell::get), 0);
+            assert_eq!(thread_id(Some(123)), id);
+            assert_eq!(thread_id(Some(123)), id);
+            assert_eq!(REGISTRATION_CALLS.with(Cell::get), 1);
+            assert_eq!(thread_id(Some(456)), id);
+            assert_eq!(REGISTRATION_CALLS.with(Cell::get), 2);
+            id
+        })
+        .join()
+        .unwrap();
+        let second = std::thread::spawn(|| {
+            let id = thread_id(Some(123));
+            assert_eq!(REGISTRATION_CALLS.with(Cell::get), 1);
+            id
+        })
+        .join()
+        .unwrap();
+        assert_ne!(first, second, "exited thread ordinals must never be reused");
+    }
+
+    #[test]
+    fn scheduler_capture_declares_registration_and_preserves_thread_ordinals() {
+        let _test = CAPTURE_TEST.lock().unwrap();
+        let epoch = monotonic_ns();
+        let path = std::env::temp_dir().join(format!("lifecycle-scheduler-{epoch}.jsonl"));
+        let (layer, guard) = LifecycleLayer::start_with_scheduler(
+            File::create(&path).unwrap(),
+            [7; 32],
+            epoch,
+            CaptureDetail::Full,
+            false,
+            Some(epoch),
+        )
+        .unwrap();
+        let before = REGISTRATION_CALLS.with(Cell::get);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info!(target: "lifecycle", stage = "load_start");
+            tracing::info!(target: "lifecycle", stage = "load_end");
+        });
+        drop(guard);
+        let rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(rows[0]["scheduler"], "registered_threads_v1");
+        assert_eq!(rows[1]["thread"], rows[2]["thread"]);
+        assert_eq!(rows[1]["thread"], thread_id(None));
+        assert_eq!(REGISTRATION_CALLS.with(Cell::get), before + 1);
+        assert_eq!(rows.last().unwrap()["dropped"], 0);
+    }
+
+    #[test]
+    fn scheduler_mode_requires_exact_name_and_nonzero_epoch() {
+        assert_eq!(scheduler_epoch(None, 0).unwrap(), None);
+        assert_eq!(scheduler_epoch(Some("registered_threads_v1"), 1).unwrap(), Some(1));
+        for (mode, epoch) in
+            [("registered_threads_v1", 0), ("", 1), ("disabled", 1), ("unknown", 1)]
+        {
+            assert!(scheduler_epoch(Some(mode), epoch).is_err());
         }
     }
 
@@ -1997,6 +2124,7 @@ mod tests {
         let dropped = Arc::new(AtomicU64::new(0));
         let failures = Arc::new(AtomicU64::new(0));
         let layer = LifecycleLayer {
+            scheduler_epoch: None,
             detail: CaptureDetail::Milestones,
             prewarm_cpu: true,
             writer: Arc::new(Writer {
@@ -2026,6 +2154,7 @@ mod tests {
             tx.send(Some(CaptureRecord::Json(json!({"type":"header"})))).unwrap();
             let dropped = Arc::new(AtomicU64::new(0));
             let layer = LifecycleLayer {
+                scheduler_epoch: None,
                 detail,
                 prewarm_cpu: false,
                 writer: Arc::new(Writer {
