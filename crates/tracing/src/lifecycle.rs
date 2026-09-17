@@ -714,6 +714,8 @@ fn numeric_field(name: &str) -> bool {
             "worker_storage_targets" |
             "worker_storage_groups" |
             "worker_jobs_storage_only_single_group" |
+            "worker_inline_storage_attempts" |
+            "worker_inline_storage_targets" |
             "worker_root_requests" |
             "worker_target_max" |
             "worker_jobs_targets_0" |
@@ -1028,7 +1030,7 @@ mod tests {
                     execution_block_input_operations=None::<u64>,
                     execution_block_output_operations=None::<u64>);
                 tracing::info!(target: "lifecycle", stage="execution_totals",
-                    execution_minor_page_faults="must-not-export-private-text", worker_jobs_storage_only_single_group="must-not-export-private-text");
+                    execution_minor_page_faults="must-not-export-private-text", worker_jobs_storage_only_single_group="must-not-export-private-text", worker_inline_storage_attempts="must-not-export-private-text", worker_inline_storage_targets="must-not-export-private-text");
             });
             drop(guard);
             let text = std::fs::read_to_string(&path).unwrap();
@@ -1092,7 +1094,7 @@ mod tests {
                     // The explicit event parent must work without a thread-local entered span.
                     assert!(tracing::Span::current().is_none());
                     tracing::info!(target: "lifecycle", parent: &worker, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64, worker_job_counts_measured=1u64, worker_jobs=Some(1u64), worker_storage_targets=Some(0u64), worker_account_targets=None::<u64>, worker_storage_groups=None::<u64>, worker_root_requests=Some(1u64), worker_target_max=Some(0u64), worker_jobs_targets_0=Some(1u64), worker_jobs_targets_1=Some(0u64), worker_jobs_targets_2_8=Some(0u64), worker_jobs_targets_9_32=Some(0u64), worker_jobs_targets_33_plus=Some(0u64), worker_job_counts_saturated=Some(0u64), native_tid=77777u64);
-                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64, worker_job_counts_measured=1u64, worker_jobs=Some(0u64), worker_account_targets=Some(0u64), worker_storage_groups=Some(0u64), worker_jobs_storage_only_single_group=Some(0u64), worker_storage_targets=None::<u64>, worker_root_requests=None::<u64>);
+                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64, worker_job_counts_measured=1u64, worker_jobs=Some(0u64), worker_account_targets=Some(0u64), worker_storage_groups=Some(0u64), worker_jobs_storage_only_single_group=Some(0u64), worker_inline_storage_attempts=Some(2u64), worker_inline_storage_targets=Some(9u64), worker_storage_targets=None::<u64>, worker_root_requests=None::<u64>);
                 });
             }).join().unwrap();
         });
@@ -1139,6 +1141,8 @@ mod tests {
         assert_eq!(account["fields"]["worker_account_targets"], 0);
         assert_eq!(account["fields"]["worker_storage_groups"], 0);
         assert_eq!(account["fields"]["worker_jobs_storage_only_single_group"], 0);
+        assert_eq!(account["fields"]["worker_inline_storage_attempts"], 2);
+        assert_eq!(account["fields"]["worker_inline_storage_targets"], 9);
         assert!(account["fields"].get("worker_storage_targets").is_none());
         assert!(account["fields"].get("worker_root_requests").is_none());
         assert!(account["fields"].get("worker_thread_cpu_ns").is_none());
