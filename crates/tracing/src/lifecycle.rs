@@ -567,12 +567,16 @@ const STAGES: &[&str] = &[
     "load_end",
     "decode_done",
     "message_origin",
+    "message_router_queue_start",
     "message_router_queue",
+    "message_peer_queue_start",
     "message_peer_queue",
+    "message_inbound_queue_start",
     "message_inbound_queue",
     "message_dequeued",
     "message_decode",
     "message_decode_result",
+    "message_decoded_queue_start",
     "message_decoded_queue",
     "message_delivered",
     "frame_authenticated",
@@ -620,6 +624,7 @@ fn numeric_field(name: &str) -> bool {
             "workers" |
             "channel" |
             "sequence" |
+            "queue_id" |
             "message_id" |
             "receive_id" |
             "accepted" |
@@ -1097,19 +1102,33 @@ mod tests {
     fn frame_lineage_fields_are_numeric_and_stages_are_closed() {
         let key = [7; 32];
         let mut fields = SafeFields { key: &key, values: Map::new() };
+        fields.text("queue_id", &u64::MAX.to_string());
         fields.text("message_id", &u64::MAX.to_string());
         fields.text("receive_id", "12");
         fields.text("accepted", "0");
         fields.text("peer", "private peer identity");
         fields.text("payload_bytes", "private payload");
         fields.text("stage", "message_origin");
+        assert_eq!(fields.values["queue_id"], u64::MAX);
         assert_eq!(fields.values["message_id"], u64::MAX);
         assert_eq!(fields.values["receive_id"], 12);
         assert_eq!(fields.values["accepted"], 0);
         assert_eq!(fields.values["stage"], "message_origin");
-        assert_eq!(fields.values.len(), 4);
+        assert_eq!(fields.values.len(), 5);
+        for stage in [
+            "message_router_queue_start",
+            "message_peer_queue_start",
+            "message_inbound_queue_start",
+            "message_decoded_queue_start",
+        ] {
+            fields.text("stage", stage);
+            assert_eq!(fields.values["stage"], stage);
+        }
+        fields.text("stage", "message_origin");
+        fields.text("queue_id", "private text");
         fields.text("message_id", "not a number");
         fields.text("stage", "private arbitrary text");
+        assert_eq!(fields.values["queue_id"], u64::MAX);
         assert_eq!(fields.values["message_id"], u64::MAX);
         assert_eq!(fields.values["stage"], "message_origin");
     }
