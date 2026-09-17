@@ -502,6 +502,10 @@ where
             return;
         }
         self.root_readiness_samples += 1;
+        // Include the scan and diagnostic emission in an explicit overhead interval.
+        let _scan = debug_span!(target: "lifecycle", "proof.trie.prehash_scan",
+            root_readiness_sample = u64::from(self.root_readiness_samples))
+        .entered();
         let mut remaining = 4096usize;
         let mut inspected_tries = 0u64;
         let mut pending_updates = 0u64;
