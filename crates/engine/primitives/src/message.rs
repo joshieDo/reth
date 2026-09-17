@@ -252,6 +252,8 @@ pub enum BeaconEngineMessage<Payload: PayloadTypes> {
         payload: Payload::ExecutionData,
         /// The sender for returning payload status result.
         tx: oneshot::Sender<Result<PayloadStatus, BeaconOnNewPayloadError>>,
+        /// Optional exact request context, moved with this payload (never inferred from its hash).
+        context: Option<Box<NewPayloadContext>>,
     },
     /// Message with new payload used by `reth_newPayload` endpoint.
     ///
@@ -344,7 +346,20 @@ where
         payload: Payload::ExecutionData,
     ) -> Result<PayloadStatus, BeaconOnNewPayloadError> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.to_engine.send(BeaconEngineMessage::NewPayload { payload, tx });
+        let _ = self.to_engine.send(BeaconEngineMessage::NewPayload { payload, tx, context: None });
+        rx.await.map_err(|_| BeaconOnNewPayloadError::EngineUnavailable)?
+    }
+
+    /// Submits a payload with an explicit request span. Dropping the response future does not
+    /// cancel an already queued payload. A disabled parent produces no request context.
+    pub async fn new_payload_with_parent(
+        &self,
+        payload: Payload::ExecutionData,
+        parent: tracing::Span,
+    ) -> Result<PayloadStatus, BeaconOnNewPayloadError> {
+        let (tx, rx) = oneshot::channel();
+        let context = NewPayloadContext::new(parent).map(Box::new);
+        let _ = self.to_engine.send(BeaconEngineMessage::NewPayload { payload, tx, context });
         rx.await.map_err(|_| BeaconOnNewPayloadError::EngineUnavailable)?
     }
 
@@ -403,3 +418,50 @@ where
         rx
     }
 }
+
+/// Single-owner trace context for one payload request, including time in all transport queues.
+///
+/// This is deliberately not cloneable: the queue span must close before service starts. Keeping
+/// the request span alive permits exact links even when the caller stops waiting; its retained
+/// lifetime is not a measurement of caller work. Consumers must require the explicit follows-from
+/// edge for attempt attribution when per-layer filters can hide the request span.
+#[derive(Debug)]
+pub struct NewPayloadContext {
+    parent: tracing::Span,
+    queued: tracing::Span,
+}
+
+impl NewPayloadContext {
+    /// Creates context only for an enabled, explicit parent; never falls back to the current span.
+    pub fn new(parent: tracing::Span) -> Option<Self> {
+        if parent.is_disabled() {
+            return None
+        }
+        let queued = tracing::debug_span!(target: "engine::tree", parent: &parent,
+            "engine.new_payload.queue", accepted = 0_u64);
+        if queued.is_disabled() {
+            return None
+        }
+        queued.follows_from(&parent);
+        Some(Self { parent, queued })
+    }
+
+    /// Marks this exact request dequeued and closes its queue interval before returning service.
+    /// Queue `accepted=0` means never dequeued, not that the engine rejected the payload.
+    /// Service `accepted` is recorded by the caller only after attempting response delivery.
+    /// Its timestamp, not eventual span closure (which may retain descendants), marks that
+    /// boundary.
+    pub fn start(self) -> tracing::Span {
+        let Self { parent, queued } = self;
+        queued.record("accepted", 1_u64);
+        let service = tracing::debug_span!(target: "engine::tree", parent: &parent,
+            "engine.new_payload.service", accepted = tracing::field::Empty);
+        service.follows_from(&parent);
+        service.follows_from(&queued);
+        drop(queued);
+        service
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests;

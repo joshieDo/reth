@@ -2197,6 +2197,78 @@ mod tests {
         assert_eq!(values.last().unwrap()["dropped"], 0);
     }
     #[test]
+    fn engine_request_links_require_exact_captured_parent_and_end_queue_before_service() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for mode in 0..3 {
+            let path =
+                std::env::temp_dir().join(format!("engine-request-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                CaptureDetail::Full,
+            )
+            .unwrap();
+            let layer = layer.with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                CaptureDetail::Full.capture_metadata(meta) && (mode == 0 || meta.name() != "verify")
+            }));
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+                .with(layer)
+                .with(tracing_subscriber::filter::filter_fn(move |meta| {
+                    mode != 2 || meta.name() != "verify"
+                }));
+            tracing::subscriber::with_default(subscriber, || {
+                let _ancestor =
+                    tracing::info_span!(target: "lifecycle", "unrelated_ancestor").entered();
+                let parent = tracing::info_span!(target: "lifecycle", "verify");
+                let context = reth_engine_primitives::NewPayloadContext::new(parent);
+                assert_eq!(context.is_none(), mode == 2);
+                if let Some(context) = context {
+                    let service = context.start();
+                    service.in_scope(|| {
+                        let _execution =
+                            tracing::debug_span!(target: "engine::tree", "on_new_payload")
+                                .entered();
+                    });
+                    service.record("accepted", 0_u64);
+                }
+            });
+            drop(guard);
+            let data = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let rows: Vec<Value> = data.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+            let services: Vec<_> =
+                rows.iter().filter(|r| r["name"] == "engine.new_payload.service").collect();
+            assert_eq!(services.len(), usize::from(mode != 2));
+            if let Some(service) = services.first() {
+                let queue = rows.iter().find(|r| r["name"] == "engine.new_payload.queue").unwrap();
+                let queue_end =
+                    rows.iter().position(|r| r["type"] == "end" && r["id"] == queue["id"]).unwrap();
+                let service_enter = rows
+                    .iter()
+                    .position(|r| r["type"] == "enter" && r["id"] == service["id"])
+                    .unwrap();
+                assert!(queue_end < service_enter);
+                let links: Vec<_> = rows.iter().filter(|r| r["type"] == "link").collect();
+                assert!(links.iter().any(|r| r["id"] == service["id"] && r["from"] == queue["id"]));
+                if mode == 0 {
+                    let parent = rows.iter().find(|r| r["name"] == "verify").unwrap();
+                    assert!(links
+                        .iter()
+                        .any(|r| r["id"] == service["id"] && r["from"] == parent["id"]));
+                    assert!(links
+                        .iter()
+                        .any(|r| r["id"] == queue["id"] && r["from"] == parent["id"]));
+                } else {
+                    assert_eq!(links.len(), 1, "filtered request cannot link to its ancestor");
+                }
+            }
+            assert_eq!(rows.last().unwrap()["dropped"], 0);
+        }
+    }
+
+    #[test]
     fn frame_lineage_fields_are_numeric_and_stages_are_closed() {
         let key = [7; 32];
         let mut fields = SafeFields { key: &key, values: FieldMap::new() };

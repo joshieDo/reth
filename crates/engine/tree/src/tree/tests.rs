@@ -1147,6 +1147,7 @@ async fn test_holesky_payload() {
                     sidecar: ExecutionPayloadSidecar::none(),
                 },
                 tx,
+                context: None,
             }
             .into(),
         ))
@@ -1154,6 +1155,83 @@ async fn test_holesky_payload() {
 
     let resp = rx.await.unwrap().unwrap();
     assert!(resp.is_syncing());
+}
+
+#[test]
+fn traced_new_payload_service_keeps_execution_parent_and_canceled_delivery() {
+    use reth_tracing::tracing_subscriber::{layer::SubscriberExt, registry::LookupSpan, Layer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Capture(Arc<AtomicUsize>);
+    struct Delivery<'a>(&'a AtomicUsize);
+    impl tracing::field::Visit for Delivery<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "accepted" {
+                assert!(value <= 1);
+                self.0.fetch_or(1 << value, Ordering::Relaxed);
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+    impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            ctx: reth_tracing::tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "on_new_payload" {
+                assert_eq!(
+                    ctx.span(id).unwrap().parent().unwrap().name(),
+                    "engine.new_payload.service"
+                );
+                self.0.fetch_or(4, Ordering::Relaxed);
+            }
+        }
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: reth_tracing::tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if ctx.span(id).unwrap().name() == "engine.new_payload.service" {
+                values.record(&mut Delivery(&self.0));
+            }
+        }
+    }
+    let observed = Arc::new(AtomicUsize::new(0));
+    let subscriber = reth_tracing::tracing_subscriber::registry().with(Capture(observed.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        let data = Bytes::from_str(include_str!("../../test-data/holesky/1.rlp")).unwrap();
+        let block = Block::decode(&mut data.as_ref()).unwrap();
+        let payload = ExecutionPayloadV1::from_block_slow(&block);
+        let mut harness =
+            TestHarness::new(HOLESKY.clone()).with_backfill_state(BackfillSyncState::Active);
+        for canceled in [false, true] {
+            let (tx, rx) = oneshot::channel();
+            let mut rx = (!canceled).then_some(rx);
+            let context =
+                reth_engine_primitives::NewPayloadContext::new(tracing::info_span!("verify"));
+            assert!(context.is_some());
+            let _ = harness
+                .tree
+                .on_engine_message(FromEngine::Request(
+                    BeaconEngineMessage::NewPayload {
+                        payload: ExecutionData {
+                            payload: payload.clone().into(),
+                            sidecar: ExecutionPayloadSidecar::none(),
+                        },
+                        tx,
+                        context: context.map(Box::new),
+                    }
+                    .into(),
+                ))
+                .unwrap();
+            if let Some(rx) = &mut rx {
+                assert!(rx.try_recv().unwrap().unwrap().is_syncing());
+            }
+        }
+    });
+    assert_eq!(observed.load(Ordering::Relaxed), 7);
 }
 
 #[test]

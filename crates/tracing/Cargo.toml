@@ -34,6 +34,9 @@ clap = { workspace = true, features = ["derive"], optional = true }
 eyre = { workspace = true, optional = true }
 rolling-file = { workspace = true, optional = true }
 
+[dev-dependencies]
+reth-engine-primitives = { workspace = true, features = ["std"] }
+
 [features]
 default = ["std", "otlp"]
 std = [
@@ -52,6 +55,7 @@ std = [
     "tracing/std",
     "tracing-subscriber?/std",
     "serde_json?/std",
+    "reth-engine-primitives/std",
 ]
 otlp = ["reth-tracing-otlp"]
 otlp-logs = ["reth-tracing-otlp/otlp-logs"]

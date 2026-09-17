@@ -1691,7 +1691,9 @@ where
                                     warn!(target: "engine::tree", ?state, elapsed=?start.elapsed(), "Failed to deliver forkchoiceUpdated response, receiver dropped (request cancelled): {err:?}");
                                 }
                             }
-                            BeaconEngineMessage::NewPayload { payload, tx } => {
+                            BeaconEngineMessage::NewPayload { payload, tx, context } => {
+                                let service = context.map(|context| context.start());
+                                let _service_guard = service.as_ref().map(|span| span.enter());
                                 let start = Instant::now();
                                 let gas_used = payload.gas_used();
                                 let num_hash = payload.num_hash();
@@ -1707,9 +1709,12 @@ where
                                     output.as_mut().ok().and_then(|out| out.event.take());
 
                                 // emit response
-                                if let Err(err) =
-                                    tx.send(output.map(|o| o.outcome).map_err(Into::into))
-                                {
+                                let delivered =
+                                    tx.send(output.map(|o| o.outcome).map_err(Into::into));
+                                if let Some(service) = &service {
+                                    service.record("accepted", u64::from(delivered.is_ok()));
+                                }
+                                if let Err(err) = delivered {
                                     warn!(target: "engine::tree", payload=?num_hash, elapsed=?start.elapsed(), "Failed to deliver newPayload response, receiver dropped (request cancelled): {err:?}");
                                     self.metrics
                                         .engine

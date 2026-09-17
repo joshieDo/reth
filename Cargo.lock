@@ -8561,6 +8561,7 @@ dependencies = [
  "futures",
  "reth-chain-state",
  "reth-errors",
+ "reth-ethereum-engine-primitives",
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-errors",
@@ -8573,6 +8574,8 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -10732,6 +10735,7 @@ dependencies = [
  "clap",
  "eyre",
  "libc",
+ "reth-engine-primitives",
  "reth-tracing-otlp",
  "rolling-file",
  "serde_json",
