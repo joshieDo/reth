@@ -263,6 +263,15 @@ impl WorkerPool {
         }
     }
 
+    /// Runs a callback on every pool thread without borrowing its shared [`Worker`].
+    ///
+    /// Use this for role-owned thread-local state. Unlike [`broadcast`](Self::broadcast),
+    /// the callback does not borrow the shared worker slot, including when Rayon
+    /// services the broadcast while another call is cooperatively waiting.
+    pub fn broadcast_fn(&self, f: impl Fn() + Sync) {
+        self.pool().broadcast(|_| f());
+    }
+
     /// Clears the state on every thread in the pool.
     pub fn clear(&self) {
         self.pool().broadcast(|_| {
@@ -520,6 +529,23 @@ mod tests {
         });
         let res = res.await;
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn broadcast_fn_does_not_reborrow_active_worker_state() {
+        let pool = WorkerPool::new(1, "broadcast-role-state");
+        pool.init::<usize>(|_| 11);
+        let visits = std::sync::atomic::AtomicUsize::new(0);
+        pool.install_fn(|| {
+            WorkerPool::with_worker_mut(|worker| {
+                pool.broadcast_fn(|| {
+                    visits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+                assert_eq!(*worker.get::<usize>(), 11);
+            })
+        });
+        assert_eq!(visits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(pool.install(|worker| *worker.get::<usize>()), 11);
     }
 
     #[test]
