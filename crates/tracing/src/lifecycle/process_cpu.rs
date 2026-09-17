@@ -641,8 +641,9 @@ mod tests {
     fn process_cpu_overhead_fixture() {
         use super::super::{CaptureDetail, LifecycleLayer};
         use std::sync::{atomic::AtomicBool, Barrier};
-        let compiled_source = option_env!("RETH_PROCESS_CPU_SOURCE_SHA")
-            .expect("fixture must be compiled with its exact source hash");
+        let Some(compiled_source) = option_env!("RETH_PROCESS_CPU_SOURCE_SHA") else {
+            panic!("fixture must be compiled with its exact source hash")
+        };
         let enabled = match std::env::var("RETH_PROCESS_CPU_PROBE_MODE").unwrap().as_str() {
             "0" => false,
             "1" => true,
