@@ -1637,6 +1637,25 @@ where
         self.proof_inner(&mut storage_value_encoder, targets)
     }
 
+    /// Calculates only the storage root hash, retaining temporary branch-buffer capacity.
+    ///
+    /// Use this when the root node itself is not needed. Owned nodes returned by
+    /// [`Self::storage_root_node`] and [`Self::storage_proof`] remain independent.
+    pub fn storage_root_hash(&mut self, hashed_address: B256) -> Result<B256, StateProofError> {
+        let root_node = self.storage_root_node(hashed_address)?;
+        let root = self
+            .compute_root_hash(core::slice::from_ref(&root_node))?
+            .expect("storage_root_node returns a node at empty path");
+        // Hashing has finished and no node escapes this method. Returning only the
+        // root branch's owned child buffer avoids reallocating it on the next walk.
+        // Other proof nodes remain caller-owned and are never admitted to this pool.
+        if let TrieNodeV2::Branch(mut branch) = root_node.node {
+            branch.stack.clear();
+            self.rlp_nodes_bufs.push(branch.stack);
+        }
+        Ok(root)
+    }
+
     /// Calculates the root node of a storage trie.
     ///
     /// This method does not accept targets nor retain proofs. Returns the root node which can
@@ -2160,6 +2179,80 @@ mod tests {
 
         let second_root = calculator.root_node(&mut StorageValueEncoder).unwrap();
         pretty_assertions::assert_eq!(first_root, second_root);
+    }
+
+    #[test]
+    fn test_hash_only_root_recycles_branch_capacity_and_preserves_owned_proofs() {
+        for count in [0, 1, 2, 16, 256] {
+            let storage: BTreeMap<_, _> =
+                (0..count).map(|i: u64| (keccak256(i.to_le_bytes()), U256::from(i + 1))).collect();
+            let harness = ProofTestHarness::new(storage.clone());
+            let address = harness.hashed_address();
+            let target = storage.keys().next().copied().unwrap_or_default();
+            let state =
+                HashedPostState::from_hashed_storage(address, HashedStorage::from_iter(storage))
+                    .into_sorted();
+            let updates = TrieUpdatesSorted::default();
+            let mut calculator = StorageProofCalculator::new_storage(
+                InMemoryTrieCursor::new_storage(
+                    NoopStorageTrieCursor::default(),
+                    &updates,
+                    address,
+                ),
+                HashedPostStateCursor::new_storage(NoopHashedCursor::default(), &state, address),
+            );
+            assert_eq!(calculator.storage_root_hash(address).unwrap(), harness.original_root());
+            let free_count = calculator.rlp_nodes_bufs.len();
+            if count > 1 {
+                assert!(free_count > 0, "hash-only root must return its branch buffer");
+                assert!(calculator.rlp_nodes_bufs.last().unwrap().is_empty());
+            }
+            for _ in 0..8 {
+                assert_eq!(calculator.storage_root_hash(address).unwrap(), harness.original_root());
+                assert_eq!(calculator.rlp_nodes_bufs.len(), free_count);
+            }
+            // Retain a real owned proof across several hash-only calls. The pool must not
+            // hold or overwrite buffers belonging to the caller's still-live proof.
+            let owned =
+                calculator.storage_proof(address, &mut [ProofV2Target::new(target)]).unwrap();
+            let expected = owned.clone();
+            for _ in 0..3 {
+                assert_eq!(calculator.storage_root_hash(address).unwrap(), harness.original_root());
+                assert_eq!(owned, expected);
+            }
+            let again =
+                calculator.storage_proof(address, &mut [ProofV2Target::new(target)]).unwrap();
+            assert_eq!(again, expected);
+        }
+    }
+
+    #[test]
+    fn test_hash_only_root_extension_and_partial_proof_ownership() {
+        let slot_a = B256::right_padding_from(&[0xae, 0xd4, 0x00]);
+        let slot_b = B256::right_padding_from(&[0xae, 0xd4, 0x10]);
+        let harness = ProofTestHarness::new(BTreeMap::from([
+            (slot_a, U256::from(1)),
+            (slot_b, U256::from(2)),
+        ]));
+        let address = harness.hashed_address();
+        let mut calculator = StorageProofCalculator::new_storage(
+            harness.trie_cursor_factory().storage_trie_cursor(address).unwrap(),
+            harness.hashed_cursor_factory().hashed_storage_cursor(address).unwrap(),
+        );
+        let original = calculator.storage_root_node(address).unwrap();
+        assert!(matches!(&original.node, TrieNodeV2::Branch(branch) if !branch.key.is_empty()));
+        assert_eq!(calculator.storage_root_hash(address).unwrap(), harness.original_root());
+        let target = ProofV2Target::new(slot_a).with_parent(ProofV2TargetParent::new(3));
+        let actual = calculator.storage_proof(address, &mut [target]).unwrap();
+        let (expected, root) = harness.proof_v2(&mut [target]);
+        assert!(root.is_none());
+        assert_eq!(actual, expected);
+        assert_eq!(calculator.storage_root_hash(address).unwrap(), harness.original_root());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            calculator.compute_root_hash(&[original]).unwrap(),
+            Some(harness.original_root())
+        );
     }
 
     #[test]
@@ -3286,6 +3379,21 @@ mod tests {
             calculator.storage_root_node(harness.hashed_address()),
             Err(StateProofError::TrieInconsistency(_))
         ));
+        let buffers_before = calculator.rlp_nodes_bufs.len();
+        assert!(matches!(
+            calculator.storage_root_hash(harness.hashed_address()),
+            Err(StateProofError::TrieInconsistency(_))
+        ));
+        assert_eq!(calculator.rlp_nodes_bufs.len(), buffers_before);
+        assert!(calculator.child_stack.is_empty());
+        assert!(calculator.branch_stack.is_empty());
+        // Ignore the inconsistent cached hint and reuse the same calculator after
+        // the failed hash-only call; the actual leaf remains authoritative.
+        calculator.prefix_set = PrefixSet::all_paths();
+        assert_eq!(
+            calculator.storage_root_hash(harness.hashed_address()).unwrap(),
+            harness.original_root()
+        );
     }
 
     #[test]

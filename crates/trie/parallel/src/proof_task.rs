@@ -490,8 +490,7 @@ where
             // changing the target's parent context, then reset the storage cursors by starting the
             // targeted proof.
             let root = if needs_root && targets.iter().all(|target| target.parent.is_known()) {
-                let root_node = calculator.storage_root_node(hashed_address)?;
-                calculator.compute_root_hash(core::slice::from_ref(&root_node))?
+                Some(calculator.storage_root_hash(hashed_address)?)
             } else {
                 None
             };
