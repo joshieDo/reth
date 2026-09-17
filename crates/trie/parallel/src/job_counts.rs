@@ -15,6 +15,7 @@ pub(crate) struct JobCounts {
     pub(crate) max_targets: u64,
     pub(crate) bins: [u64; 5],
     pub(crate) storage_groups: u64,
+    pub(crate) storage_only_single_group: u64,
     pub(crate) root_requests: u64,
     pub(crate) saturated: bool,
 }
@@ -35,6 +36,7 @@ impl JobCounts {
             max_targets: 0,
             bins: [0; 5],
             storage_groups: 0,
+            storage_only_single_group: 0,
             root_requests: 0,
             saturated: false,
         }
@@ -67,6 +69,9 @@ impl JobCounts {
                     u64::MAX
                 });
                 add(&mut counts.storage_groups, groups, &mut counts.saturated);
+                if size.targets == 0 && size.storage_groups == 1 {
+                    add(&mut counts.storage_only_single_group, 1, &mut counts.saturated);
+                }
             }
             JobKind::Storage => {
                 add(&mut counts.root_requests, u64::from(size.needs_root), &mut counts.saturated)
@@ -114,6 +119,40 @@ mod tests {
         assert_eq!(account.root_requests, 0);
         assert_eq!(storage.storage_groups, 0);
         assert_eq!(storage.root_requests, 7);
+    }
+
+    #[test]
+    fn storage_only_single_group_is_joint_account_only_and_saturating() {
+        let mut account = JobCounts::new(JobKind::Account);
+        let mut storage = JobCounts::new(JobKind::Storage);
+        for (targets, groups) in [(0, 0), (0, 1), (0, 2), (1, 1), (0, 1)] {
+            for counts in [&mut account, &mut storage] {
+                JobCounts::observe(Some(counts), || JobSize {
+                    targets,
+                    storage_groups: groups,
+                    needs_root: false,
+                });
+            }
+        }
+        assert_eq!(account.jobs, 5);
+        assert_eq!(account.bins[0], 4);
+        assert_eq!(account.storage_only_single_group, 2);
+        assert_eq!(storage.storage_only_single_group, 0);
+        assert!(!account.saturated);
+        account.storage_only_single_group = u64::MAX;
+        JobCounts::observe(Some(&mut account), || JobSize {
+            targets: 0,
+            storage_groups: 1,
+            needs_root: false,
+        });
+        assert_eq!(account.storage_only_single_group, u64::MAX);
+        assert!(account.saturated);
+        JobCounts::observe(Some(&mut account), || JobSize {
+            targets: 1,
+            storage_groups: 1,
+            needs_root: false,
+        });
+        assert!(account.saturated);
     }
 
     #[test]

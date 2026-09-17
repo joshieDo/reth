@@ -63,6 +63,7 @@ impl WorkerCpuTimer {
             worker_jobs = jobs.map(|j| j.jobs),
             worker_account_targets = jobs.filter(|j| j.kind == JobKind::Account).map(|j| j.targets),
             worker_storage_targets = jobs.filter(|j| j.kind == JobKind::Storage).map(|j| j.targets),
+            worker_jobs_storage_only_single_group = jobs.filter(|j| j.kind == JobKind::Account).map(|j| j.storage_only_single_group),
             worker_storage_groups = jobs.filter(|j| j.kind == JobKind::Account).map(|j| j.storage_groups),
             worker_root_requests = jobs.filter(|j| j.kind == JobKind::Storage).map(|j| j.root_requests),
             worker_target_max = jobs.map(|j| j.max_targets),
