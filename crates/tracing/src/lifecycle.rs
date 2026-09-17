@@ -121,6 +121,7 @@ impl Visit for MilestoneStage {
 enum CaptureRecord {
     Json(Value),
     Start(Box<SpanStart>),
+    Fields(Box<FieldRecord>),
     Enter { id: u64, ts: u64, thread: u64 },
     Exit { id: u64, ts: u64, thread: u64 },
     End { id: u64, ts: u64, thread: u64 },
@@ -154,6 +155,38 @@ impl SpanStart {
     }
 }
 
+/// Privacy-filtered event/update fields; outer JSON keys need no producer allocations.
+#[derive(Debug)]
+struct FieldRecord {
+    kind: FieldRecordKind,
+    id: u64,
+    ts: u64,
+    thread: u64,
+    fields: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FieldRecordKind {
+    Event,
+    Fields,
+}
+
+impl FieldRecord {
+    fn write_json(&self, out: &mut impl Write) -> io::Result<()> {
+        out.write_all(b"{\"fields\":")?;
+        serde_json::to_writer(&mut *out, &self.fields).map_err(io::Error::other)?;
+        let kind = match self.kind {
+            FieldRecordKind::Event => "event",
+            FieldRecordKind::Fields => "fields",
+        };
+        write!(
+            out,
+            ",\"id\":{},\"thread\":{},\"ts\":{},\"type\":\"{kind}\"}}",
+            self.id, self.thread, self.ts
+        )
+    }
+}
+
 impl From<Value> for CaptureRecord {
     fn from(value: Value) -> Self {
         Self::Json(value)
@@ -165,6 +198,7 @@ impl CaptureRecord {
         let (kind, id, ts, thread) = match self {
             Self::Json(value) => return serde_json::to_writer(out, value).map_err(io::Error::other),
             Self::Start(value) => return value.write_json(out),
+            Self::Fields(value) => return value.write_json(out),
             Self::Enter { id, ts, thread } => ("enter", id, ts, thread),
             Self::Exit { id, ts, thread } => ("exit", id, ts, thread),
             Self::End { id, ts, thread } => ("end", id, ts, thread),
@@ -175,7 +209,13 @@ impl CaptureRecord {
     }
 
     fn is_backpressure(&self) -> bool {
-        matches!(self, Self::Json(value) if value["fields"]["stage"] == "backpressure_start")
+        match self {
+            Self::Json(value) => value["fields"]["stage"] == "backpressure_start",
+            Self::Fields(value) => {
+                value.fields.get("stage").and_then(Value::as_str) == Some("backpressure_start")
+            }
+            _ => false,
+        }
     }
 }
 
@@ -394,9 +434,13 @@ where
         let mut fields = self.fields();
         values.record(&mut fields);
         if !fields.values.is_empty() {
-            let mut value = self.stamp("fields", span.id);
-            value["fields"] = Value::Object(fields.values);
-            self.writer.send(value);
+            self.writer.send(CaptureRecord::Fields(Box::new(FieldRecord {
+                kind: FieldRecordKind::Fields,
+                id: span.id,
+                ts: monotonic_ns().saturating_sub(self.epoch),
+                thread: thread_id(),
+                fields: fields.values,
+            })));
         }
     }
 
@@ -422,14 +466,17 @@ where
             ctx.event_span(event).and_then(|s| s.extensions().get::<CapturedSpan>().map(|s| s.id));
         let mut fields = self.fields();
         event.record(&mut fields);
-        let mut value = self.stamp("event", parent.unwrap_or(0));
-        value["fields"] = Value::Object(fields.values);
-        if value["fields"]["stage"] == "backpressure_start" &&
-            !self.backpressure_seen.swap(true, Ordering::Relaxed)
-        {
+        let value = CaptureRecord::Fields(Box::new(FieldRecord {
+            kind: FieldRecordKind::Event,
+            id: parent.unwrap_or(0),
+            ts: monotonic_ns().saturating_sub(self.epoch),
+            thread: thread_id(),
+            fields: fields.values,
+        }));
+        if value.is_backpressure() && !self.backpressure_seen.swap(true, Ordering::Relaxed) {
             // A full queue must not drop the first stop boundary. This can block only
             // after the measured pre-backpressure interval has already ended.
-            if self.writer.tx.send(Some(value.into())).is_err() {
+            if self.writer.tx.send(Some(value)).is_err() {
                 self.writer.dropped.fetch_add(1, Ordering::Relaxed);
             }
         } else {
@@ -797,6 +844,41 @@ mod tests {
         for capacity in [0, 14, 22, 70] {
             let mut buffer = vec![0; capacity];
             assert!(record.write_json(&mut io::Cursor::new(buffer.as_mut_slice())).is_err());
+        }
+    }
+
+    #[test]
+    fn typed_fields_preserve_json_and_flush_boundary() {
+        for id in [0, 1, u64::MAX] {
+            for (kind, name) in
+                [(FieldRecordKind::Event, "event"), (FieldRecordKind::Fields, "fields")]
+            {
+                for stage in [None, Some("backpressure_start"), Some("quoted\"\\\n\t\u{0000}λ")] {
+                    let mut fields = Map::from_iter([("transactions".into(), id.into())]);
+                    if let Some(stage) = stage {
+                        fields.insert("stage".into(), stage.into());
+                    }
+                    let expected = json!({"type":name,"id":id,"ts":id,"thread":id,"fields":fields});
+                    let record = CaptureRecord::Fields(Box::new(FieldRecord {
+                        kind,
+                        id,
+                        ts: id,
+                        thread: id,
+                        fields,
+                    }));
+                    let mut bytes = Vec::new();
+                    record.write_json(&mut bytes).unwrap();
+                    assert_eq!(bytes, serde_json::to_vec(&expected).unwrap());
+                    assert_eq!(record.is_backpressure(), stage == Some("backpressure_start"));
+                    for capacity in [0, 5, 13, bytes.len() - 1] {
+                        let mut buffer = vec![0; capacity];
+                        assert!(record
+                            .write_json(&mut io::Cursor::new(buffer.as_mut_slice()))
+                            .is_err());
+                    }
+                    assert_eq!(as_value(record), expected);
+                }
+            }
         }
     }
 
