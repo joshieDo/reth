@@ -604,7 +604,15 @@ impl<N: NodePrimitives> OverlayBuilder<N> {
             + PruneCheckpointReader,
     {
         let anchor_for_parent =
-            self.anchor_at_parent_with_frontiers(provider, state_trie_tip_block, finish_tip_block)?;
+            tracing::debug_span!(target: "lifecycle", "state.overlay.execution_anchor").in_scope(
+                || {
+                    self.anchor_at_parent_with_frontiers(
+                        provider,
+                        state_trie_tip_block,
+                        finish_tip_block,
+                    )
+                },
+            )?;
         let (anchor_hash, fallback_block_number) = match anchor_for_parent {
             AnchorForParent::RevertsRequired { anchor, .. } => {
                 (anchor.hash, Some(anchor.number + 1))

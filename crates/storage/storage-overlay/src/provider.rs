@@ -334,7 +334,11 @@ where
             return Ok((&overlay.overlay, overlay.historical_fallback.as_ref()))
         }
 
-        let (state_trie_tip_block, finish_tip_block) = database_state_frontiers(self.provider())?;
+        // Only the first resolution pays for these scopes; OnceCell hits return above.
+        let _resolve = tracing::debug_span!(target: "lifecycle", "state.overlay.resolve").entered();
+        let (state_trie_tip_block, finish_tip_block) =
+            tracing::debug_span!(target: "lifecycle", "state.overlay.frontiers")
+                .in_scope(|| database_state_frontiers(self.provider()))?;
         let (overlay, fallback_block_number) = self
             .overlay_builder
             .as_ref()
@@ -1207,6 +1211,34 @@ mod tests {
 
         provider.account_trie_cursor().unwrap();
         assert_eq!(state_provider_factory.state_trie_overlay_cache.len(), 1);
+    }
+
+    #[test]
+    fn execution_resolution_scopes_only_cover_first_provider_access() {
+        let trace = crate::test_trace::Capture::default();
+        trace.run(|| {
+            let (factory, blocks) = setup_frontiers(1, 3);
+            let manager = OverlayManager::default();
+            for block in &blocks[2..=3] {
+                manager.insert_block(block.clone());
+            }
+            let factory = OverlayStateProviderFactory::new(
+                factory,
+                manager.overlay_builder(blocks[3].recovered_block().hash()),
+            );
+            let provider = factory.database_provider_ro().unwrap();
+            let first = provider.execution_overlay().unwrap().0.clone();
+            let second = provider.execution_overlay().unwrap().0.clone();
+            assert!(Arc::ptr_eq(&first, &second));
+            for name in [
+                "state.overlay.resolve",
+                "state.overlay.frontiers",
+                "state.overlay.execution_anchor",
+            ] {
+                assert_eq!(trace.count(name), 1, "{name}");
+            }
+            assert_eq!(trace.parents("state.overlay.frontiers"), vec!["state.overlay.resolve"]);
+        });
     }
 
     #[test]

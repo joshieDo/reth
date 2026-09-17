@@ -10648,6 +10648,7 @@ dependencies = [
  "reth-trie-db",
  "revm",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

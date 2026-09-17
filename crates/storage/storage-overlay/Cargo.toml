@@ -49,6 +49,7 @@ reth-provider = { workspace = true, features = ["test-utils"] }
 reth-trie = { workspace = true, features = ["test-utils"] }
 
 alloy-consensus.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 rayon = ["dep:rayon", "dep:reth-tasks"]

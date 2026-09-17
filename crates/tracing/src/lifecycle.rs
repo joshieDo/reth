@@ -69,12 +69,37 @@ impl CaptureDetail {
         // These scopes carry otherwise implicit attempt/execution identities.
         // Filtering at enablement avoids allocating detailed spans at all.
         (meta.target().starts_with("tempo_consensus") &&
-            matches!(meta.name(), "handle_propose" | "handle_verify" | "verify")) ||
+            matches!(
+                meta.name(),
+                "handle_propose" |
+                    "handle_verify" |
+                    "verify" |
+                    "read_validator_config_at_block_hash"
+            )) ||
             (meta.target() == "engine::tree::payload_validator" &&
                 matches!(meta.name(), "execute_block" | "execute_block_bal")) ||
             (meta.target() == "trie::proof_task" &&
-                matches!(meta.name(), "storage_worker" | "account_worker"))
+                matches!(meta.name(), "storage_worker" | "account_worker")) ||
+            (meta.target() == "lifecycle" && execution_overlay_scope(meta.name()))
     }
+}
+
+// Cold resolution only: keep high-frequency OnceCell access aggregates out of milestones.
+fn execution_overlay_scope(name: &str) -> bool {
+    matches!(
+        name,
+        "state.overlay.resolve" |
+            "state.overlay.frontiers" |
+            "state.overlay.execution_anchor" |
+            "state.overlay.execution_cache" |
+            "state.overlay.cache_ready" |
+            "state.overlay.cache_pending_skip" |
+            "state.overlay.cache_wait" |
+            "state.overlay.cache_miss" |
+            "state.overlay.compute_envelope" |
+            "state.overlay.compute_worker" |
+            "state.overlay.compute_inline"
+    )
 }
 
 #[derive(Default)]
@@ -954,6 +979,92 @@ mod tests {
         assert!(account["fields"].get("storage_partial_roots").is_none());
         assert!(account["fields"].get("worker_thread_cpu_ns").is_none());
         assert_eq!(rows.last().unwrap()["dropped"], 0);
+    }
+
+    #[test]
+    fn overlay_resolution_keeps_block_and_worker_parent_in_both_details() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            let path =
+                std::env::temp_dir().join(format!("overlay-scopes-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                detail,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+                .with(layer.with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                    detail.capture_metadata(meta)
+                })));
+            tracing::subscriber::with_default(subscriber, || {
+                let read = tracing::info_span!(target: "tempo_consensus::validators", "read_validator_config_at_block_hash", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                read.in_scope(|| {
+                    let unrelated = tracing::trace_span!(target: "storage::overlay::manager", "get_or_compute_overlay");
+                    assert!(!unrelated.is_disabled(), "formatting subscriber enables filtered parent");
+                    unrelated.in_scope(|| {
+                        tracing::debug_span!(target: "lifecycle", "state.overlay.resolve").in_scope(|| {
+                            macro_rules! cold {
+                                ($name:literal) => { tracing::debug_span!(target: "lifecycle", $name).in_scope(|| ()) };
+                            }
+                            cold!("state.overlay.frontiers");
+                            cold!("state.overlay.execution_anchor");
+                            cold!("state.overlay.execution_cache");
+                            cold!("state.overlay.cache_ready");
+                            cold!("state.overlay.cache_pending_skip");
+                            cold!("state.overlay.cache_wait");
+                            cold!("state.overlay.cache_miss");
+                            cold!("state.overlay.compute_inline");
+                            let envelope = tracing::debug_span!(target: "lifecycle", "state.overlay.compute_envelope");
+                            envelope.in_scope(|| {
+                                let parent = envelope.clone();
+                                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                                std::thread::spawn(move || tracing::dispatcher::with_default(&dispatch, || {
+                                    let other = tracing::debug_span!(target: "engine::tree::payload_validator", "execute_block");
+                                    other.in_scope(|| {
+                                        tracing::debug_span!(target: "lifecycle", parent: &parent, "state.overlay.compute_worker", secret="never-export-this").in_scope(|| ());
+                                    });
+                                })).join().unwrap();
+                            });
+                        });
+                    });
+                });
+            });
+            drop(guard);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let rows: Vec<Value> =
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let find = |name| rows.iter().find(|r| r["name"] == name).unwrap();
+            let read = find("read_validator_config_at_block_hash");
+            assert_eq!(read["fields"]["block_hash"].as_str().unwrap().len(), 24);
+            let resolve = find("state.overlay.resolve");
+            assert_eq!(resolve["parent"], read["id"]);
+            let envelope = find("state.overlay.compute_envelope");
+            assert_eq!(envelope["parent"], resolve["id"]);
+            assert_eq!(find("state.overlay.compute_worker")["parent"], envelope["id"]);
+            let scopes: Vec<_> = rows
+                .iter()
+                .filter(|r| {
+                    r["type"] == "start" && r["name"].as_str().is_some_and(execution_overlay_scope)
+                })
+                .collect();
+            assert_eq!(scopes.len(), 11);
+            for scope in scopes {
+                assert_eq!(scope["fields"], json!({}));
+                assert!(rows.iter().any(|r| r["type"] == "end" && r["id"] == scope["id"]));
+            }
+            if detail == CaptureDetail::Milestones {
+                assert!(!rows
+                    .iter()
+                    .any(|r| matches!(r["type"].as_str(), Some("enter" | "exit" | "aggregate"))));
+            }
+            assert!(!text.contains("never-export-this"));
+            assert!(!text.contains("aaaaaaaaaaaaaaaa"));
+            assert_eq!(rows.last().unwrap()["dropped"], 0);
+        }
     }
 
     #[test]

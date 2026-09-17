@@ -371,7 +371,7 @@ impl<N: NodePrimitives> OverlayManager<N> {
             "loading state trie overlay for parent"
         );
         let input = self
-            .get_or_compute_overlay(
+            .get_or_compute_overlay::<_, _, false>(
                 &self.state_trie_overlays,
                 &self.metrics,
                 anchor_hash,
@@ -429,7 +429,7 @@ impl<N: NodePrimitives> OverlayManager<N> {
             return Ok(Some(Arc::new(ExecutionOverlay::default())))
         }
 
-        self.get_or_compute_overlay(
+        self.get_or_compute_overlay::<_, _, true>(
             &self.execution_overlays,
             &self.execution_metrics,
             anchor_hash,
@@ -451,7 +451,7 @@ impl<N: NodePrimitives> OverlayManager<N> {
             parent_overlay_reused = tracing::field::Empty,
         )
     )]
-    fn get_or_compute_overlay<T, M>(
+    fn get_or_compute_overlay<T, M, const EXECUTION: bool>(
         &self,
         cache: &OverlayCache<T>,
         metrics: &M,
@@ -466,16 +466,25 @@ impl<N: NodePrimitives> OverlayManager<N> {
         let tip_hash = parent_state.hash();
         let key = OverlayCacheKey { anchor_hash, tip_hash };
         let span = tracing::Span::current();
+        let _cache = execution_scope::<EXECUTION>(ExecutionScope::Cache).entered();
         if let Some(entry) = cache.entries.get(&key).map(|entry| entry.value().clone()) {
             metrics.record_cache_reuse();
             span.record("cache_reused", true);
             return match entry {
-                OverlayCacheEntry::Ready(input) => Ok(Some(input)),
-                OverlayCacheEntry::Computing(_) if cache_config.precompute => Ok(None),
-                OverlayCacheEntry::Computing(waiter) => Ok(Some(waiter.wait())),
+                OverlayCacheEntry::Ready(input) => {
+                    execution_scope::<EXECUTION>(ExecutionScope::Ready).in_scope(|| Ok(Some(input)))
+                }
+                OverlayCacheEntry::Computing(_) if cache_config.precompute => {
+                    execution_scope::<EXECUTION>(ExecutionScope::Pending).in_scope(|| Ok(None))
+                }
+                OverlayCacheEntry::Computing(waiter) => {
+                    execution_scope::<EXECUTION>(ExecutionScope::Wait)
+                        .in_scope(|| Ok(Some(waiter.wait())))
+                }
             }
         }
         span.record("cache_reused", false);
+        let _miss = execution_scope::<EXECUTION>(ExecutionScope::Miss).entered();
 
         // Resolve the block path and any cached parent overlay before locking the child entry.
         let mut blocks = Self::blocks_from_parent_state(parent_state, anchor_hash)?;
@@ -511,7 +520,10 @@ impl<N: NodePrimitives> OverlayManager<N> {
                 span.record("cache_reused", true);
                 match entry {
                     OverlayCacheEntry::Ready(input) => CacheAction::Ready(input),
-                    OverlayCacheEntry::Computing(_) if cache_config.precompute => return Ok(None),
+                    OverlayCacheEntry::Computing(_) if cache_config.precompute => {
+                        return execution_scope::<EXECUTION>(ExecutionScope::Pending)
+                            .in_scope(|| Ok(None))
+                    }
                     OverlayCacheEntry::Computing(waiter) => CacheAction::Wait(waiter),
                 }
             }
@@ -524,8 +536,11 @@ impl<N: NodePrimitives> OverlayManager<N> {
         };
 
         match action {
-            CacheAction::Ready(input) => Ok(Some(input)),
-            CacheAction::Wait(waiter) => Ok(Some(waiter.wait())),
+            CacheAction::Ready(input) => {
+                execution_scope::<EXECUTION>(ExecutionScope::Ready).in_scope(|| Ok(Some(input)))
+            }
+            CacheAction::Wait(waiter) => execution_scope::<EXECUTION>(ExecutionScope::Wait)
+                .in_scope(|| Ok(Some(waiter.wait()))),
             CacheAction::Compute(waiter) => {
                 let parent_input = blocks.first().and_then(|block| {
                     let parent_hash = block.recovered_block().parent_hash();
@@ -640,19 +655,36 @@ impl<N: NodePrimitives> OverlayManager<N> {
         anchor_hash: B256,
         _span: tracing::Span,
     ) -> ExecutionOverlay {
+        // This envelope includes dispatch/wait. The worker scope below measures only the
+        // actual merge/extend call, not CPU time or scheduler queue residence.
+        let envelope = tracing::debug_span!(target: "lifecycle", "state.overlay.compute_envelope");
+        let _envelope = envelope.enter();
         #[cfg(feature = "rayon")]
         {
             if let Some(worker_pool) = &self.worker_pool {
                 let compute_span = _span;
+                let envelope = envelope.clone();
+                let dispatch = (!envelope.is_disabled())
+                    .then(|| tracing::dispatcher::get_default(Clone::clone));
                 let metrics = self.execution_metrics.clone();
                 return worker_pool.spawn_and_wait(move || {
-                    let _guard = compute_span.enter();
-                    compute_execution_overlay_inner(compute_input, anchor_hash, &metrics)
+                    let compute = || {
+                        let _guard = compute_span.enter();
+                        tracing::debug_span!(target: "lifecycle", parent: &envelope, "state.overlay.compute_worker")
+                            .in_scope(|| compute_execution_overlay_inner(compute_input, anchor_hash, &metrics))
+                    };
+                    match dispatch {
+                        Some(dispatch) => tracing::dispatcher::with_default(&dispatch, compute),
+                        None => compute(),
+                    }
                 })
             }
         }
 
-        compute_execution_overlay_inner(compute_input, anchor_hash, &self.execution_metrics)
+        tracing::debug_span!(target: "lifecycle", parent: &envelope, "state.overlay.compute_inline")
+            .in_scope(|| {
+                compute_execution_overlay_inner(compute_input, anchor_hash, &self.execution_metrics)
+            })
     }
 }
 
@@ -948,6 +980,39 @@ fn compute_execution_overlay_inner<N: NodePrimitives>(
     overlay
 }
 
+// Const selection removes all new scopes from the shared state-trie cache path.
+#[derive(Clone, Copy)]
+enum ExecutionScope {
+    Cache,
+    Ready,
+    Pending,
+    Wait,
+    Miss,
+}
+
+fn execution_scope<const EXECUTION: bool>(scope: ExecutionScope) -> tracing::Span {
+    if !EXECUTION {
+        return tracing::Span::none()
+    }
+    match scope {
+        ExecutionScope::Cache => {
+            tracing::debug_span!(target: "lifecycle", "state.overlay.execution_cache")
+        }
+        ExecutionScope::Ready => {
+            tracing::debug_span!(target: "lifecycle", "state.overlay.cache_ready")
+        }
+        ExecutionScope::Pending => {
+            tracing::debug_span!(target: "lifecycle", "state.overlay.cache_pending_skip")
+        }
+        ExecutionScope::Wait => {
+            tracing::debug_span!(target: "lifecycle", "state.overlay.cache_wait")
+        }
+        ExecutionScope::Miss => {
+            tracing::debug_span!(target: "lifecycle", "state.overlay.cache_miss")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,6 +1110,105 @@ mod tests {
             .block_state(parent_hash)
             .ok_or(StateTrieOverlayError { tip_hash: parent_hash, anchor_hash })?;
         manager.overlay_for_parent(&parent_state, anchor_hash, OverlayCacheConfig::default())
+    }
+
+    #[test]
+    fn execution_cache_scopes_distinguish_miss_ready_and_trie_work() {
+        let trace = crate::test_trace::Capture::default();
+        trace.run(|| {
+            let manager = OverlayManager::default();
+            let block = test_blocks().remove(0);
+            let anchor = block.recovered_block().parent_hash();
+            let tip = block.recovered_block().hash();
+            manager.insert_block(block);
+            let first = manager.execution_overlay_for_parent(tip, anchor).unwrap();
+            let second = manager.execution_overlay_for_parent(tip, anchor).unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+            assert_eq!(first.block_hashes().len(), 1);
+            assert_eq!(trace.count("state.overlay.execution_cache"), 2);
+            assert_eq!(trace.count("state.overlay.cache_miss"), 1);
+            assert_eq!(trace.count("state.overlay.cache_ready"), 1);
+            assert_eq!(trace.count("state.overlay.compute_inline"), 1);
+            let before = trace.len();
+            overlay_for_parent(&manager, tip, anchor).unwrap();
+            assert_eq!(trace.len(), before, "state-trie work must not emit execution scopes");
+            let missing_anchor = B256::random();
+            assert!(manager.execution_overlay_for_parent(tip, missing_anchor).is_err());
+            assert_eq!(trace.count("state.overlay.compute_inline"), 1);
+        });
+    }
+
+    #[test]
+    fn execution_cache_scopes_distinguish_pending_skip_from_wait() {
+        let trace = crate::test_trace::Capture::default();
+        let manager = OverlayManager::default();
+        let block = test_blocks().remove(0);
+        let parent = BlockState::new(block);
+        let anchor = parent.block_ref().recovered_block().parent_hash();
+        let key = OverlayCacheKey { anchor_hash: anchor, tip_hash: parent.hash() };
+        let waiter = Arc::new(OverlayWaiter::new());
+        manager
+            .execution_overlays
+            .entries
+            .insert(key, OverlayCacheEntry::Computing(waiter.clone()));
+        trace.run(|| {
+            assert!(manager
+                .execution_overlay_for_parent_inner(
+                    &parent,
+                    anchor,
+                    OverlayCacheConfig { precompute: true, write_to_cache: true }
+                )
+                .unwrap()
+                .is_none());
+        });
+        assert_eq!(trace.count("state.overlay.cache_pending_skip"), 1);
+        assert_eq!(trace.count("state.overlay.cache_wait"), 0);
+        let waiting_trace = trace.clone();
+        let (tx, rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            waiting_trace.run(|| {
+                tx.send(manager.execution_overlay_for_block_state(
+                    &parent,
+                    anchor,
+                    OverlayCacheConfig::default(),
+                ))
+                .unwrap();
+            })
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let expected = Arc::new(ExecutionOverlay::default());
+        waiter.finish(expected.clone());
+        let actual = rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        thread.join().unwrap();
+        assert!(Arc::ptr_eq(&expected, &actual));
+        assert_eq!(trace.count("state.overlay.cache_wait"), 1);
+        assert_eq!(trace.count("state.overlay.compute_envelope"), 0);
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn execution_compute_worker_keeps_envelope_parent_and_dispatch() {
+        let trace = crate::test_trace::Capture::default();
+        trace.run(|| {
+            let manager = OverlayManager::new(Arc::new(WorkerPool::new(1, "overlay-trace-test")));
+            // Avoid insert_block's independent precomputation: this tests demand resolution.
+            let parent = BlockState::new(test_blocks().remove(0));
+            let anchor = parent.block_ref().recovered_block().parent_hash();
+            let actual = manager
+                .execution_overlay_for_block_state(&parent, anchor, OverlayCacheConfig::default())
+                .unwrap();
+            assert_eq!(actual.block_hashes().len(), 1);
+        });
+        assert_eq!(trace.count("state.overlay.compute_envelope"), 1);
+        assert_eq!(trace.count("state.overlay.compute_worker"), 1);
+        assert_eq!(trace.count("state.overlay.compute_inline"), 0);
+        assert_eq!(
+            trace.parents("state.overlay.compute_worker"),
+            vec!["state.overlay.compute_envelope"]
+        );
     }
 
     #[test]
