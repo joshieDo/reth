@@ -29,8 +29,11 @@
 //! ProofResultMessage <-- ProofResultSender
 //! ```
 
+#[cfg(feature = "metrics")]
+use crate::job_counts::JobKind;
 use crate::{
     error::StateRootTaskError,
+    job_counts::{JobCounts, JobSize},
     value_encoder::{AsyncAccountValueEncoder, ValueEncoderStats},
 };
 use alloy_primitives::{
@@ -233,11 +236,15 @@ impl ProofWorkerHandle {
                 );
                 #[cfg(feature = "metrics")]
                 let cpu_timer = crate::worker_cpu::WorkerCpuTimer::start();
-                let result = worker.run();
+                #[cfg(feature = "metrics")]
+                let mut job_counts = cpu_timer.as_ref().map(|_| JobCounts::new(JobKind::Storage));
+                #[cfg(not(feature = "metrics"))]
+                let mut job_counts = None;
+                let result = worker.run(job_counts.as_mut());
                 #[cfg(feature = "metrics")]
                 if let Some(timer) = cpu_timer {
                     let parent = if span.is_disabled() { &storage_parent_span } else { &span };
-                    timer.record(parent, "proof_storage_worker_totals", result.is_ok());
+                    timer.record(parent, "proof_storage_worker_totals", result.is_ok(), job_counts.as_ref());
                 }
                 if let Err(error) = result {
                     error!(
@@ -288,11 +295,15 @@ impl ProofWorkerHandle {
                 );
                 #[cfg(feature = "metrics")]
                 let cpu_timer = crate::worker_cpu::WorkerCpuTimer::start();
-                let result = worker.run();
+                #[cfg(feature = "metrics")]
+                let mut job_counts = cpu_timer.as_ref().map(|_| JobCounts::new(JobKind::Account));
+                #[cfg(not(feature = "metrics"))]
+                let mut job_counts = None;
+                let result = worker.run(job_counts.as_mut());
                 #[cfg(feature = "metrics")]
                 if let Some(timer) = cpu_timer {
                     let parent = if span.is_disabled() { &account_parent_span } else { &span };
-                    timer.record(parent, "proof_account_worker_totals", result.is_ok());
+                    timer.record(parent, "proof_account_worker_totals", result.is_ok(), job_counts.as_ref());
                 }
                 if let Err(error) = result {
                     error!(
@@ -733,7 +744,7 @@ where
     ///
     /// If this function panics, the worker thread terminates but other workers
     /// continue operating and the system degrades gracefully.
-    fn run(mut self) -> ProviderResult<()> {
+    fn run(mut self, mut job_counts: Option<&mut JobCounts>) -> ProviderResult<()> {
         // Create provider from factory
         let provider = self.task_ctx.factory.database_provider_ro()?;
         let proof_tx = ProofTaskTx::new(provider, self.worker_id);
@@ -772,6 +783,11 @@ where
             self.availability.mark_busy(self.worker_id);
             let StorageWorkerJob::StorageProof { input, proof_result_sender, trace } = job;
             let work = trace.start_storage();
+            JobCounts::observe(job_counts.as_deref_mut(), || JobSize {
+                targets: input.targets.len(),
+                storage_groups: 0,
+                needs_root: input.needs_root,
+            });
 
             #[cfg(feature = "trie-debug")]
             if let Some(max_jitter) = self.task_ctx.proof_jitter {
@@ -950,7 +966,7 @@ where
     ///
     /// If this function panics, the worker thread terminates but other workers
     /// continue operating and the system degrades gracefully.
-    fn run(mut self) -> ProviderResult<()> {
+    fn run(mut self, mut job_counts: Option<&mut JobCounts>) -> ProviderResult<()> {
         let provider = self.task_ctx.factory.database_provider_ro()?;
 
         trace!(
@@ -1022,6 +1038,11 @@ where
             self.availability.mark_busy(self.worker_id);
             let AccountWorkerJob::AccountMultiproof { input, trace } = job;
             let work = trace.start_account();
+            JobCounts::observe(job_counts.as_deref_mut(), || JobSize {
+                targets: input.targets.account_targets.len(),
+                storage_groups: input.targets.storage_targets.len(),
+                needs_root: false,
+            });
 
             #[cfg(feature = "trie-debug")]
             if let Some(max_jitter) = self.task_ctx.proof_jitter {

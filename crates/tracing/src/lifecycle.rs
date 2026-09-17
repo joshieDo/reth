@@ -701,6 +701,19 @@ fn numeric_field(name: &str) -> bool {
             "worker_thread_cpu_ns" |
             "worker_cpu_measured" |
             "worker_success" |
+            "worker_job_counts_measured" |
+            "worker_jobs" |
+            "worker_account_targets" |
+            "worker_storage_targets" |
+            "worker_storage_groups" |
+            "worker_root_requests" |
+            "worker_target_max" |
+            "worker_jobs_targets_0" |
+            "worker_jobs_targets_1" |
+            "worker_jobs_targets_2_8" |
+            "worker_jobs_targets_9_32" |
+            "worker_jobs_targets_33_plus" |
+            "worker_job_counts_saturated" |
             "execution_resources_measured" |
             "execution_voluntary_context_switches" |
             "execution_involuntary_context_switches" |
@@ -1070,8 +1083,8 @@ mod tests {
                     let worker = tracing::debug_span!(target: "trie::proof_task", parent: &parent, "storage_worker");
                     // The explicit event parent must work without a thread-local entered span.
                     assert!(tracing::Span::current().is_none());
-                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64, native_tid=77777u64);
-                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64);
+                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64, worker_job_counts_measured=1u64, worker_jobs=Some(1u64), worker_storage_targets=Some(0u64), worker_account_targets=None::<u64>, worker_storage_groups=None::<u64>, worker_root_requests=Some(1u64), worker_target_max=Some(0u64), worker_jobs_targets_0=Some(1u64), worker_jobs_targets_1=Some(0u64), worker_jobs_targets_2_8=Some(0u64), worker_jobs_targets_9_32=Some(0u64), worker_jobs_targets_33_plus=Some(0u64), worker_job_counts_saturated=Some(0u64), native_tid=77777u64);
+                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64, worker_job_counts_measured=1u64, worker_jobs=Some(0u64), worker_account_targets=Some(0u64), worker_storage_groups=Some(0u64), worker_storage_targets=None::<u64>, worker_root_requests=None::<u64>);
                 });
             }).join().unwrap();
         });
@@ -1090,12 +1103,34 @@ mod tests {
         assert_eq!(storage["fields"]["worker_thread_cpu_ns"], 0);
         assert_eq!(storage["fields"]["worker_cpu_measured"], 1);
         assert_eq!(storage["fields"]["worker_success"], 1);
+        assert_eq!(storage["fields"]["worker_job_counts_measured"], 1);
+        assert_eq!(storage["fields"]["worker_jobs"], 1);
+        assert_eq!(storage["fields"]["worker_root_requests"], 1);
+        assert_eq!(storage["fields"]["worker_jobs_targets_0"], 1);
+        for field in [
+            "worker_storage_targets",
+            "worker_target_max",
+            "worker_jobs_targets_1",
+            "worker_jobs_targets_2_8",
+            "worker_jobs_targets_9_32",
+            "worker_jobs_targets_33_plus",
+            "worker_job_counts_saturated",
+        ] {
+            assert_eq!(storage["fields"][field], 0, "{field}");
+        }
+        assert!(storage["fields"].get("worker_account_targets").is_none());
+        assert!(storage["fields"].get("worker_storage_groups").is_none());
         let account =
             rows.iter().find(|r| r["fields"]["stage"] == "proof_account_worker_totals").unwrap();
         assert_eq!(account["id"], worker["id"]);
         assert_eq!(account["fields"]["worker_run_ns"], 60);
         assert_eq!(account["fields"]["worker_cpu_measured"], 0);
         assert_eq!(account["fields"]["worker_success"], 0);
+        assert_eq!(account["fields"]["worker_job_counts_measured"], 1);
+        assert_eq!(account["fields"]["worker_account_targets"], 0);
+        assert_eq!(account["fields"]["worker_storage_groups"], 0);
+        assert!(account["fields"].get("worker_storage_targets").is_none());
+        assert!(account["fields"].get("worker_root_requests").is_none());
         assert!(account["fields"].get("worker_thread_cpu_ns").is_none());
         assert_eq!(rows.last().unwrap()["dropped"], 0);
     }
@@ -1258,7 +1293,7 @@ mod tests {
             let _entered = span.enter();
             tracing::info!(target:"lifecycle", stage="marshal_enqueued", block_hash="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
             tracing::info!(target:"lifecycle", stage="DO_NOT_EXPORT", payload="PRIVATE_TRANSACTION", private_key="DO_NOT_EXPORT");
-            tracing::info!(target: "lifecycle", stage = "operation_completed", queued_jobs = 3u64);
+            tracing::info!(target: "lifecycle", stage = "operation_completed", queued_jobs = 3u64, worker_jobs="DO_NOT_EXPORT", worker_target_max=?"DO_NOT_EXPORT", worker_job_counts_saturated=Some(1u64), worker_storage_targets=Some(u64::MAX));
             tracing::info!(target: "lifecycle", stage = "operation_abandoned");
             tracing::info!("DO_NOT_EXPORT");
         });
@@ -1280,6 +1315,10 @@ mod tests {
             .iter()
             .any(|v| v["fields"]["stage"] == "operation_completed" &&
                 v["fields"]["queued_jobs"] == 3));
+        assert!(values.iter().any(|v| v["fields"]["worker_job_counts_saturated"] == 1 &&
+            v["fields"]["worker_storage_targets"] == u64::MAX));
+        assert!(!values.iter().any(|v| v["fields"].get("worker_jobs").is_some() ||
+            v["fields"].get("worker_target_max").is_some()));
         assert!(values.iter().any(|v| v["fields"]["stage"] == "operation_abandoned"));
         assert_eq!(values.last().unwrap()["dropped"], 0);
         assert_eq!(
