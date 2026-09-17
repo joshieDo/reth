@@ -593,7 +593,8 @@ fn numeric_field(name: &str) -> bool {
     let name = canonical_field(name);
     matches!(
         name,
-        "queued_jobs" |
+        "body_source" |
+            "queued_jobs" |
             "in_flight_proof_batches" |
             "pending_updates" |
             "pending_targets" |
@@ -942,6 +943,9 @@ mod tests {
             tracing::info!(target:"lifecycle", stage="marshal_enqueued", block_hash="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
             tracing::info!(target:"lifecycle", stage="DO_NOT_EXPORT", payload="PRIVATE_TRANSACTION", private_key="DO_NOT_EXPORT");
             tracing::info!(target: "lifecycle", stage = "operation_completed", queued_jobs = 3u64);
+            tracing::info!(target: "lifecycle", stage = "body_ready", body_source = 3u64);
+            tracing::info!(target: "lifecycle", stage = "body_ready", body_source = "DO_NOT_EXPORT");
+            tracing::info!(target: "lifecycle", stage = "body_ready", body_source = ?"DO_NOT_EXPORT");
             tracing::info!(target: "lifecycle", stage = "operation_abandoned");
             tracing::info!("DO_NOT_EXPORT");
         });
@@ -963,6 +967,12 @@ mod tests {
             .iter()
             .any(|v| v["fields"]["stage"] == "operation_completed" &&
                 v["fields"]["queued_jobs"] == 3));
+        let body_rows: Vec<_> =
+            values.iter().filter(|v| v["fields"]["stage"] == "body_ready").collect();
+        assert_eq!(body_rows.len(), 3);
+        assert_eq!(body_rows[0]["fields"]["body_source"], 3);
+        assert!(body_rows[1]["fields"].get("body_source").is_none());
+        assert!(body_rows[2]["fields"].get("body_source").is_none());
         assert!(values.iter().any(|v| v["fields"]["stage"] == "operation_abandoned"));
         assert_eq!(values.last().unwrap()["dropped"], 0);
         assert_eq!(
