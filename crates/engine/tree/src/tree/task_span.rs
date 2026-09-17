@@ -2,17 +2,17 @@
 use tracing::{debug_span, trace_span, Span};
 
 // A Span converted by value into an Id can close before new_span uses that Id.
-// These functions own the queued handle but borrow it during child creation.
-pub(super) fn sparse_trie(parent: Span) -> Span {
-    debug_span!(target: "engine::tree::payload_processor", parent: &parent, "sparse_trie_task")
+// The caller retains its handle even when the child callsite is disabled.
+pub(super) fn sparse_trie(parent: &Span) -> Span {
+    debug_span!(target: "engine::tree::payload_processor", parent: parent, "sparse_trie_task")
 }
 
-pub(super) fn hashing(parent: Span) -> Span {
-    trace_span!(target: "reth_engine_tree::tree::state_root_strategy::sparse_trie", parent: &parent, "run_hashing_task")
+pub(super) fn hashing(parent: &Span) -> Span {
+    trace_span!(target: "reth_engine_tree::tree::state_root_strategy::sparse_trie", parent: parent, "run_hashing_task")
 }
 
-pub(super) fn payload_conversion(parent: Span) -> Span {
-    debug_span!(target: "engine::tree::payload_validator", parent: &parent, "convert_and_validate")
+pub(super) fn payload_conversion(parent: &Span) -> Span {
+    debug_span!(target: "engine::tree::payload_validator", parent: parent, "convert_and_validate")
 }
 
 #[cfg(test)]
@@ -24,7 +24,7 @@ mod tests {
     fn detached_tasks_retain_last_parent_after_cancellation() {
         for (make, target, name) in [
             (
-                sparse_trie as fn(Span) -> Span,
+                sparse_trie as fn(&Span) -> Span,
                 "engine::tree::payload_processor",
                 "sparse_trie_task",
             ),
@@ -49,7 +49,7 @@ mod tests {
             });
             std::thread::spawn(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    let child = make(queued);
+                    let child = make(&queued);
                     assert!(!child.is_disabled());
                     let metadata = child.metadata().expect("enabled child metadata");
                     assert_eq!(metadata.target(), target);
@@ -63,10 +63,57 @@ mod tests {
     }
 
     #[test]
+    fn filtered_child_preserves_caller_owned_parent_until_task_exit() {
+        use reth_tracing::tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct Closed(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Closed {
+            fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+                assert_eq!(ctx.span(&id).expect("closing parent").name(), "caller");
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for make in [sparse_trie, hashing, payload_conversion] {
+            let closed = Arc::new(AtomicUsize::new(0));
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::registry()
+                    .with(Closed(Arc::clone(&closed)))
+                    .with(tracing_subscriber::filter::filter_fn(|meta| meta.name() == "caller")),
+            );
+            let queued = tracing::dispatcher::with_default(&dispatch, || {
+                let caller = tracing::info_span!("caller");
+                assert!(!caller.is_disabled());
+                caller
+            });
+            std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let child = make(&queued);
+                    assert!(child.is_disabled());
+                    drop(child);
+                    assert_eq!(
+                        closed.load(Ordering::SeqCst),
+                        0,
+                        "disabled child must not close the task's parent"
+                    );
+                    // The captured handle is released only when the worker finishes.
+                    drop(queued);
+                    assert_eq!(closed.load(Ordering::SeqCst), 1);
+                })
+            })
+            .join()
+            .expect("filtered worker parent lifetime");
+        }
+    }
+
+    #[test]
     fn detached_tasks_accept_disabled_parent() {
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
             for make in [sparse_trie, hashing, payload_conversion] {
-                assert!(make(Span::none()).is_disabled());
+                assert!(make(&Span::none()).is_disabled());
             }
         });
     }
