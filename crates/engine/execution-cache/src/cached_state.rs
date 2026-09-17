@@ -1314,7 +1314,12 @@ impl ExecutionCache {
 
             // Now we iterate over all storage and make updates to the cached storage values
             for (key, slot) in &account.storage {
-                self.insert_storage(*addr, (*key).into(), Some(slot.present_value));
+                let key: StorageKey = (*key).into();
+                if slot.is_changed() ||
+                    self.0.storage_cache.get(&(*addr, key)) != Some(slot.present_value)
+                {
+                    self.insert_storage(*addr, key, Some(slot.present_value));
+                }
             }
 
             // Insert will update if present, so we just use the new account info as the new value
@@ -1527,6 +1532,91 @@ mod tests {
 
         drop(cache3);
         assert!(cache.is_available());
+    }
+
+    #[test]
+    fn test_insert_state_warms_missing_and_repairs_stale_unchanged_slots() {
+        use reth_revm::db::states::plain_account::StorageSlot;
+
+        // Check each shape independently: collisions cannot make this assertion vacuous.
+        for cached in [None, Some(U256::from(42)), Some(U256::from(99))] {
+            for changed in [false, true] {
+                let caches = ExecutionCache::new(1_000_000);
+                let address = Address::ZERO;
+                let key = U256::from(1);
+                let value = U256::from(42);
+                if let Some(cached) = cached {
+                    caches.insert_storage(address, key.into(), Some(cached));
+                }
+                let info = AccountInfo::default();
+                let slot = if changed {
+                    StorageSlot::new_changed(U256::ZERO, value)
+                } else {
+                    StorageSlot::new(value)
+                };
+                let bundle = BundleState {
+                    state: HashMap::from_iter([(
+                        address,
+                        BundleAccount::new(
+                            Some(info.clone()),
+                            Some(info),
+                            HashMap::from_iter([(key, slot)]),
+                            AccountStatus::Changed,
+                        ),
+                    )]),
+                    ..Default::default()
+                };
+                assert!(caches.insert_state(&bundle).is_ok());
+                assert_eq!(caches.0.storage_cache.get(&(address, key.into())), Some(value));
+                // Repeated equal insertion and epoch clear both preserve generic warming.
+                assert!(caches.insert_state(&bundle).is_ok());
+                caches.clear();
+                assert!(caches.insert_state(&bundle).is_ok());
+                assert_eq!(caches.0.storage_cache.get(&(address, key.into())), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn test_insert_state_repairs_retained_values_under_collisions() {
+        use reth_revm::db::states::plain_account::StorageSlot;
+
+        let caches = ExecutionCache::new(1);
+        let address = Address::ZERO;
+        let count = 32_768;
+        let storage = (0..count)
+            .map(|i| {
+                let key = U256::from(i);
+                let value = U256::from(i + 1);
+                if i % 3 != 0 {
+                    caches.insert_storage(address, key.into(), Some(U256::MAX));
+                }
+                let slot = if i % 2 == 0 {
+                    StorageSlot::new(value)
+                } else {
+                    StorageSlot::new_changed(U256::ZERO, value)
+                };
+                (key, slot)
+            })
+            .collect();
+        let info = AccountInfo::default();
+        let bundle = BundleState {
+            state: HashMap::from_iter([(
+                address,
+                BundleAccount::new(Some(info.clone()), Some(info), storage, AccountStatus::Changed),
+            )]),
+            ..Default::default()
+        };
+        assert!(caches.insert_state(&bundle).is_ok());
+        assert!(caches.0.storage_stats.collisions() > 0);
+        let mut retained = 0;
+        for i in 0..count {
+            if let Some(value) = caches.0.storage_cache.get(&(address, U256::from(i).into())) {
+                assert_eq!(value, U256::from(i + 1));
+                retained += 1;
+            }
+        }
+        assert!(retained > 0 && retained < count);
     }
 
     #[test]
