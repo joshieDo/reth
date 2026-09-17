@@ -286,6 +286,7 @@ impl ProofWorkerHandle {
                     account_work_rx.clone(),
                     worker_id,
                     account_tx.clone(),
+                    storage_worker_count,
                     account_avail.clone(),
                     cached_storage_roots.clone(),
                     #[cfg(feature = "metrics")]
@@ -968,6 +969,8 @@ struct AccountProofWorker<Factory> {
     worker_id: usize,
     /// Channel for dispatching storage proof work (for pre-dispatched target proofs)
     storage_work_tx: CrossbeamSender<StorageWorkerJob>,
+    /// Advisory threshold: one queued job per storage worker before using the nested path.
+    storage_worker_count: usize,
     /// Per-worker availability flags
     availability: Arc<AvailabilitySheet>,
     /// Cached storage roots
@@ -991,6 +994,7 @@ where
         work_rx: CrossbeamReceiver<AccountWorkerJob>,
         worker_id: usize,
         storage_work_tx: CrossbeamSender<StorageWorkerJob>,
+        storage_worker_count: usize,
         availability: Arc<AvailabilitySheet>,
         cached_storage_roots: Arc<DashMap<B256, B256>>,
         #[cfg(feature = "metrics")] metrics: ProofTaskTrieMetrics,
@@ -1001,6 +1005,7 @@ where
             work_rx,
             worker_id,
             storage_work_tx,
+            storage_worker_count,
             availability,
             cached_storage_roots,
             #[cfg(feature = "metrics")]
@@ -1215,7 +1220,12 @@ where
     {
         let proof_start = Instant::now();
 
-        let Some(input) = forward_storage_only_job(&self.storage_work_tx, input, job_counts) else {
+        let Some(input) = forward_storage_only_job(
+            &self.storage_work_tx,
+            input,
+            job_counts,
+            self.storage_worker_count,
+        ) else {
             *account_proofs_processed += 1;
             return ValueEncoderStats::default();
         };
@@ -1264,11 +1274,20 @@ fn forward_storage_only_job(
     storage_work_tx: &CrossbeamSender<StorageWorkerJob>,
     input: AccountMultiproofInput,
     job_counts: Option<&mut JobCounts>,
+    storage_worker_count: usize,
 ) -> Option<AccountMultiproofInput> {
-    if !input.targets.account_targets.is_empty() || input.targets.storage_targets.len() != 1 {
+    let Some((queued_jobs, forward)) =
+        forwarding_queue_decision(&input.targets, storage_worker_count, || storage_work_tx.len())
+    else {
+        return Some(input)
+    };
+    JobCounts::observe_forward(job_counts, !forward);
+    if !forward {
+        // Reuse the original calculation/collection path, including its result and error
+        // handling. The snapshot races with other producers/consumers: this is an
+        // admission heuristic, not a queue capacity or memory bound.
         return Some(input)
     }
-    JobCounts::observe_forward(job_counts, false);
     let AccountMultiproofInput { targets, proof_result_sender } = input;
     let (hashed_address, targets) = targets.storage_targets.into_iter().next().expect("one group");
     // An empty account proof never invokes the value encoder, so no storage root is
@@ -1279,7 +1298,7 @@ fn forward_storage_only_job(
             context: Some(proof_result_sender),
             hashed_address,
         })),
-        trace: ProofJobTrace::storage(storage_work_tx.len()),
+        trace: ProofJobTrace::storage(queued_jobs),
     };
     if let Err(error) = storage_work_tx.send(job) {
         let StorageWorkerJob::StorageProof { proof_result_sender, .. } = error.0;
@@ -1289,6 +1308,20 @@ fn forward_storage_only_job(
         context.send(Err(storage_dispatch_error(hashed_address)));
     }
     None
+}
+
+/// Do not inspect the shared queue for ineligible inputs. One snapshot controls the
+/// route and is reused by the existing queue trace; there is no reservation or wait.
+fn forwarding_queue_decision(
+    targets: &MultiProofTargetsV2,
+    storage_worker_count: usize,
+    queued_jobs: impl FnOnce() -> usize,
+) -> Option<(usize, bool)> {
+    if !targets.account_targets.is_empty() || targets.storage_targets.len() != 1 {
+        return None
+    }
+    let queued_jobs = queued_jobs();
+    Some((queued_jobs, queued_jobs < storage_worker_count))
 }
 
 fn storage_dispatch_error(hashed_address: B256) -> StateRootTaskError {
@@ -1570,8 +1603,8 @@ mod tests {
             }
             let expected_accounts = input.targets.account_targets.clone();
             let expected_storage = input.targets.storage_targets.clone();
-            let input =
-                forward_storage_only_job(&tx, input, None).expect("must retain ordinary path");
+            let input = forward_storage_only_job(&tx, input, None, usize::MAX)
+                .expect("must retain ordinary path");
             assert_eq!(
                 input
                     .targets
@@ -1596,18 +1629,112 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_pressure_boundary_and_race_are_advisory() {
+        let (input, _) = storage_only_input(B256::ZERO, Vec::new(), 1);
+        for (queued, workers, expected) in [
+            (0, 0, false),
+            (0, 1, true),
+            (1, 1, false),
+            (31, 32, true),
+            (32, 32, false),
+            (usize::MAX, 32, false),
+        ] {
+            assert_eq!(
+                forwarding_queue_decision(&input.targets, workers, || queued),
+                Some((queued, expected))
+            );
+        }
+        let calls = std::cell::Cell::new(0);
+        let live_queue = std::cell::Cell::new(0);
+        let decision = forwarding_queue_decision(&input.targets, 1, || {
+            calls.set(calls.get() + 1);
+            let snapshot = live_queue.get();
+            live_queue.set(2); // Another producer can enqueue after the snapshot.
+            snapshot
+        });
+        assert_eq!(decision, Some((0, true)));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(live_queue.get(), 2);
+        let mut targets = input.targets;
+        targets.account_targets.push(ProofV2Target::new(B256::ZERO));
+        assert_eq!(
+            forwarding_queue_decision(&targets, 1, || panic!(
+                "ineligible inputs must not read queue"
+            )),
+            None
+        );
+        targets.account_targets.clear();
+        targets.storage_targets.clear();
+        assert_eq!(
+            forwarding_queue_decision(&targets, 1, || panic!(
+                "ineligible inputs must not read queue"
+            )),
+            None
+        );
+        targets.storage_targets.insert(B256::ZERO, Vec::new());
+        targets.storage_targets.insert(B256::repeat_byte(1), Vec::new());
+        assert_eq!(
+            forwarding_queue_decision(&targets, 1, || panic!(
+                "ineligible inputs must not read queue"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn pressure_fallback_preserves_context_and_resumes_after_drain() {
+        let (tx, rx) = unbounded();
+        let (first, first_result) = storage_only_input(B256::ZERO, Vec::new(), 1);
+        assert!(forward_storage_only_job(&tx, first, None, 1).is_none());
+        let mut counts = JobCounts::new(crate::job_counts::JobKind::Account);
+        let address = B256::repeat_byte(2);
+        let targets = vec![ProofV2Target::new(B256::repeat_byte(3))];
+        let (input, result) = storage_only_input(address, targets.clone(), 2);
+        let start = input.proof_result_sender.start_time;
+        let fallback = forward_storage_only_job(&tx, input, Some(&mut counts), 1).unwrap();
+        assert_eq!(rx.len(), 1);
+        assert_eq!(counts.pressure_fallback_attempts, 1);
+        assert_eq!(counts.forward_attempts, 0);
+        assert_eq!(fallback.proof_result_sender.start_time, start);
+        assert_eq!(fallback.proof_result_sender.state.accounts[&B256::ZERO].unwrap().nonce, 2);
+        assert_eq!(fallback.targets.storage_targets[&address][0].key(), targets[0].key());
+        assert!(result.try_recv().is_err());
+        drop(rx.recv().unwrap());
+        assert!(first_result.recv_timeout(Duration::from_secs(1)).unwrap().result.is_err());
+        // The exact original context can now follow the ordinary nested error path.
+        drop(rx);
+        let old_error = dispatch_v2_storage_proofs(
+            &tx,
+            &fallback.targets.account_targets,
+            fallback.targets.storage_targets,
+        )
+        .unwrap_err();
+        fallback.proof_result_sender.send(Err(old_error));
+        let message = result.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(message.state.accounts[&B256::ZERO].unwrap().nonce, 2);
+        assert!(message.result.is_err());
+        assert!(result.try_recv().is_err());
+        let (tx, rx) = unbounded();
+        let (input, canceled) = storage_only_input(address, Vec::new(), 3);
+        drop(canceled);
+        assert!(forward_storage_only_job(&tx, input, Some(&mut counts), 1).is_none());
+        drop(rx.recv().unwrap());
+        assert_eq!((counts.forward_attempts, counts.pressure_fallback_attempts), (1, 1));
+    }
+
+    #[test]
     fn forwarded_decision_is_an_attempt_even_if_dispatch_fails() {
         let mut counts = JobCounts::new(crate::job_counts::JobKind::Account);
         let (tx, rx) = unbounded();
         drop(rx);
         let (input, result) = storage_only_input(B256::ZERO, Vec::new(), 1);
-        assert!(forward_storage_only_job(&tx, input, Some(&mut counts)).is_none());
+        assert!(forward_storage_only_job(&tx, input, Some(&mut counts), usize::MAX).is_none());
         assert_eq!(counts.forward_attempts, 1);
         assert_eq!(counts.pressure_fallback_attempts, 0);
         assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().result.is_err());
         let (mut input, _) = storage_only_input(B256::ZERO, Vec::new(), 2);
         input.targets.account_targets.push(ProofV2Target::new(B256::ZERO));
-        assert!(forward_storage_only_job(&tx, input, Some(&mut counts)).is_some());
+        assert!(forward_storage_only_job(&tx, input, Some(&mut counts), usize::MAX).is_some());
         assert_eq!(counts.forward_attempts, 1);
     }
 
@@ -1620,7 +1747,7 @@ mod tests {
             dispatch_v2_storage_proofs(&tx, &[], B256Map::from_iter([(address, Vec::new())]))
                 .unwrap_err();
         let (input, result) = storage_only_input(address, Vec::new(), 1);
-        assert!(forward_storage_only_job(&tx, input, None).is_none());
+        assert!(forward_storage_only_job(&tx, input, None, usize::MAX).is_none());
         let message = result.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(message.result.unwrap_err().to_string(), old_error.to_string());
         assert_eq!(message.state.accounts[&B256::ZERO].unwrap().nonce, 1);
@@ -1628,7 +1755,7 @@ mod tests {
 
         let (tx, rx) = unbounded();
         let (input, result) = storage_only_input(address, Vec::new(), 2);
-        assert!(forward_storage_only_job(&tx, input, None).is_none());
+        assert!(forward_storage_only_job(&tx, input, None, usize::MAX).is_none());
         drop(rx.recv().unwrap());
         let message = result.recv_timeout(Duration::from_secs(1)).unwrap();
         let expected: StateRootTaskError = StateProofError::Database(DatabaseError::Other(
@@ -1642,7 +1769,7 @@ mod tests {
         // A canceled consumer must neither block storage shutdown nor panic on the drop error.
         let (input, result) = storage_only_input(address, Vec::new(), 3);
         drop(result);
-        assert!(forward_storage_only_job(&tx, input, None).is_none());
+        assert!(forward_storage_only_job(&tx, input, None, usize::MAX).is_none());
         drop(rx.recv().unwrap());
     }
 
@@ -1652,7 +1779,7 @@ mod tests {
         for tag in 1..=3 {
             let (input, result) =
                 storage_only_input(B256::repeat_byte(tag), Vec::new(), u64::from(tag));
-            assert!(forward_storage_only_job(&tx, input, None).is_none());
+            assert!(forward_storage_only_job(&tx, input, None, usize::MAX).is_none());
             let StorageWorkerJob::StorageProof { input, proof_result_sender, .. } =
                 rx.recv().unwrap();
             assert!(!input.needs_root);
@@ -1706,13 +1833,23 @@ mod tests {
             )
             .unwrap();
             let (input, result) = storage_only_input(address, targets, tag);
-            assert!(forward_storage_only_job(&tx, input, None).is_none());
-            pairs.push((tag, nested, result));
+            // Mix forwarding with pressure-selected original fallback on the same provider.
+            let threshold = if tag == 2 { 0 } else { usize::MAX };
+            let fallback = forward_storage_only_job(&tx, input, None, threshold).map(|input| {
+                let receivers = dispatch_v2_storage_proofs(
+                    &tx,
+                    &input.targets.account_targets,
+                    input.targets.storage_targets,
+                )
+                .unwrap();
+                (receivers, input.proof_result_sender)
+            });
+            pairs.push((tag, nested, result, fallback));
         }
         // Cancel another result receiver; the proof still follows the normal compute/cache path.
         let (input, canceled) = storage_only_input(address, Vec::new(), 4);
         drop(canceled);
-        assert!(forward_storage_only_job(&tx, input, None).is_none());
+        assert!(forward_storage_only_job(&tx, input, None, usize::MAX).is_none());
         drop(tx);
         let roots = Arc::new(DashMap::<B256, B256>::default());
         let worker = StorageProofWorker::new(
@@ -1736,13 +1873,21 @@ mod tests {
             provider.account_trie_cursor().unwrap(),
             provider.hashed_account_cursor().unwrap(),
         );
-        for (tag, nested, receiver) in pairs {
+        for (tag, nested, receiver, fallback) in pairs {
             // Reconstruct the exact former empty-account path: no account nodes, then collect.
             let mut encoder =
                 AsyncAccountValueEncoder::new(nested, roots.clone(), calculator.clone());
             let account_proofs = account_calculator.proof(&mut encoder, &mut []).unwrap();
             assert!(account_proofs.is_empty());
             let (storage_proofs, _) = encoder.finalize().unwrap();
+            if let Some((receivers, context)) = fallback {
+                // This is the unchanged nested empty-account walk/finalize sequence.
+                let mut encoder =
+                    AsyncAccountValueEncoder::new(receivers, roots.clone(), calculator.clone());
+                let account_proofs = account_calculator.proof(&mut encoder, &mut []).unwrap();
+                let (storage_proofs, _) = encoder.finalize().unwrap();
+                context.send(Ok(DecodedMultiProofV2 { account_proofs, storage_proofs }));
+            }
             let message = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
             let actual = message.result.unwrap();
             assert_eq!(actual.account_proofs, account_proofs);
@@ -1770,7 +1915,7 @@ mod tests {
         // Forward another job without touching the already-used account calculator, then reuse it.
         let (tx, rx) = unbounded();
         let (input, receiver) = storage_only_input(address, Vec::new(), 5);
-        assert!(forward_storage_only_job(&tx, input, None).is_none());
+        assert!(forward_storage_only_job(&tx, input, None, usize::MAX).is_none());
         drop(rx.recv().unwrap());
         assert!(receiver.recv().unwrap().result.is_err());
         let mut encoder =
