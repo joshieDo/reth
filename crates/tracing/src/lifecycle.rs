@@ -1,5 +1,7 @@
 //! Opt-in benchmark capture. Only structural metadata and allowlisted fields reach disk.
 
+mod process_cpu;
+
 use serde_json::{json, Value};
 use std::{
     cell::Cell,
@@ -136,6 +138,7 @@ enum CaptureRecord {
     Json(Value),
     Start(Box<SpanStart>),
     Fields(Box<FieldRecord>),
+    ProcessCpu(Box<process_cpu::Sample>),
     Enter { id: u64, ts: u64, thread: u64 },
     Exit { id: u64, ts: u64, thread: u64 },
     End { id: u64, ts: u64, thread: u64 },
@@ -218,6 +221,7 @@ impl CaptureRecord {
             Self::Json(value) => return serde_json::to_writer(out, value).map_err(io::Error::other),
             Self::Start(value) => return value.write_json(out),
             Self::Fields(value) => return value.write_json(out),
+            Self::ProcessCpu(value) => return value.write_json(out),
             Self::Enter { id, ts, thread } => ("enter", id, ts, thread),
             Self::Exit { id, ts, thread } => ("exit", id, ts, thread),
             Self::End { id, ts, thread } => ("end", id, ts, thread),
@@ -253,6 +257,7 @@ struct Writer {
 
 /// Drains the capture and records loss status before the process exits.
 pub(crate) struct LifecycleGuard {
+    process_cpu: Option<process_cpu::Sampler>,
     writer: Arc<Writer>,
     worker: Option<JoinHandle<()>>,
     root_aggregates: Aggregates,
@@ -296,6 +301,15 @@ fn flush_aggregates(writer: &Writer, owner: u64, aggregates: &Aggregates) {
 
 impl LifecycleLayer {
     pub(crate) fn from_env() -> eyre::Result<Option<(Self, LifecycleGuard)>> {
+        let process_value = std::env::var("TEMPO_LIFECYCLE_PROCESS_CPU");
+        let process_cpu = process_cpu::configured(
+            match &process_value {
+                Ok(value) => Some(value.as_str()),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(_) => eyre::bail!("invalid process CPU capture configuration"),
+            },
+            cfg!(target_os = "linux"),
+        )?;
         let prewarm_cpu = match std::env::var("TEMPO_LIFECYCLE_PREWARM_CPU") {
             Ok(value) if value == "leaf_v1" => true,
             Ok(value) if value == "disabled" => false,
@@ -304,6 +318,7 @@ impl LifecycleLayer {
         };
         let Some(path) = std::env::var_os("RETH_LIFECYCLE_FILE") else {
             eyre::ensure!(!prewarm_cpu, "prewarm CPU capture requires lifecycle capture");
+            eyre::ensure!(!process_cpu, "process CPU capture requires lifecycle capture");
             return Ok(None)
         };
         let detail = match std::env::var("TEMPO_LIFECYCLE_DETAIL") {
@@ -326,7 +341,7 @@ impl LifecycleLayer {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        Ok(Some(Self::start_prewarm(file, key, epoch, detail, prewarm_cpu)?))
+        Ok(Some(Self::start_observers(file, key, epoch, detail, prewarm_cpu, process_cpu)?))
     }
 
     pub(crate) const fn detail(&self) -> CaptureDetail {
@@ -343,6 +358,7 @@ impl LifecycleLayer {
         Self::start_prewarm(file, key, epoch, detail, false)
     }
 
+    #[cfg(test)]
     fn start_prewarm(
         file: File,
         key: [u8; 32],
@@ -350,6 +366,23 @@ impl LifecycleLayer {
         detail: CaptureDetail,
         prewarm_cpu: bool,
     ) -> eyre::Result<(Self, LifecycleGuard)> {
+        Self::start_observers(file, key, epoch, detail, prewarm_cpu, false)
+    }
+
+    fn start_observers(
+        file: File,
+        key: [u8; 32],
+        epoch: u64,
+        detail: CaptureDetail,
+        prewarm_cpu: bool,
+        process_enabled: bool,
+    ) -> eyre::Result<(Self, LifecycleGuard)> {
+        eyre::ensure!(
+            !process_enabled || cfg!(target_os = "linux"),
+            "process CPU capture requires Linux"
+        );
+        let process_totals = process_enabled.then(|| Arc::new(process_cpu::Totals::default()));
+        let footer_totals = process_totals.clone();
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let prewarm_failures = Arc::new(AtomicU64::new(0));
@@ -376,20 +409,32 @@ impl LifecycleLayer {
                 }
                 written += 1;
             }
-            let footer = json!({"type":"footer", "written":written,
+            let mut footer = json!({"type":"footer", "written":written,
                 "dropped":dropped.load(Ordering::Relaxed), "io_error":failed,
                 "prewarm_coverage_failures":prewarm_failures.load(Ordering::Relaxed)});
+            if let Some(totals) = footer_totals {
+                totals.footer(&mut footer);
+            }
             let _ = serde_json::to_writer(&mut out, &footer);
             let _ = out.write_all(b"\n");
             let _ = out.flush();
         })?;
-        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(), "prewarm_cpu":if prewarm_cpu { "leaf_v1" } else { "disabled" }}));
+        let mut header = json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(), "prewarm_cpu":if prewarm_cpu { "leaf_v1" } else { "disabled" }, "process_cpu":if process_enabled { "rusage_self_v1" } else { "disabled" }});
+        if process_enabled {
+            header["process_cpu_period_ns"] = process_cpu::PERIOD_NS.into();
+        }
+        writer.send(header);
         let root_aggregates = Aggregates::default();
-        let guard = LifecycleGuard {
+        let mut guard = LifecycleGuard {
+            process_cpu: None,
             writer: Arc::clone(&writer),
             worker: Some(worker),
             root_aggregates: Arc::clone(&root_aggregates),
         };
+        if let Some(totals) = process_totals {
+            guard.process_cpu =
+                Some(process_cpu::Sampler::start(Arc::clone(&writer), epoch, totals)?);
+        }
         Ok((
             Self {
                 detail,
@@ -424,6 +469,9 @@ impl Writer {
 
 impl Drop for LifecycleGuard {
     fn drop(&mut self) {
+        if let Some(mut sampler) = self.process_cpu.take() {
+            sampler.stop();
+        }
         flush_aggregates(&self.writer, 0, &self.root_aggregates);
         let _ = self.writer.tx.send(None);
         if let Some(worker) = self.worker.take() {
