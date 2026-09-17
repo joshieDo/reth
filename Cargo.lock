@@ -10734,6 +10734,7 @@ dependencies = [
  "libc",
  "reth-tracing-otlp",
  "rolling-file",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-appender",

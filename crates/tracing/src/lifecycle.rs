@@ -143,8 +143,48 @@ enum CaptureRecord {
 
 /// Field names come from static tracing metadata or fixed canonical aliases.
 /// An ordered map preserves the existing sorted JSON without owning each key.
-/// Values retain the same privacy filtering and ownership as before.
-type FieldMap = BTreeMap<&'static str, Value>;
+/// Values retain the same privacy filter; only validated stage literals are borrowed.
+type FieldMap = BTreeMap<&'static str, FieldValue>;
+
+/// The closed set of scalar values admitted by `SafeFields`.
+#[derive(Debug, Clone)]
+enum FieldValue {
+    Unsigned(u64),
+    Stage(&'static str),
+    Owned(String),
+}
+
+impl FieldValue {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Unsigned(_) => None,
+            Self::Stage(value) => Some(value),
+            Self::Owned(value) => Some(value),
+        }
+    }
+}
+
+impl From<u64> for FieldValue {
+    fn from(value: u64) -> Self {
+        Self::Unsigned(value)
+    }
+}
+
+impl From<String> for FieldValue {
+    fn from(value: String) -> Self {
+        Self::Owned(value)
+    }
+}
+
+impl serde::Serialize for FieldValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unsigned(value) => serializer.serialize_u64(*value),
+            Self::Stage(value) => serializer.serialize_str(value),
+            Self::Owned(value) => serializer.serialize_str(value),
+        }
+    }
+}
 
 /// Only the variable-size start record is boxed, keeping queue slots unchanged.
 /// Metadata strings are static; fields have already passed the privacy filter.
@@ -231,7 +271,7 @@ impl CaptureRecord {
         match self {
             Self::Json(value) => value["fields"]["stage"] == "backpressure_start",
             Self::Fields(value) => {
-                value.fields.get("stage").and_then(Value::as_str) == Some("backpressure_start")
+                value.fields.get("stage").and_then(FieldValue::as_str) == Some("backpressure_start")
             }
             _ => false,
         }
@@ -518,7 +558,7 @@ where
             ctx.event_span(event).and_then(|s| s.extensions().get::<CapturedSpan>().map(|s| s.id));
         let mut fields = self.fields();
         event.record(&mut fields);
-        let stage = fields.values.get("stage").and_then(Value::as_str);
+        let stage = fields.values.get("stage").and_then(FieldValue::as_str);
         if stage.is_some_and(|stage| stage.starts_with("prewarm_")) {
             if !self.prewarm_cpu {
                 return
@@ -684,14 +724,16 @@ impl SafeFields<'_> {
             if let Ok(number) = value.parse::<u64>() {
                 self.values.insert(name, number.into());
             }
-        } else if name == "stage" && STAGES.contains(&value) {
-            self.values.insert(name, value.into());
+        } else if name == "stage" &&
+            let Some(stage) = STAGES.iter().copied().find(|stage| *stage == value)
+        {
+            self.values.insert(name, FieldValue::Stage(stage));
         }
     }
 }
 
 // Producer markers form a closed vocabulary: an arbitrary string cannot escape through `stage`.
-const STAGES: &[&str] = &[
+static STAGES: &[&str] = &[
     "proposal_start",
     "payload_built",
     "proposal_ready",
@@ -895,6 +937,92 @@ mod tests {
     }
 
     #[test]
+    fn field_scalars_match_json_and_keep_record_layout() {
+        for number in [0, 1, u64::MAX] {
+            assert_eq!(
+                serde_json::to_vec(&FieldValue::Unsigned(number)).unwrap(),
+                serde_json::to_vec(&Value::from(number)).unwrap()
+            );
+        }
+        for text in ["", "quoted\"\\\n\t\u{0000}λ", "0123456789abcdef01234567"] {
+            assert_eq!(
+                serde_json::to_vec(&FieldValue::Owned(text.to_owned())).unwrap(),
+                serde_json::to_vec(&Value::String(text.to_owned())).unwrap()
+            );
+        }
+        #[allow(dead_code)]
+        struct PreviousStart {
+            id: u64,
+            ts: u64,
+            thread: u64,
+            name: &'static str,
+            category: &'static str,
+            parent: Option<u64>,
+            fields: BTreeMap<&'static str, Value>,
+        }
+        #[allow(dead_code)]
+        struct PreviousFields {
+            kind: FieldRecordKind,
+            id: u64,
+            ts: u64,
+            thread: u64,
+            fields: BTreeMap<&'static str, Value>,
+        }
+        #[allow(dead_code)]
+        enum PreviousRecord {
+            Json(Value),
+            Start(Box<PreviousStart>),
+            Fields(Box<PreviousFields>),
+            Enter { id: u64, ts: u64, thread: u64 },
+            Exit { id: u64, ts: u64, thread: u64 },
+            End { id: u64, ts: u64, thread: u64 },
+        }
+        assert!(std::mem::size_of::<FieldValue>() <= std::mem::size_of::<Value>());
+        assert_eq!(std::mem::size_of::<SpanStart>(), std::mem::size_of::<PreviousStart>());
+        assert_eq!(std::mem::size_of::<FieldRecord>(), std::mem::size_of::<PreviousFields>());
+        assert_eq!(
+            std::mem::size_of::<Option<CaptureRecord>>(),
+            std::mem::size_of::<Option<PreviousRecord>>()
+        );
+        assert_eq!(
+            std::mem::align_of::<Option<CaptureRecord>>(),
+            std::mem::align_of::<Option<PreviousRecord>>()
+        );
+        eprintln!(
+            "field layout: old={}, new={}, start={}, fields={}, queue={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<FieldValue>(),
+            std::mem::size_of::<SpanStart>(),
+            std::mem::size_of::<FieldRecord>(),
+            std::mem::size_of::<Option<CaptureRecord>>()
+        );
+    }
+
+    #[test]
+    fn allowed_stage_values_borrow_vocabulary_after_dynamic_input_drops() {
+        for stage in STAGES {
+            let fields = {
+                let key = [7; 32];
+                let mut visitor = SafeFields { key: &key, values: FieldMap::new() };
+                let mut dynamic = stage.to_string();
+                visitor.text("stage", &dynamic);
+                dynamic.clear();
+                drop(dynamic);
+                visitor.values
+            };
+            let Some(FieldValue::Stage(saved)) = fields.get("stage") else {
+                panic!("stage must borrow vocabulary")
+            };
+            let canonical = STAGES.iter().copied().find(|value| value == stage).unwrap();
+            assert!(std::ptr::eq(*saved, canonical));
+            assert_eq!(
+                serde_json::to_vec(&fields).unwrap(),
+                serde_json::to_vec(&json!({"stage":stage})).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn static_field_keys_match_owned_sorted_maps_across_tree_nodes() {
         let keys = [
             "worker_jobs_targets_33_plus",
@@ -920,13 +1048,17 @@ mod tests {
             let mut fields = FieldMap::new();
             let mut owned = serde_json::Map::new();
             for (index, key) in keys[..length].iter().copied().enumerate() {
-                let value = if key == "stage" {
-                    Value::String("backpressure_start".into())
+                let (value, expected) = if key == "stage" {
+                    (
+                        FieldValue::Stage("backpressure_start"),
+                        Value::String("backpressure_start".into()),
+                    )
                 } else {
-                    Value::from(u64::MAX - index as u64)
+                    let number = u64::MAX - index as u64;
+                    (FieldValue::Unsigned(number), Value::from(number))
                 };
-                fields.insert(key, value.clone());
-                owned.insert(key.to_owned(), value);
+                fields.insert(key, value);
+                owned.insert(key.to_owned(), expected);
             }
             // Repeated metadata fields overwrite the value, never duplicate the key.
             if length > 0 {
@@ -989,7 +1121,7 @@ mod tests {
             for parent in [None, Some(0), Some(u64::MAX)] {
                 for name in ["storage_worker", "quoted\"\\\n\t\u{0000}λ"] {
                     let fields = FieldMap::from_iter([
-                        ("block_hash", Value::String("pseudonymous".into())),
+                        ("block_hash", FieldValue::Owned("pseudonymous".into())),
                         ("transactions", id.into()),
                     ]);
                     let expected = json!({"type":"start", "id":id, "ts":id,
@@ -1040,7 +1172,7 @@ mod tests {
                 for stage in [None, Some("backpressure_start"), Some("quoted\"\\\n\t\u{0000}λ")] {
                     let mut fields = FieldMap::from_iter([("transactions", id.into())]);
                     if let Some(stage) = stage {
-                        fields.insert("stage", stage.into());
+                        fields.insert("stage", FieldValue::Owned(stage.to_owned()));
                     }
                     let expected = json!({"type":name,"id":id,"ts":id,"thread":id,"fields":fields});
                     let record = CaptureRecord::Fields(Box::new(FieldRecord {
@@ -1646,6 +1778,7 @@ mod tests {
             tracing::info!(target:"lifecycle", stage="DO_NOT_EXPORT", payload="PRIVATE_TRANSACTION", private_key="DO_NOT_EXPORT");
             tracing::info!(target: "lifecycle", stage = "operation_completed", queued_jobs = 3u64, worker_jobs="DO_NOT_EXPORT", worker_target_max=?"DO_NOT_EXPORT", worker_job_counts_saturated=Some(1u64), worker_storage_targets=Some(u64::MAX));
             tracing::info!(target: "lifecycle", stage = "operation_abandoned");
+            tracing::info!(target: "lifecycle", stage = ?String::from("proposal_start"), transactions=123456u64);
             tracing::info!("DO_NOT_EXPORT");
         });
         drop(guard);
@@ -1658,6 +1791,10 @@ mod tests {
         }
         let values: Vec<Value> = data.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
         assert!(values.iter().any(|v| v["fields"]["height"] == 42));
+        assert!(values
+            .iter()
+            .any(|v| v["fields"]["transactions"] == 123456 && v["fields"].get("stage").is_none()));
+        assert!(!data.contains("proposal_start"));
         assert!(values.iter().any(|v| v["fields"]["stage"] == "marshal_enqueued"));
         assert!(values
             .iter()

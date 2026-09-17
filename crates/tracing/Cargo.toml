@@ -29,6 +29,7 @@ tracy-client = { workspace = true, optional = true }
 # misc
 blake3 = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true, features = ["std"] }
+serde = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"], optional = true }
 eyre = { workspace = true, optional = true }
@@ -39,6 +40,7 @@ default = ["std", "otlp"]
 std = [
     "dep:blake3",
     "dep:serde_json",
+    "dep:serde",
     "dep:libc",
     "tracing-subscriber",
     "tracing-appender",
@@ -52,6 +54,7 @@ std = [
     "tracing/std",
     "tracing-subscriber?/std",
     "serde_json?/std",
+    "serde?/std",
 ]
 otlp = ["reth-tracing-otlp"]
 otlp-logs = ["reth-tracing-otlp/otlp-logs"]
