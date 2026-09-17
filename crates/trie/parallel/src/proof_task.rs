@@ -1459,3 +1459,7 @@ mod tests {
         drop(proof_handle);
     }
 }
+
+#[cfg(test)]
+#[path = "proof_task_inline_tests.rs"]
+mod inline_tests;
