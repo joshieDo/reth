@@ -32,6 +32,7 @@ use tracing::debug;
 
 pub mod lazy;
 pub mod metrics;
+pub mod prewarm_cpu;
 pub mod runtime;
 pub mod shutdown;
 pub mod utils;

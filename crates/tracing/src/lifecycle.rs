@@ -30,6 +30,7 @@ thread_local! { static THREAD: Cell<u64> = const { Cell::new(0) }; }
 /// Captures a source-timestamped, privacy-filtered benchmark stream.
 pub(crate) struct LifecycleLayer {
     detail: CaptureDetail,
+    prewarm_cpu: bool,
     writer: Arc<Writer>,
     key: [u8; 32],
     epoch: u64,
@@ -76,7 +77,8 @@ impl CaptureDetail {
                     "validate_block_with_state" | "execute_block" | "execute_block_bal"
                 )) ||
             (meta.target() == "trie::proof_task" &&
-                matches!(meta.name(), "storage_worker" | "account_worker"))
+                matches!(meta.name(), "storage_worker" | "account_worker")) ||
+            (meta.target() == "lifecycle" && meta.name() == "prewarm.context")
     }
 }
 
@@ -114,6 +116,11 @@ impl Visit for MilestoneStage {
                 "execution_totals" |
                 "proof_storage_worker_totals" |
                 "proof_account_worker_totals" |
+                "prewarm_context_started" |
+                "prewarm_leaf_started" |
+                "prewarm_leaf_completed" |
+                "prewarm_context_completed" |
+                "prewarm_coverage_failure" |
                 "backpressure_start" |
                 "proposal_failed"
         );
@@ -236,6 +243,7 @@ enum StampKind {
 struct Writer {
     tx: mpsc::SyncSender<Option<CaptureRecord>>,
     dropped: Arc<AtomicU64>,
+    prewarm_failures: Arc<AtomicU64>,
 }
 
 /// Drains the capture and records loss status before the process exits.
@@ -283,7 +291,16 @@ fn flush_aggregates(writer: &Writer, owner: u64, aggregates: &Aggregates) {
 
 impl LifecycleLayer {
     pub(crate) fn from_env() -> eyre::Result<Option<(Self, LifecycleGuard)>> {
-        let Some(path) = std::env::var_os("RETH_LIFECYCLE_FILE") else { return Ok(None) };
+        let prewarm_cpu = match std::env::var("TEMPO_LIFECYCLE_PREWARM_CPU") {
+            Ok(value) if value == "leaf_v1" => true,
+            Ok(value) if value == "disabled" => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => eyre::bail!("TEMPO_LIFECYCLE_PREWARM_CPU must be disabled or leaf_v1"),
+        };
+        let Some(path) = std::env::var_os("RETH_LIFECYCLE_FILE") else {
+            eyre::ensure!(!prewarm_cpu, "prewarm CPU capture requires lifecycle capture");
+            return Ok(None)
+        };
         let detail = match std::env::var("TEMPO_LIFECYCLE_DETAIL") {
             Ok(value) => CaptureDetail::parse(Some(&value))?,
             Err(std::env::VarError::NotPresent) => CaptureDetail::Full,
@@ -304,22 +321,38 @@ impl LifecycleLayer {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        Ok(Some(Self::start(file, key, epoch, detail)?))
+        Ok(Some(Self::start_prewarm(file, key, epoch, detail, prewarm_cpu)?))
     }
 
     pub(crate) const fn detail(&self) -> CaptureDetail {
         self.detail
     }
 
+    #[cfg(test)]
     fn start(
         file: File,
         key: [u8; 32],
         epoch: u64,
         detail: CaptureDetail,
     ) -> eyre::Result<(Self, LifecycleGuard)> {
+        Self::start_prewarm(file, key, epoch, detail, false)
+    }
+
+    fn start_prewarm(
+        file: File,
+        key: [u8; 32],
+        epoch: u64,
+        detail: CaptureDetail,
+        prewarm_cpu: bool,
+    ) -> eyre::Result<(Self, LifecycleGuard)> {
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
-        let writer = Arc::new(Writer { tx, dropped: Arc::clone(&dropped) });
+        let prewarm_failures = Arc::new(AtomicU64::new(0));
+        let writer = Arc::new(Writer {
+            tx,
+            dropped: Arc::clone(&dropped),
+            prewarm_failures: Arc::clone(&prewarm_failures),
+        });
         let worker = thread::Builder::new().name("lifecycle-writer".into()).spawn(move || {
             let mut out = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
             let mut written = 0u64;
@@ -330,19 +363,22 @@ impl LifecycleLayer {
                     // Continue draining so shutdown never waits on a full queue after an I/O error.
                     continue
                 }
-                // Make the stop boundary visible even when the stream is otherwise idle.
-                if value.is_backpressure() && out.flush().is_err() {
+                // Admission must see the header before load; the first stop
+                // boundary must be visible even if the stream becomes idle.
+                let header = matches!(&value, CaptureRecord::Json(v) if v["type"] == "header");
+                if (header || value.is_backpressure()) && out.flush().is_err() {
                     failed = true;
                 }
                 written += 1;
             }
             let footer = json!({"type":"footer", "written":written,
-                "dropped":dropped.load(Ordering::Relaxed), "io_error":failed});
+                "dropped":dropped.load(Ordering::Relaxed), "io_error":failed,
+                "prewarm_coverage_failures":prewarm_failures.load(Ordering::Relaxed)});
             let _ = serde_json::to_writer(&mut out, &footer);
             let _ = out.write_all(b"\n");
             let _ = out.flush();
         })?;
-        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label()}));
+        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(), "prewarm_cpu":if prewarm_cpu { "leaf_v1" } else { "disabled" }}));
         let root_aggregates = Aggregates::default();
         let guard = LifecycleGuard {
             writer: Arc::clone(&writer),
@@ -352,6 +388,7 @@ impl LifecycleLayer {
         Ok((
             Self {
                 detail,
+                prewarm_cpu,
                 writer,
                 key,
                 epoch,
@@ -395,6 +432,9 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        if attrs.metadata().name() == "prewarm.context" && !self.prewarm_cpu {
+            return
+        }
         let Some(span) = ctx.span(id) else { return };
         if aggregate_name(attrs.metadata().name()) {
             let (owner, aggregates) = span
@@ -473,6 +513,19 @@ where
             ctx.event_span(event).and_then(|s| s.extensions().get::<CapturedSpan>().map(|s| s.id));
         let mut fields = self.fields();
         event.record(&mut fields);
+        let stage = fields.values.get("stage").and_then(Value::as_str);
+        if stage.is_some_and(|stage| stage.starts_with("prewarm_")) {
+            if !self.prewarm_cpu {
+                return
+            }
+            if stage == Some("prewarm_coverage_failure") {
+                let _ = self.writer.prewarm_failures.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |value| Some(value.saturating_add(1)),
+                );
+            }
+        }
         let value = CaptureRecord::Fields(Box::new(FieldRecord {
             kind: FieldRecordKind::Event,
             id: parent.unwrap_or(0),
@@ -660,6 +713,11 @@ const STAGES: &[&str] = &[
     "execution_totals",
     "proof_storage_worker_totals",
     "proof_account_worker_totals",
+    "prewarm_context_started",
+    "prewarm_leaf_started",
+    "prewarm_leaf_completed",
+    "prewarm_context_completed",
+    "prewarm_coverage_failure",
     "backpressure_start",
     "proposal_failed",
     "marshal_enqueued",
@@ -683,7 +741,18 @@ fn numeric_field(name: &str) -> bool {
     let name = canonical_field(name);
     matches!(
         name,
-        "queued_jobs" |
+        "prewarm_role" |
+            "prewarm_mode" |
+            "prewarm_leaf" |
+            "prewarm_cpu_measured" |
+            "prewarm_thread_cpu_ns" |
+            "prewarm_outcome" |
+            "prewarm_dispatched" |
+            "prewarm_started" |
+            "prewarm_completed" |
+            "prewarm_context_outcome" |
+            "prewarm_failure" |
+            "queued_jobs" |
             "in_flight_proof_batches" |
             "pending_updates" |
             "pending_targets" |
@@ -934,7 +1003,11 @@ mod tests {
     fn typed_stamps_keep_fifo_and_count_queue_failures() {
         let (tx, rx) = mpsc::sync_channel(2);
         let dropped = Arc::new(AtomicU64::new(0));
-        let writer = Writer { tx, dropped: Arc::clone(&dropped) };
+        let writer = Writer {
+            tx,
+            dropped: Arc::clone(&dropped),
+            prewarm_failures: Arc::new(AtomicU64::new(0)),
+        };
         writer.send(CaptureRecord::Enter { id: 9, ts: 10, thread: 11 });
         writer.send(json!({"type":"event","id":9,"ts":12}));
         writer.send(CaptureRecord::Exit { id: 9, ts: 13, thread: 11 });
@@ -1511,6 +1584,182 @@ mod tests {
         );
     }
     #[test]
+    fn prewarm_admission_parent_privacy_and_failure_footer() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            for enabled in [false, true] {
+                let path = std::env::temp_dir()
+                    .join(format!("lifecycle-prewarm-{}.jsonl", monotonic_ns()));
+                let (layer, guard) = LifecycleLayer::start_prewarm(
+                    File::create(&path).unwrap(),
+                    [9; 32],
+                    monotonic_ns(),
+                    detail,
+                    enabled,
+                )
+                .unwrap();
+                let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+                    tracing_subscriber::filter::filter_fn(move |meta| {
+                        detail.capture_metadata(meta)
+                    }),
+                ));
+                tracing::subscriber::with_default(subscriber, || {
+                    let parent = tracing::debug_span!(target:"engine::tree::payload_validator", "validate_block_with_state", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                    let context = tracing::debug_span!(target:"lifecycle", parent:&parent, "prewarm.context", prewarm_role=1u64, prewarm_mode=1u64, secret="private-value");
+                    tracing::info!(target:"lifecycle", parent:&context, stage="prewarm_context_started", prewarm_role=1u64, prewarm_mode=1u64);
+                    tracing::info!(target:"lifecycle", parent:&context, stage="prewarm_leaf_started", prewarm_leaf=1u64);
+                    tracing::info!(target:"lifecycle", parent:&context, stage="prewarm_leaf_completed", prewarm_leaf=1u64, prewarm_cpu_measured=1u64, prewarm_thread_cpu_ns=0u64, prewarm_outcome=5u64, secret="private-value");
+                    tracing::info!(target:"lifecycle", parent:&context, stage="prewarm_coverage_failure", prewarm_failure=1u64);
+                    tracing::info!(target:"lifecycle", parent:&context, stage="prewarm_context_completed", prewarm_dispatched=1u64, prewarm_started=1u64, prewarm_completed=1u64, prewarm_context_outcome=0u64);
+                });
+                drop(guard);
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::remove_file(path).unwrap();
+                let rows: Vec<Value> =
+                    text.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+                assert_eq!(rows[0]["prewarm_cpu"], if enabled { "leaf_v1" } else { "disabled" });
+                assert_eq!(rows.last().unwrap()["prewarm_coverage_failures"], u64::from(enabled));
+                assert!(!text.contains("private-value") && !text.contains("aaaaaaaaaaaaaaaa"));
+                let context = rows.iter().find(|r| r["name"] == "prewarm.context");
+                assert_eq!(context.is_some(), enabled);
+                if let Some(context) = context {
+                    let parent =
+                        rows.iter().find(|r| r["name"] == "validate_block_with_state").unwrap();
+                    assert_eq!(context["parent"], parent["id"]);
+                    let events: Vec<_> = rows.iter().filter(|r| r["type"] == "event").collect();
+                    assert_eq!(events.len(), 5);
+                    assert!(events.iter().all(|e| e["id"] == context["id"]));
+                    let end = events
+                        .iter()
+                        .find(|e| e["fields"]["stage"] == "prewarm_leaf_completed")
+                        .unwrap();
+                    assert_eq!(end["fields"]["prewarm_thread_cpu_ns"], 0);
+                } else {
+                    assert!(!rows.iter().any(|r| r["type"] == "event"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prewarm_identity_uses_retained_parent_on_unrelated_worker_scope() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            let path =
+                std::env::temp_dir().join(format!("prewarm-parent-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start_prewarm(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                detail,
+                true,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+                .with(layer.with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                    detail.capture_metadata(meta)
+                })));
+            tracing::subscriber::with_default(subscriber, || {
+                let root = tracing::debug_span!(target:"engine::tree::payload_validator","validate_block_with_state");
+                let parent=root.in_scope(||tracing::debug_span!(target:"engine::tree::payload_processor::prewarm","prewarm and caching"));
+                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                drop(root);
+                std::thread::spawn(move ||tracing::dispatcher::with_default(&dispatch,||{
+                    let unrelated=tracing::debug_span!(target:"engine::tree::payload_validator","execute_block_bal");
+                    unrelated.in_scope(||{
+                        let context=tracing::debug_span!(target:"lifecycle",parent:&parent,"prewarm.context",prewarm_role=1u64,prewarm_mode=3u64);
+                        tracing::info!(target:"lifecycle",parent:&context,stage="prewarm_context_started",prewarm_role=1u64,prewarm_mode=3u64);
+                        tracing::info!(target:"lifecycle",parent:&context,stage="prewarm_context_completed",prewarm_dispatched=0u64,prewarm_started=0u64,prewarm_completed=0u64,prewarm_context_outcome=0u64);
+                    });
+                })).join().unwrap();
+            });
+            drop(guard);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let rows: Vec<Value> =
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let identity = rows.iter().find(|r| r["name"] == "prewarm.context").unwrap();
+            let mut parent = identity["parent"].clone();
+            loop {
+                let found =
+                    rows.iter().find(|r| r["type"] == "start" && r["id"] == parent).unwrap();
+                assert_ne!(found["name"], "execute_block_bal");
+                if found["name"] == "validate_block_with_state" {
+                    break
+                }
+                parent = found["parent"].clone();
+            }
+            assert!(rows
+                .iter()
+                .filter(|r| r["type"] == "event")
+                .all(|r| r["id"] == identity["id"]));
+            assert_eq!(rows.last().unwrap()["dropped"], 0);
+        }
+    }
+
+    #[test]
+    fn prewarm_header_is_available_before_any_work() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for enabled in [false, true] {
+            let path =
+                std::env::temp_dir().join(format!("lifecycle-admission-{}.jsonl", monotonic_ns()));
+            let (_layer, guard) = LifecycleLayer::start_prewarm(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                CaptureDetail::Milestones,
+                enabled,
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let data = std::fs::read_to_string(&path).unwrap();
+                if let Some(header) =
+                    data.lines().next().and_then(|line| serde_json::from_str::<Value>(line).ok())
+                {
+                    assert_eq!(header["type"], "header");
+                    assert_eq!(header["prewarm_cpu"], if enabled { "leaf_v1" } else { "disabled" });
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "header stayed buffered");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drop(guard);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn prewarm_failure_count_survives_queue_loss() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        tx.send(Some(CaptureRecord::Json(json!({"type":"header"})))).unwrap();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(AtomicU64::new(0));
+        let layer = LifecycleLayer {
+            detail: CaptureDetail::Milestones,
+            prewarm_cpu: true,
+            writer: Arc::new(Writer {
+                tx,
+                dropped: Arc::clone(&dropped),
+                prewarm_failures: Arc::clone(&failures),
+            }),
+            key: [7; 32],
+            epoch: monotonic_ns(),
+            next_span: AtomicU64::new(1),
+            backpressure_seen: AtomicBool::new(false),
+            root_aggregates: Aggregates::default(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target:"lifecycle",stage="prewarm_coverage_failure",prewarm_failure=1u64);
+        });
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn mandatory_boundary_survives_a_full_queue_in_both_modes() {
         let _serial = CAPTURE_TEST.lock().unwrap();
         for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
@@ -1519,7 +1768,12 @@ mod tests {
             let dropped = Arc::new(AtomicU64::new(0));
             let layer = LifecycleLayer {
                 detail,
-                writer: Arc::new(Writer { tx, dropped: Arc::clone(&dropped) }),
+                prewarm_cpu: false,
+                writer: Arc::new(Writer {
+                    tx,
+                    dropped: Arc::clone(&dropped),
+                    prewarm_failures: Arc::new(AtomicU64::new(0)),
+                }),
                 key: [7; 32],
                 epoch: monotonic_ns(),
                 next_span: AtomicU64::new(1),

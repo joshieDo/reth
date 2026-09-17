@@ -33,7 +33,14 @@ use reth_provider::{
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_overlay::OverlayStateProviderFactory;
-use reth_tasks::{pool::WorkerPool, Runtime};
+use reth_tasks::{
+    pool::WorkerPool,
+    prewarm_cpu::{
+        Context as CpuContext, Job as CpuJob, Mode as CpuMode, Outcome as CpuOutcome,
+        Role as CpuRole,
+    },
+    Runtime,
+};
 use reth_trie_common::MultiProofTargetsV2;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -136,6 +143,7 @@ where
         pending: mpsc::Receiver<(usize, Tx)>,
         actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>,
         state_root_hint_stream: Option<StateRootHintStream>,
+        observer: CpuContext,
     ) where
         Tx: ExecutableTxFor<Evm> + Send + 'static,
     {
@@ -177,6 +185,7 @@ where
 
                     tx_count += 1;
                     let parent_span = Span::current();
+                    let cpu_job = observer.dispatch();
                     s.spawn(move |_| {
                         let _enter = trace_span!(
                             target: "engine::tree::payload_processor::prewarm",
@@ -185,7 +194,7 @@ where
                             i = index,
                         )
                         .entered();
-                        Self::transact_worker(ctx, index, tx, state_root_hint_stream);
+                        Self::transact_worker(ctx, index, tx, state_root_hint_stream, cpu_job);
                     });
                 }
 
@@ -198,6 +207,8 @@ where
                     state_root_hint_stream.on_access_hint(targets.into());
                 }
             });
+
+            observer.finish();
 
             // All tasks are done — clear per-thread EVM state for the next block.
             pool.clear();
@@ -216,22 +227,27 @@ where
         index: usize,
         tx: Tx,
         state_root_hint_stream: Option<&StateRootHintStream>,
+        cpu_job: CpuJob,
     ) where
         Tx: ExecutableTxFor<Evm>,
     {
+        let mut cpu = cpu_job.start();
         WorkerPool::with_worker_mut(|worker| {
             let Some(evm) =
                 worker.get_or_init::<PrewarmEvmState<Evm>>(|| ctx.evm_for_ctx()).as_mut()
             else {
+                cpu.outcome(CpuOutcome::EvmUnavailable);
                 return;
             };
 
             if ctx.should_stop() {
+                cpu.outcome(CpuOutcome::Stopped);
                 return;
             }
 
             // skip if main execution has already processed this transaction
             if index < ctx.executed_tx_index.load(Ordering::Relaxed) {
+                cpu.outcome(CpuOutcome::AlreadyExecuted);
                 return;
             }
 
@@ -248,6 +264,7 @@ where
                         sender=%tx.signer(),
                         "Error when executing prewarm transaction",
                     );
+                    cpu.outcome(CpuOutcome::ExecutionError);
                     ctx.metrics.transaction_errors.increment(1);
                     return;
                 }
@@ -255,6 +272,7 @@ where
             ctx.metrics.execution_duration.record(start.elapsed());
 
             if ctx.should_stop() {
+                cpu.outcome(CpuOutcome::ExecutedThenStopped);
                 return;
             }
 
@@ -267,6 +285,7 @@ where
             }
 
             ctx.metrics.total_runtime.record(start.elapsed());
+            cpu.outcome(CpuOutcome::Executed);
         });
     }
 
@@ -483,14 +502,25 @@ where
         // Spawn execution tasks based on mode. The state-root capabilities arrive inside the
         // mode and move into the spawned producers, so they die with the producers instead of
         // living for the full lifetime of this task.
+        let observer = CpuContext::with_parent(
+            CpuRole::Engine,
+            match &mode {
+                PrewarmMode::Transactions { .. } => CpuMode::Transactions,
+                PrewarmMode::BlockAccessList { .. } => CpuMode::Bal,
+                PrewarmMode::Skipped => CpuMode::Skipped,
+            },
+            &self.parent_span,
+        );
         match mode {
             PrewarmMode::Transactions { pending, hints } => {
-                self.spawn_txs_prewarm(pending, actions_tx, hints);
+                self.spawn_txs_prewarm(pending, actions_tx, hints, observer);
             }
             PrewarmMode::BlockAccessList { bal, updates } => {
                 self.run_bal_prewarm(bal, actions_tx, updates);
+                observer.finish();
             }
             PrewarmMode::Skipped => {
+                observer.finish();
                 let _ = actions_tx
                     .send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
             }
