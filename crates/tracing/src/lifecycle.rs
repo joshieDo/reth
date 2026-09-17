@@ -1989,7 +1989,7 @@ mod tests {
     #[test]
     fn frame_lineage_fields_are_numeric_and_stages_are_closed() {
         let key = [7; 32];
-        let mut fields = SafeFields { key: &key, values: Map::new() };
+        let mut fields = SafeFields { key: &key, values: FieldMap::new() };
         fields.text("queue_id", &u64::MAX.to_string());
         fields.text("message_id", &u64::MAX.to_string());
         fields.text("receive_id", "12");
