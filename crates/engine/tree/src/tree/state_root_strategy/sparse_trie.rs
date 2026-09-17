@@ -115,6 +115,8 @@ pub(super) struct SparseTrieCacheTask<A = ArenaParallelSparseTrie, S = ArenaPara
     pending_updates: usize,
     /// Whether the first buffered leaf batch has been applied.
     initial_updates_applied: bool,
+    /// Bounded read-only post-finish diagnostic snapshots.
+    root_readiness_samples: u8,
     /// Combined final hashed state.
     ///
     /// Sparse trie task observes and hashes all state updates, allowing it to cheaply construct a
@@ -185,6 +187,7 @@ where
             in_flight_proof_batches: 0,
             pending_updates: Default::default(),
             initial_updates_applied: false,
+            root_readiness_samples: 0,
             final_hashed_state: Default::default(),
             metrics,
         }
@@ -458,6 +461,8 @@ where
             self.dispatch_pending_targets()?;
             self.ensure_not_stalled(updates_queued)?;
 
+            self.observe_storage_prehash_readiness();
+
             // If there's still no pending updates spend some time pre-computing the account
             // trie upper hashes
             if self.proof_result_rx.is_empty() {
@@ -483,6 +488,60 @@ where
             self.dispatch_pending_targets()?;
         }
         Ok(false)
+    }
+
+    /// Observe at most eight post-finish idle gaps, never hash early or promote a root.
+    /// The entry/trie caps bound logical scanning, not elapsed time or `HashMap` buckets.
+    fn observe_storage_prehash_readiness(&mut self) {
+        if !self.finished_state_updates ||
+            self.in_flight_proof_batches == 0 ||
+            !self.proof_result_rx.is_empty() ||
+            self.root_readiness_samples >= 8 ||
+            !tracing::enabled!(target: "lifecycle", tracing::Level::DEBUG)
+        {
+            return;
+        }
+        self.root_readiness_samples += 1;
+        let mut remaining = 4096usize;
+        let mut inspected_tries = 0u64;
+        let mut pending_updates = 0u64;
+        let mut total = reth_trie_sparse::PrehashReadiness::default();
+        let mut complete = true;
+        for (address, updates) in &self.storage_updates {
+            if inspected_tries == 64 {
+                complete = false;
+                break;
+            }
+            inspected_tries += 1;
+            let Some(trie) =
+                self.trie.storage_tries_mut().get(address).and_then(|trie| trie.as_revealed_ref())
+            else {
+                complete = false;
+                break;
+            };
+            let Some(counts) = trie.prehash_readiness(updates, remaining) else {
+                complete = false;
+                break;
+            };
+            remaining -= counts.inspected_entries;
+            pending_updates += updates.len() as u64;
+            total.dirty_subtries += counts.dirty_subtries;
+            total.dirty_leaves += counts.dirty_leaves;
+            total.ready_subtries += counts.ready_subtries;
+            total.ready_dirty_leaves += counts.ready_dirty_leaves;
+        }
+        let _sample = debug_span!(target: "lifecycle", "proof.trie.prehash_readiness",
+            root_readiness_sample = u64::from(self.root_readiness_samples),
+            root_readiness_complete = u64::from(complete),
+            root_inspected_tries = inspected_tries,
+            root_inspected_entries = (4096 - remaining) as u64,
+            root_pending_updates = pending_updates,
+            root_subtries = total.dirty_subtries,
+            root_dirty_leaves = total.dirty_leaves,
+            root_ready_subtries = total.ready_subtries,
+            root_ready_dirty_leaves = total.ready_dirty_leaves,
+            in_flight_proof_batches = self.in_flight_proof_batches as u64)
+        .entered();
     }
 
     /// Processes a [`SparseTrieTaskMessage`] from the hashing task.
@@ -1256,6 +1315,125 @@ mod tests {
         assert_eq!(decoded.balance, U256::from(42));
         assert_eq!(decoded.storage_root, storage_root);
         assert_eq!(account_rlp_buf, encoded);
+    }
+
+    #[test]
+    fn root_readiness_is_post_finish_idle_and_bounded() {
+        use reth_tracing::tracing_subscriber::{
+            self, layer::Context, prelude::*, registry::LookupSpan, Layer,
+        };
+        use std::sync::Mutex;
+        #[derive(Clone, Default)]
+        struct Samples(Arc<Mutex<Vec<std::collections::BTreeMap<String, u64>>>>);
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Samples {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _: &tracing::Id,
+                _: Context<'_, S>,
+            ) {
+                if attrs.metadata().name() != "proof.trie.prehash_readiness" {
+                    return;
+                }
+                #[derive(Default)]
+                struct Fields(std::collections::BTreeMap<String, u64>);
+                impl tracing::field::Visit for Fields {
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        self.0.insert(field.name().to_string(), value);
+                    }
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                let mut fields = Fields::default();
+                attrs.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+        let runtime = reth_tasks::Runtime::test();
+        let provider = create_test_provider_factory();
+        let anchor = init_genesis(&provider).unwrap();
+        let factory = OverlayStateProviderFactory::new(
+            provider,
+            OverlayManager::<reth_chain_state::EthPrimitives>::default().overlay_builder(anchor),
+        );
+        let (proof_tx, proof_rx) = crossbeam_channel::unbounded();
+        let workers =
+            ProofWorkerHandle::new(&runtime, ProofTaskCtx::new(factory), false, proof_tx.clone());
+        let trie = SparseStateTrie::default()
+            .with_accounts_trie(
+                RevealableSparseTrie::blind_from(ArenaParallelSparseTrie::default()),
+            )
+            .with_default_storage_trie(RevealableSparseTrie::blind_from(
+                ArenaParallelSparseTrie::default(),
+            ));
+        let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+        let (_cancel, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+        let mut task = SparseTrieCacheTask::new_with_trie(
+            &runtime,
+            updates_rx,
+            cancel_rx,
+            std::sync::mpsc::channel().0,
+            workers,
+            proof_tx.clone(),
+            proof_rx,
+            SparseTrieTaskMetrics::default(),
+            trie,
+            B256::ZERO,
+            TrieNodeEpoch::new(1),
+            1,
+        );
+        for i in 0..65u8 {
+            let address = B256::repeat_byte(i);
+            task.storage_updates.insert(address, Default::default());
+            task.trie
+                .get_or_create_storage_trie_mut(address)
+                .reveal_root(reth_trie_common::TrieNodeV2::EmptyRoot, None, true)
+                .unwrap();
+        }
+        task.finished_state_updates = true;
+        task.in_flight_proof_batches = 1;
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            task.observe_storage_prehash_readiness();
+            assert_eq!(task.root_readiness_samples, 0);
+        });
+        let samples = Samples::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(samples.clone()));
+        tracing::dispatcher::with_default(&dispatch, || {
+            task.finished_state_updates = false;
+            task.observe_storage_prehash_readiness();
+            task.finished_state_updates = true;
+            task.in_flight_proof_batches = 0;
+            task.observe_storage_prehash_readiness();
+            task.in_flight_proof_batches = 1;
+            proof_tx
+                .send(ProofResultMessage {
+                    result: Ok(Default::default()),
+                    elapsed: Default::default(),
+                    state: Default::default(),
+                })
+                .unwrap();
+            task.observe_storage_prehash_readiness();
+            task.proof_result_rx.try_recv().unwrap();
+            assert_eq!(task.root_readiness_samples, 0);
+            for _ in 0..12 {
+                task.observe_storage_prehash_readiness();
+            }
+        });
+        let rows = samples.0.lock().unwrap();
+        assert_eq!(rows.len(), 8);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row["root_readiness_sample"], i as u64 + 1);
+            assert_eq!(row["root_readiness_complete"], 0);
+            assert_eq!(row["root_inspected_tries"], 64);
+            assert_eq!(row["root_inspected_entries"], 64);
+        }
+        assert_eq!(task.storage_updates.len(), 65);
+        assert_eq!(task.in_flight_proof_batches, 1);
+        drop(rows);
+        drop(proof_tx);
+        drop(updates_tx);
+        drop(task);
+        drain_sparse_trie_tasks(&runtime);
     }
 
     #[test]

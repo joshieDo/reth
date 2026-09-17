@@ -9,7 +9,8 @@ use nodes::{
 };
 
 use crate::{
-    LeafLookup, LeafLookupError, LeafUpdate, SparseTrie, SparseTrieUpdates, TrieNodeEpoch,
+    LeafLookup, LeafLookupError, LeafUpdate, PrehashReadiness, SparseTrie, SparseTrieUpdates,
+    TrieNodeEpoch,
 };
 use alloc::{borrow::Cow, boxed::Box, collections::VecDeque, vec::Vec};
 use alloy_primitives::{keccak256, map::B256Map, B256};
@@ -2298,6 +2299,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
     fn root(&mut self, new_epoch: TrieNodeEpoch) -> B256 {
         self.update_subtrie_hashes(new_epoch);
 
+        let _upper = tracing::debug_span!(target: "lifecycle", "proof.trie.hash_upper").entered();
         let rlp_node = Self::update_cached_rlp(
             &mut self.upper_arena,
             self.root,
@@ -2347,11 +2349,24 @@ impl SparseTrie for ArenaParallelSparseTrie {
             taken.push((idx, subtrie));
         }
 
+        // These closed numeric fields describe the selected work, not exclusive CPU.
+        // Batch wall includes Rayon dispatch/helping/join; child spans begin on workers.
+        let hash_batch = tracing::debug_span!(target: "lifecycle", "proof.trie.hash_batch",
+            root_subtries = taken.len() as u64,
+            root_dirty_leaves = total_dirty_leaves,
+            root_parallel = u64::from(taken.len() > 1 &&
+                total_dirty_leaves >= self.parallelism_thresholds.min_dirty_leaves))
+        .entered();
         // Hash taken subtries in parallel if total dirty leaves meet the threshold.
         if !taken.is_empty() {
             if taken.len() == 1 || total_dirty_leaves < self.parallelism_thresholds.min_dirty_leaves
             {
                 for (_, subtrie) in &mut taken {
+                    let _work =
+                        tracing::debug_span!(target: "lifecycle", "proof.trie.hash_subtrie",
+                        root_dirty_leaves = subtrie.num_dirty_leaves,
+                        root_leaves = subtrie.num_leaves)
+                        .entered();
                     subtrie.update_cached_rlp(new_epoch);
                 }
             } else {
@@ -2362,6 +2377,11 @@ impl SparseTrie for ArenaParallelSparseTrie {
                     .into_par_iter()
                     .map(|(idx, mut subtrie)| {
                         let _guard = parent_span.enter();
+                        let _work =
+                            tracing::debug_span!(target: "lifecycle", "proof.trie.hash_subtrie",
+                            root_dirty_leaves = subtrie.num_dirty_leaves,
+                            root_leaves = subtrie.num_leaves)
+                            .entered();
                         subtrie.update_cached_rlp(new_epoch);
                         (idx, subtrie)
                     })
@@ -2369,12 +2389,16 @@ impl SparseTrie for ArenaParallelSparseTrie {
             }
         }
 
+        drop(hash_batch);
+
         // If the root branch is already cached and nothing was taken for parallel
         // hashing, there are no dirty subtries to process.
         if taken.is_empty() && self.upper_arena[self.root].is_cached() {
             return;
         }
 
+        let _restore =
+            tracing::debug_span!(target: "lifecycle", "proof.trie.restore_subtries").entered();
         // Walk the upper trie depth-first, restoring hashed subtries and inline-hashing
         // any remaining dirty subtries. Only descend into dirty branches; clean subtrees
         // cannot contain dirty subtries since dirty state propagates upward.
@@ -2410,6 +2434,45 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
             self.update_upper_subtrie(head_idx, new_epoch);
         }
+    }
+
+    fn prehash_readiness(
+        &self,
+        pending: &B256Map<LeafUpdate>,
+        entry_budget: usize,
+    ) -> Option<PrehashReadiness> {
+        let inspected_entries = pending.len().checked_add(self.upper_arena.len())?;
+        if inspected_entries > entry_budget {
+            return None;
+        }
+        let mut blocked = [false; 256];
+        for key in pending.keys() {
+            blocked[usize::from(key[0])] = true;
+        }
+        let mut result = PrehashReadiness { inspected_entries, ..Default::default() };
+        for (_, node) in &self.upper_arena {
+            let ArenaSparseNode::Subtrie(subtrie) = node else { continue };
+            if subtrie.num_dirty_leaves == 0 {
+                continue;
+            }
+            result.dirty_subtries += 1;
+            result.dirty_leaves += subtrie.num_dirty_leaves;
+            // Lower subtries normally start at >=2 nibbles. Retain a conservative
+            // fallback for shallower paths, without guessing ownership of keys.
+            let ready = if subtrie.path.len() < 2 {
+                pending.is_empty()
+            } else {
+                !blocked[usize::from(
+                    (subtrie.path.get(0).expect("length checked") << 4) |
+                        subtrie.path.get(1).expect("length checked"),
+                )]
+            };
+            if ready {
+                result.ready_subtries += 1;
+                result.ready_dirty_leaves += subtrie.num_dirty_leaves;
+            }
+        }
+        Some(result)
     }
 
     fn get_leaf_value(&self, full_path: &Nibbles) -> Option<&Vec<u8>> {
@@ -2910,6 +2973,61 @@ mod tests {
 
     const fn epoch(value: u64) -> TrieNodeEpoch {
         TrieNodeEpoch::new(value)
+    }
+
+    #[test]
+    fn bounded_readiness_excludes_pending_prefixes_without_mutating_hashes() {
+        use reth_trie_common::TrieNodeV2;
+        let mut trie = ArenaParallelSparseTrie::default();
+        trie.set_root(TrieNodeV2::EmptyRoot, None, true).unwrap();
+        let mut updates = B256Map::default();
+        for prefix in [0x10u8, 0x11, 0x20, 0x21] {
+            for suffix in 0..8u8 {
+                let mut key = [0u8; 32];
+                key[0] = prefix;
+                key[1] = suffix;
+                updates.insert(B256::from(key), LeafUpdate::Changed(vec![1]));
+            }
+        }
+        trie.update_leaves(&mut updates, |_, _| panic!("empty trie needs no proof")).unwrap();
+        assert!(updates.is_empty());
+        assert!(!trie.is_root_cached());
+        let mut baseline = trie.clone();
+        let all = trie.prehash_readiness(&updates, usize::MAX).unwrap();
+        assert_eq!(all.dirty_leaves, 32);
+        assert_eq!(all.ready_dirty_leaves, all.dirty_leaves);
+        assert_eq!(all.ready_subtries, all.dirty_subtries);
+        assert!(all.dirty_subtries >= 2);
+        assert!(trie.prehash_readiness(&updates, all.inspected_entries - 1).is_none());
+        assert_eq!(trie.prehash_readiness(&updates, all.inspected_entries), Some(all));
+        // A pending key need not exist in the trie to block the entire conservative prefix.
+        let mut key = [0u8; 32];
+        key[0] = 0x10;
+        key[31] = 99;
+        updates.insert(B256::from(key), LeafUpdate::Touched);
+        let partial = trie.prehash_readiness(&updates, usize::MAX).unwrap();
+        assert_eq!(partial.dirty_leaves, 32);
+        assert_eq!(partial.ready_dirty_leaves, 24);
+        assert!(partial.ready_subtries < partial.dirty_subtries);
+        for prefix in [0x11, 0x20, 0x21] {
+            key[0] = prefix;
+            updates.insert(B256::from(key), LeafUpdate::Changed(vec![]));
+        }
+        assert_eq!(trie.prehash_readiness(&updates, usize::MAX).unwrap().ready_dirty_leaves, 0);
+        // Diagnostic reads cannot hash, alter epoch, or consume retained trie updates.
+        assert!(!trie.is_root_cached());
+        assert_eq!(trie.root(epoch(7)), baseline.root(epoch(7)));
+        assert_eq!(trie.take_updates(), baseline.take_updates());
+        let clean = trie.prehash_readiness(&updates, usize::MAX).unwrap();
+        assert_eq!(clean.dirty_leaves, 0);
+        assert_eq!(clean.ready_subtries, 0);
+        // A subsequent write dirties the path again; the observer must not reuse old counts.
+        updates.clear();
+        key[0] = 0x20;
+        key[31] = 0;
+        updates.insert(B256::from(key), LeafUpdate::Changed(vec![2]));
+        trie.update_leaves(&mut updates, |_, _| panic!("revealed trie needs no proof")).unwrap();
+        assert_eq!(trie.prehash_readiness(&updates, usize::MAX).unwrap().dirty_leaves, 1);
     }
 
     /// Test harness for proptest-based arena sparse trie testing.

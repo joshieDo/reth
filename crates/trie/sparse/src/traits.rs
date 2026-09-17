@@ -63,6 +63,24 @@ impl LeafUpdate {
     }
 }
 
+/// Read-only lower-subtrie prehash opportunity counts, not a published partial root.
+///
+/// Ready counts conservatively exclude every key prefix containing an unapplied update.
+/// They omit dirty upper nodes and do not imply that future proof revelation is free.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PrehashReadiness {
+    /// Dirty lower subtries inspected.
+    pub dirty_subtries: u64,
+    /// Dirty leaves in those lower subtries.
+    pub dirty_leaves: u64,
+    /// Dirty lower subtries with no pending update in their conservative prefix.
+    pub ready_subtries: u64,
+    /// Dirty leaves in the conservatively ready subset.
+    pub ready_dirty_leaves: u64,
+    /// Logical pending-key and arena entries inspected; not a wall-time bound.
+    pub inspected_entries: usize,
+}
+
 /// Trait defining common operations for revealed sparse trie implementations.
 ///
 /// This trait provides a unified interface for the core trie operations needed by
@@ -144,6 +162,18 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// The root node is considered to be at level 0. This method is useful for optimizing
     /// hash recalculations after localized changes to the trie structure.
     fn update_subtrie_hashes(&mut self, new_epoch: TrieNodeEpoch);
+
+    /// Returns bounded diagnostic readiness counts without hashing or modifying the trie.
+    ///
+    /// `None` means unsupported or insufficient entry budget, never measured zero.
+    /// Implementations must check the budget before scanning any entries.
+    fn prehash_readiness(
+        &self,
+        _pending: &B256Map<LeafUpdate>,
+        _entry_budget: usize,
+    ) -> Option<PrehashReadiness> {
+        None
+    }
 
     /// Retrieves a reference to the leaf value at the specified path.
     ///

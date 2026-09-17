@@ -761,7 +761,18 @@ fn numeric_field(name: &str) -> bool {
     let name = canonical_field(name);
     matches!(
         name,
-        "prewarm_role" |
+        "root_readiness_sample" |
+            "root_readiness_complete" |
+            "root_inspected_tries" |
+            "root_inspected_entries" |
+            "root_pending_updates" |
+            "root_ready_subtries" |
+            "root_ready_dirty_leaves" |
+            "root_subtries" |
+            "root_dirty_leaves" |
+            "root_parallel" |
+            "root_leaves" |
+            "prewarm_role" |
             "prewarm_mode" |
             "prewarm_leaf" |
             "prewarm_cpu_measured" |
@@ -1696,6 +1707,61 @@ mod tests {
             values.iter().filter(|v| v["type"] == "end").count()
         );
     }
+    #[test]
+    fn root_links_require_both_captured_endpoints_and_keep_only_numeric_shapes() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for filtered in ["none", "spawn_state_root", "build_payload"] {
+            let path =
+                std::env::temp_dir().join(format!("lifecycle-root-link-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                CaptureDetail::Full,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+                .with(layer.with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                    capture_metadata(meta) && meta.name() != filtered
+                })));
+            tracing::subscriber::with_default(subscriber, || {
+                let ancestor = tracing::debug_span!(target: "lifecycle", "ancestor");
+                let _enter = ancestor.enter();
+                let root_a = tracing::debug_span!(target: "engine::tree::payload_processor", "spawn_state_root");
+                let root_b = tracing::debug_span!(target: "engine::tree::payload_processor", "spawn_state_root");
+                let builder = tracing::debug_span!(target: "payload_builder", "build_payload");
+                builder.follows_from(root_a.id());
+                root_b.in_scope(|| {
+                    let _hash = tracing::debug_span!(target: "lifecycle", "proof.trie.hash_batch",
+                        root_subtries=3u64, root_dirty_leaves=65u64, root_parallel=1u64,
+                        root_leaves=99u64, private_key="DO_NOT_EXPORT")
+                    .entered();
+                });
+            });
+            drop(guard);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let rows: Vec<Value> =
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let links: Vec<_> = rows.iter().filter(|row| row["type"] == "link").collect();
+            assert_eq!(links.len(), usize::from(filtered == "none"));
+            if let Some(link) = links.first() {
+                let root = rows.iter().find(|row| row["name"] == "spawn_state_root").unwrap();
+                let builder = rows.iter().find(|row| row["name"] == "build_payload").unwrap();
+                assert_eq!(link["from"], root["id"]);
+                assert_eq!(link["id"], builder["id"]);
+            }
+            let hash = rows.iter().find(|row| row["name"] == "proof.trie.hash_batch").unwrap();
+            assert_eq!(
+                hash["fields"],
+                json!({"root_subtries":3,"root_dirty_leaves":65,"root_parallel":1,"root_leaves":99})
+            );
+            assert!(!text.contains("DO_NOT_EXPORT"));
+            assert_eq!(rows.last().unwrap()["dropped"], 0);
+        }
+    }
+
     #[test]
     fn prewarm_admission_parent_privacy_and_failure_footer() {
         let _serial = CAPTURE_TEST.lock().unwrap();

@@ -96,7 +96,7 @@ use std::{
     },
     time::Duration,
 };
-use tracing::{debug, debug_span, instrument, warn, Span};
+use tracing::{debug, debug_span, warn, Span};
 
 /// Handle to a [`HashedPostState`] computed on a background thread.
 pub type LazyHashedPostState = reth_tasks::LazyHandle<Arc<HashedPostState>>;
@@ -487,7 +487,6 @@ impl DefaultStateRootStrategy {
     /// The authoritative update capability taken from the returned handle must be dropped or
     /// explicitly finished after execution so the task observes the end of the update stream.
     /// An unknown transaction count uses the full proof-worker pool.
-    #[instrument(level = "debug", target = "engine::tree::payload_processor", skip_all)]
     fn spawn_state_root<N, F>(
         &self,
         executor: &reth_tasks::Runtime,
@@ -503,6 +502,11 @@ impl DefaultStateRootStrategy {
             + Sync
             + 'static,
     {
+        // Keep the exact span handle: Span::current() could return an enabled
+        // ancestor when this callsite is filtered out by another subscriber.
+        let task_span =
+            tracing::debug_span!(target: "engine::tree::payload_processor", "spawn_state_root");
+        let _task_entered = task_span.enter();
         let StateRootTaskOptions {
             parent_header,
             preserved_sparse_trie,
@@ -556,7 +560,7 @@ impl DefaultStateRootStrategy {
             state_root_rx,
             hashed_state_rx,
         )
-        .with_task_span(Span::current())
+        .with_task_span(task_span.clone())
     }
 
     /// Spawns the sparse-trie task and preserves its trie for the next state-root job.
