@@ -30,12 +30,37 @@ thread_local! { static THREAD: Cell<u64> = const { Cell::new(0) }; }
 /// Captures a source-timestamped, privacy-filtered benchmark stream.
 pub(crate) struct LifecycleLayer {
     detail: CaptureDetail,
+    async_tasks: AsyncTasks,
+    async_failures: Arc<AtomicU64>,
     writer: Arc<Writer>,
     key: [u8; 32],
     epoch: u64,
     next_span: AtomicU64,
     backpressure_seen: AtomicBool,
     root_aggregates: Aggregates,
+}
+
+/// Selected Commonware actor observations; registration proves producer support.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AsyncTasks {
+    #[default]
+    Disabled,
+    SelectedV1,
+}
+impl AsyncTasks {
+    fn parse(value: Option<&str>) -> eyre::Result<Self> {
+        match value {
+            None | Some("disabled") => Ok(Self::Disabled),
+            Some("selected_v1") => Ok(Self::SelectedV1),
+            _ => eyre::bail!("TEMPO_LIFECYCLE_ASYNC_TASKS must be disabled or selected_v1"),
+        }
+    }
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::SelectedV1 => "selected_v1",
+        }
+    }
 }
 
 /// Runtime detail selection leaves cutoff and privacy handling unchanged.
@@ -219,6 +244,15 @@ impl LifecycleLayer {
             Err(std::env::VarError::NotPresent) => CaptureDetail::Full,
             Err(error) => return Err(error.into()),
         };
+        let async_tasks = match std::env::var("TEMPO_LIFECYCLE_ASYNC_TASKS") {
+            Ok(value) => AsyncTasks::parse(Some(&value))?,
+            Err(std::env::VarError::NotPresent) => AsyncTasks::Disabled,
+            Err(error) => return Err(error.into()),
+        };
+        eyre::ensure!(
+            async_tasks == AsyncTasks::Disabled || detail == CaptureDetail::Full,
+            "selected async tasks require full lifecycle detail"
+        );
         let key_path = std::env::var_os("RETH_LIFECYCLE_KEY_FILE")
             .ok_or_else(|| eyre::eyre!("lifecycle capture requires a key file"))?;
         let key: [u8; 32] = std::fs::read(key_path)?
@@ -234,19 +268,32 @@ impl LifecycleLayer {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        Ok(Some(Self::start(file, key, epoch, detail)?))
+        Ok(Some(Self::start_with_async(file, key, epoch, detail, async_tasks)?))
     }
 
     pub(crate) const fn detail(&self) -> CaptureDetail {
         self.detail
     }
 
+    #[cfg(test)]
     fn start(
         file: File,
         key: [u8; 32],
         epoch: u64,
         detail: CaptureDetail,
     ) -> eyre::Result<(Self, LifecycleGuard)> {
+        Self::start_with_async(file, key, epoch, detail, AsyncTasks::Disabled)
+    }
+
+    fn start_with_async(
+        file: File,
+        key: [u8; 32],
+        epoch: u64,
+        detail: CaptureDetail,
+        async_tasks: AsyncTasks,
+    ) -> eyre::Result<(Self, LifecycleGuard)> {
+        let async_failures = Arc::new(AtomicU64::new(0));
+        let footer_async_failures = Arc::clone(&async_failures);
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let writer = Arc::new(Writer { tx, dropped: Arc::clone(&dropped) });
@@ -267,12 +314,12 @@ impl LifecycleLayer {
                 written += 1;
             }
             let footer = json!({"type":"footer", "written":written,
-                "dropped":dropped.load(Ordering::Relaxed), "io_error":failed});
+                "dropped":dropped.load(Ordering::Relaxed), "io_error":failed, "async_coverage_failures":footer_async_failures.load(Ordering::Relaxed)});
             let _ = serde_json::to_writer(&mut out, &footer);
             let _ = out.write_all(b"\n");
             let _ = out.flush();
         })?;
-        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label()}));
+        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(), "async_tasks":async_tasks.label()}));
         let root_aggregates = Aggregates::default();
         let guard = LifecycleGuard {
             writer: Arc::clone(&writer),
@@ -282,6 +329,8 @@ impl LifecycleLayer {
         Ok((
             Self {
                 detail,
+                async_tasks,
+                async_failures,
                 writer,
                 key,
                 epoch,
@@ -395,6 +444,21 @@ where
             ctx.event_span(event).and_then(|s| s.extensions().get::<CapturedSpan>().map(|s| s.id));
         let mut fields = self.fields();
         event.record(&mut fields);
+        if fields
+            .values
+            .get("stage")
+            .and_then(Value::as_str)
+            .is_some_and(|stage| stage.starts_with("async_task_"))
+        {
+            if self.async_tasks == AsyncTasks::Disabled {
+                return
+            }
+            if fields.values.get("stage").and_then(Value::as_str) == Some("async_task_coverage") {
+                // Count before enqueue and retain in the footer even if the marker is
+                // lost or pruned at the cutoff. Any nonzero value invalidates coverage.
+                self.async_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let mut value = self.stamp("event", parent.unwrap_or(0));
         value["fields"] = Value::Object(fields.values);
         if value["fields"]["stage"] == "backpressure_start" &&
@@ -553,6 +617,12 @@ impl SafeFields<'_> {
 
 // Producer markers form a closed vocabulary: an arbitrary string cannot escape through `stage`.
 const STAGES: &[&str] = &[
+    "async_task_register",
+    "async_task_wake",
+    "async_task_poll_begin",
+    "async_task_poll_end",
+    "async_task_terminal",
+    "async_task_coverage",
     "proposal_start",
     "payload_built",
     "proposal_ready",
@@ -602,7 +672,12 @@ fn numeric_field(name: &str) -> bool {
     let name = canonical_field(name);
     matches!(
         name,
-        "queued_jobs" |
+        "task_id" |
+            "task_role" |
+            "task_poll" |
+            "task_wakes" |
+            "task_outcome" |
+            "queued_jobs" |
             "in_flight_proof_batches" |
             "pending_updates" |
             "pending_targets" |
@@ -1347,6 +1422,8 @@ mod tests {
             let dropped = Arc::new(AtomicU64::new(0));
             let layer = LifecycleLayer {
                 detail,
+                async_tasks: AsyncTasks::Disabled,
+                async_failures: Arc::new(AtomicU64::new(0)),
                 writer: Arc::new(Writer { tx, dropped: Arc::clone(&dropped) }),
                 key: [7; 32],
                 epoch: monotonic_ns(),
@@ -1447,5 +1524,57 @@ mod tests {
         }
         assert!(values.len() < 20);
         assert_eq!(values.last().unwrap()["dropped"], 0);
+    }
+    #[test]
+    fn async_tasks_advertise_mode_filter_fields_and_keep_failure_footer() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        assert!(AsyncTasks::parse(Some("unknown")).is_err());
+        for mode in [AsyncTasks::Disabled, AsyncTasks::SelectedV1] {
+            let path =
+                std::env::temp_dir().join(format!("lifecycle-task-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start_with_async(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                CaptureDetail::Full,
+                mode,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "lifecycle", parent: None, stage="async_task_register", task_id=1u64, task_role=2u64, secret="private-payload");
+                tracing::info!(target: "lifecycle", parent: None, stage="async_task_poll_begin", task_id=1u64, task_poll=1u64, task_wakes=0u64);
+                tracing::info!(target: "lifecycle", parent: None, stage="async_task_poll_end", task_id=1u64, task_poll=1u64, task_outcome=0u64);
+                tracing::info!(target: "lifecycle", parent: None, stage="async_task_wake", task_id=1u64, task_poll=2u64);
+                tracing::info!(target: "lifecycle", parent: None, stage="backpressure_start");
+                tracing::info!(target: "lifecycle", parent: None, stage="async_task_coverage", task_outcome=3u64);
+            });
+            drop(guard);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(!text.contains("private-payload"));
+            assert!(!text.contains("secret"));
+            let rows: Vec<Value> =
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(rows[0]["async_tasks"], mode.label());
+            assert_eq!(
+                rows.last().unwrap()["async_coverage_failures"],
+                u64::from(mode == AsyncTasks::SelectedV1)
+            );
+            assert_eq!(
+                rows.iter().filter(|row| row["fields"]["stage"] == "async_task_register").count(),
+                usize::from(mode == AsyncTasks::SelectedV1)
+            );
+            if mode == AsyncTasks::SelectedV1 {
+                assert_eq!(rows[1]["id"], 0);
+                assert_eq!(
+                    rows[1]["fields"],
+                    json!({"stage":"async_task_register","task_id":1,"task_role":2})
+                );
+                assert_eq!(rows[2]["fields"]["task_wakes"], 0);
+                assert_eq!(rows[3]["fields"]["task_outcome"], 0);
+                assert_eq!(rows[4]["fields"]["task_poll"], 2);
+            }
+        }
     }
 }
