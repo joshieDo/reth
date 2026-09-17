@@ -1200,6 +1200,10 @@ fn traced_new_payload_service_keeps_execution_parent_and_canceled_delivery() {
     }
     let observed = Arc::new(AtomicUsize::new(0));
     let subscriber = reth_tracing::tracing_subscriber::registry().with(Capture(observed.clone()));
+    let unrelated_observed = Arc::new(AtomicUsize::new(0));
+    let unrelated = tracing::Dispatch::new(
+        reth_tracing::tracing_subscriber::registry().with(Capture(unrelated_observed.clone())),
+    );
     tracing::subscriber::with_default(subscriber, || {
         let data = Bytes::from_str(include_str!("../../test-data/holesky/1.rlp")).unwrap();
         let block = Block::decode(&mut data.as_ref()).unwrap();
@@ -1212,26 +1216,29 @@ fn traced_new_payload_service_keeps_execution_parent_and_canceled_delivery() {
             let context =
                 reth_engine_primitives::NewPayloadContext::new(tracing::info_span!("verify"));
             assert!(context.is_some());
-            let _ = harness
-                .tree
-                .on_engine_message(FromEngine::Request(
-                    BeaconEngineMessage::NewPayload {
-                        payload: ExecutionData {
-                            payload: payload.clone().into(),
-                            sidecar: ExecutionPayloadSidecar::none(),
-                        },
-                        tx,
-                        context: context.map(Box::new),
-                    }
-                    .into(),
-                ))
-                .unwrap();
+            tracing::dispatcher::with_default(&unrelated, || {
+                let _ = harness
+                    .tree
+                    .on_engine_message(FromEngine::Request(
+                        BeaconEngineMessage::NewPayload {
+                            payload: ExecutionData {
+                                payload: payload.clone().into(),
+                                sidecar: ExecutionPayloadSidecar::none(),
+                            },
+                            tx,
+                            context: context.map(Box::new),
+                        }
+                        .into(),
+                    ))
+                    .unwrap();
+            });
             if let Some(rx) = &mut rx {
                 assert!(rx.try_recv().unwrap().unwrap().is_syncing());
             }
         }
     });
     assert_eq!(observed.load(Ordering::Relaxed), 7);
+    assert_eq!(unrelated_observed.load(Ordering::Relaxed), 0);
 }
 
 #[test]

@@ -96,7 +96,7 @@ fn same_payload_reversed_service_keeps_requests_and_cancellation_separate() {
                 panic!()
             };
             let service = context.unwrap().start();
-            let sid = service.id().unwrap().into_u64();
+            let sid = service.span().id().unwrap().into_u64();
             let qid = {
                 let r = capture.0.lock().unwrap();
                 assert!(r.links.contains(&(sid, expected)));
@@ -118,7 +118,7 @@ fn same_payload_reversed_service_keeps_requests_and_cancellation_separate() {
                 );
                 let delivered = tx.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Syncing)));
                 assert_eq!(delivered.is_err(), canceled);
-                service.record("accepted", u64::from(delivered.is_ok()));
+                service.span().record("accepted", u64::from(delivered.is_ok()));
             });
             let r = capture.0.lock().unwrap();
             assert_eq!(r.fields[&qid], 1);
@@ -199,4 +199,97 @@ fn globally_disabled_queue_does_not_create_context_for_enabled_request() {
         assert!(!parent.is_disabled());
         assert!(NewPayloadContext::new(parent).is_none());
     });
+}
+
+#[test]
+fn queue_and_service_use_explicit_parents_dispatcher() {
+    let capture = Capture::default();
+    let parent = tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(capture.clone()),
+        || tracing::info_span!("verify"),
+    );
+    let parent_id = parent.id().unwrap().into_u64();
+    let unrelated = Capture::default();
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(unrelated.clone()),
+        || {
+            let _ancestor = tracing::info_span!("unrelated").entered();
+            let context = NewPayloadContext::new(parent).unwrap();
+            // Service also works without the originating subscriber as the thread default.
+            let service = std::thread::spawn(move || context.start()).join().unwrap();
+            let service_id = service.span().id().unwrap().into_u64();
+            service.span().record("accepted", 0_u64);
+            drop(service);
+            let r = capture.0.lock().unwrap();
+            let queue_id =
+                *r.names.iter().find(|(_, name)| **name == "engine.new_payload.queue").unwrap().0;
+            assert_eq!(r.names.len(), 3);
+            assert_eq!(r.parents[&queue_id], Some(parent_id));
+            assert_eq!(r.parents[&service_id], Some(parent_id));
+            assert!(r.links.contains(&(queue_id, parent_id)));
+            assert!(r.links.contains(&(service_id, parent_id)));
+            assert!(r.links.contains(&(service_id, queue_id)));
+            assert_eq!(r.fields[&queue_id], 1);
+            assert_eq!(r.fields[&service_id], 0);
+            assert!(r.steps.contains(&("close", queue_id)));
+        },
+    );
+    let r = unrelated.0.lock().unwrap();
+    assert_eq!(r.names.values().copied().collect::<Vec<_>>(), ["unrelated"]);
+    assert!(r.links.is_empty());
+}
+
+#[test]
+fn queue_filter_uses_explicit_parents_dispatcher() {
+    let parent = tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::INFO),
+        || {
+            let _ancestor = tracing::info_span!("ancestor").entered();
+            tracing::info_span!("verify")
+        },
+    );
+    let unrelated = Capture::default();
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(unrelated.clone()),
+        || assert!(NewPayloadContext::new(parent).is_none()),
+    );
+    assert!(unrelated.0.lock().unwrap().names.is_empty());
+}
+
+#[test]
+fn canceled_transport_closes_context_under_explicit_parents_dispatcher() {
+    let capture = Capture::default();
+    let (mut response, receiver) = tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(capture.clone()),
+        || {
+            let _ancestor = tracing::info_span!("ancestor").entered();
+            let parent = tracing::info_span!("verify");
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let handle = ConsensusEngineHandle::<EthPayloadTypes>::new(tx);
+            let mut response =
+                Box::pin(async move { handle.new_payload_with_parent(payload(), parent).await });
+            assert!(poll_once(response.as_mut()).is_pending());
+            (response, rx)
+        },
+    );
+    let unrelated = Capture::default();
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(unrelated.clone()),
+        || {
+            let _ancestor = tracing::info_span!("unrelated").entered();
+            drop(receiver);
+            assert!(matches!(
+                poll_once(response.as_mut()),
+                Poll::Ready(Err(BeaconOnNewPayloadError::EngineUnavailable))
+            ));
+        },
+    );
+    let r = capture.0.lock().unwrap();
+    assert_eq!(r.names.len(), 3);
+    assert!(r.names.keys().all(|id| r.steps.contains(&("close", *id))));
+    let queue_id = r.names.iter().find(|(_, name)| **name == "engine.new_payload.queue").unwrap().0;
+    assert_eq!(r.fields[queue_id], 0);
+    let r = unrelated.0.lock().unwrap();
+    assert_eq!(r.names.values().copied().collect::<Vec<_>>(), ["unrelated"]);
+    assert_eq!(r.steps.iter().filter(|(step, _)| *step == "close").count(), 1);
 }

@@ -429,21 +429,24 @@ where
 pub struct NewPayloadContext {
     parent: tracing::Span,
     queued: tracing::Span,
+    dispatch: tracing::Dispatch,
 }
 
 impl NewPayloadContext {
     /// Creates context only for an enabled, explicit parent; never falls back to the current span.
     pub fn new(parent: tracing::Span) -> Option<Self> {
-        if parent.is_disabled() {
-            return None
-        }
-        let queued = tracing::debug_span!(target: "engine::tree", parent: &parent,
-            "engine.new_payload.queue", accepted = 0_u64);
-        if queued.is_disabled() {
-            return None
-        }
-        queued.follows_from(&parent);
-        Some(Self { parent, queued })
+        // Span IDs belong to the creating subscriber, which may differ from this thread's.
+        let dispatch = parent.with_subscriber(|(_, dispatch)| dispatch.clone())?;
+        let (parent, queued) = tracing::dispatcher::with_default(&dispatch, || {
+            let queued = tracing::debug_span!(target: "engine::tree", parent: &parent,
+                "engine.new_payload.queue", accepted = 0_u64);
+            if queued.is_disabled() {
+                return None
+            }
+            queued.follows_from(&parent);
+            Some((parent, queued))
+        })?;
+        Some(Self { parent, queued, dispatch })
     }
 
     /// Marks this exact request dequeued and closes its queue interval before returning service.
@@ -451,16 +454,69 @@ impl NewPayloadContext {
     /// Service `accepted` is recorded by the caller only after attempting response delivery.
     /// Its timestamp, not eventual span closure (which may retain descendants), marks that
     /// boundary.
-    pub fn start(self) -> tracing::Span {
-        let Self { parent, queued } = self;
-        queued.record("accepted", 1_u64);
-        let service = tracing::debug_span!(target: "engine::tree", parent: &parent,
-            "engine.new_payload.service", accepted = tracing::field::Empty);
-        service.follows_from(&parent);
-        service.follows_from(&queued);
-        drop(queued);
-        service
+    pub fn start(self) -> NewPayloadService {
+        self.queued.record("accepted", 1_u64);
+        let span = tracing::dispatcher::with_default(&self.dispatch, || {
+            tracing::debug_span!(target: "engine::tree", parent: &self.parent,
+                "engine.new_payload.service", accepted = tracing::field::Empty)
+        });
+        span.follows_from(&self.parent);
+        span.follows_from(&self.queued);
+        NewPayloadService { span, dispatch: self.dispatch.clone() }
     }
+}
+
+impl Drop for NewPayloadContext {
+    fn drop(&mut self) {
+        // Registry cleanup releases parent references through the current dispatcher, including
+        // when transport cancellation drops a queued request on another thread.
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            drop(core::mem::replace(&mut self.queued, tracing::Span::none()));
+            drop(core::mem::replace(&mut self.parent, tracing::Span::none()));
+        });
+    }
+}
+
+/// An owned payload service span that enters and closes under its originating subscriber.
+#[derive(Debug)]
+pub struct NewPayloadService {
+    span: tracing::Span,
+    dispatch: tracing::Dispatch,
+}
+
+impl NewPayloadService {
+    /// Borrows the service span for recording response delivery or inspecting its identity.
+    pub const fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    /// Enters service and installs its dispatcher for synchronous execution and descendant spans.
+    pub fn enter(&self) -> NewPayloadServiceGuard<'_> {
+        let dispatch = tracing::dispatcher::set_default(&self.dispatch);
+        NewPayloadServiceGuard { _span: self.span.enter(), _dispatch: dispatch }
+    }
+
+    /// Runs synchronous work under the service span and its originating dispatcher.
+    pub fn in_scope<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.enter();
+        f()
+    }
+}
+
+impl Drop for NewPayloadService {
+    fn drop(&mut self) {
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            drop(core::mem::replace(&mut self.span, tracing::Span::none()));
+        });
+    }
+}
+
+/// Exits service before restoring the thread's previous tracing dispatcher.
+#[derive(Debug)]
+#[must_use = "dropping the guard exits the service span"]
+pub struct NewPayloadServiceGuard<'a> {
+    _span: tracing::span::Entered<'a>,
+    _dispatch: tracing::dispatcher::DefaultGuard,
 }
 
 #[cfg(test)]
