@@ -375,17 +375,15 @@ impl ProofWorkerHandle {
         self.storage_work_tx
             .send(StorageWorkerJob::StorageProof {
                 input,
-                proof_result_sender,
+                proof_result_sender: StorageResultSender::Nested(proof_result_sender),
                 trace: ProofJobTrace::storage(self.storage_work_tx.len()),
             })
             .map_err(|err| {
                 let StorageWorkerJob::StorageProof { proof_result_sender, .. } = err.0;
-                let _ = proof_result_sender.send(StorageProofResultMessage {
+                let _ = proof_result_sender.send(
                     hashed_address,
-                    result: Err(
-                        DatabaseError::Other("storage workers unavailable".to_string()).into()
-                    ),
-                });
+                    Err(DatabaseError::Other("storage workers unavailable".to_string()).into()),
+                );
 
                 ProviderError::other(std::io::Error::other("storage workers unavailable"))
             })
@@ -598,6 +596,69 @@ pub struct StorageProofResultMessage {
     pub(crate) result: Result<StorageProofResult, StateProofError>,
 }
 
+/// Private delivery mode. A single storage-only multiproof does not need an
+/// intermediate receiver or an account worker blocked collecting it.
+#[derive(Debug)]
+pub(crate) enum StorageResultSender {
+    Nested(CrossbeamSender<StorageProofResultMessage>),
+    Multiproof(Box<ForwardedStorageProof>),
+}
+
+impl StorageResultSender {
+    fn send(
+        self,
+        hashed_address: B256,
+        result: Result<StorageProofResult, StateProofError>,
+    ) -> bool {
+        match self {
+            Self::Nested(sender) => {
+                sender.send(StorageProofResultMessage { hashed_address, result }).is_ok()
+            }
+            Self::Multiproof(context) => context.send(
+                result
+                    .map(|result| DecodedMultiProofV2 {
+                        account_proofs: Vec::new(),
+                        storage_proofs: B256Map::from_iter([(hashed_address, result.proof)]),
+                    })
+                    .map_err(StateRootTaskError::from),
+            ),
+        }
+    }
+}
+
+/// Replaces the old nested receiver's channel-closed error when queued storage work
+/// is dropped or a worker unwinds before delivering it. Normal completion disarms it.
+#[derive(Debug)]
+pub(crate) struct ForwardedStorageProof {
+    context: Option<ProofResultContext>,
+    hashed_address: B256,
+}
+
+impl ForwardedStorageProof {
+    fn send(mut self, result: Result<DecodedMultiProofV2, StateRootTaskError>) -> bool {
+        self.context.take().expect("one completion").send(result)
+    }
+}
+
+impl Drop for ForwardedStorageProof {
+    fn drop(&mut self) {
+        if let Some(context) = self.context.take() {
+            context.send(Err(StateProofError::Database(DatabaseError::Other(format!(
+                "Storage proof channel closed for {:?}",
+                self.hashed_address,
+            )))
+            .into()));
+        }
+    }
+}
+
+impl ProofResultContext {
+    fn send(self, result: Result<DecodedMultiProofV2, StateRootTaskError>) -> bool {
+        let Self { sender, state, start_time } = self;
+        sender.send(ProofResultMessage { result, elapsed: start_time.elapsed(), state }).is_ok()
+    }
+}
+
 /// Capture-only job metadata. Queue spans have no children, so dropping them at dequeue
 /// measures queue residence rather than the lifetime of references held by later work.
 #[derive(Debug)]
@@ -671,7 +732,7 @@ pub(crate) enum StorageWorkerJob {
         /// Storage proof input parameters
         input: StorageProofInput,
         /// Context for sending the proof result.
-        proof_result_sender: CrossbeamSender<StorageProofResultMessage>,
+        proof_result_sender: StorageResultSender,
         /// Queue interval and originating operation, independent of worker lifetime.
         trace: ProofJobTrace,
     },
@@ -843,7 +904,7 @@ where
         proof_tx: &ProofTaskTx<Provider>,
         v2_calculator: &mut proof_v2::StorageProofCalculator<TC, HC>,
         input: StorageProofInput,
-        proof_result_sender: CrossbeamSender<StorageProofResultMessage>,
+        proof_result_sender: StorageResultSender,
         storage_proofs_processed: &mut u64,
     ) where
         Provider: TrieCursorFactory + HashedCursorFactory,
@@ -868,7 +929,7 @@ where
 
         let root = result.as_ref().ok().and_then(|result| result.root());
 
-        if proof_result_sender.send(StorageProofResultMessage { hashed_address, result }).is_err() {
+        if !proof_result_sender.send(hashed_address, result) {
             trace!(
                 target: "trie::proof_task",
                 worker_id = self.worker_id,
@@ -1152,6 +1213,10 @@ where
     {
         let proof_start = Instant::now();
 
+        let Some(input) = forward_storage_only_job(&self.storage_work_tx, input) else {
+            *account_proofs_processed += 1;
+            return ValueEncoderStats::default();
+        };
         let AccountMultiproofInput { targets, proof_result_sender } = input;
         let (result, value_encoder_stats) = match self.compute_v2_account_multiproof::<Provider>(
             v2_account_calculator,
@@ -1191,6 +1256,43 @@ where
     }
 }
 
+/// Sends only the eligible single-group storage-only case onward without retaining an
+/// account worker to wait for its result. All other inputs keep the existing path.
+fn forward_storage_only_job(
+    storage_work_tx: &CrossbeamSender<StorageWorkerJob>,
+    input: AccountMultiproofInput,
+) -> Option<AccountMultiproofInput> {
+    if !input.targets.account_targets.is_empty() || input.targets.storage_targets.len() != 1 {
+        return Some(input)
+    }
+    let AccountMultiproofInput { targets, proof_result_sender } = input;
+    let (hashed_address, targets) = targets.storage_targets.into_iter().next().expect("one group");
+    // An empty account proof never invokes the value encoder, so no storage root is
+    // requested for account encoding. Use the same storage worker/provider/calculator.
+    let job = StorageWorkerJob::StorageProof {
+        input: StorageProofInput::new(hashed_address, targets, false),
+        proof_result_sender: StorageResultSender::Multiproof(Box::new(ForwardedStorageProof {
+            context: Some(proof_result_sender),
+            hashed_address,
+        })),
+        trace: ProofJobTrace::storage(storage_work_tx.len()),
+    };
+    if let Err(error) = storage_work_tx.send(job) {
+        let StorageWorkerJob::StorageProof { proof_result_sender, .. } = error.0;
+        let StorageResultSender::Multiproof(context) = proof_result_sender else {
+            unreachable!("forwarded job owns its original multiproof context")
+        };
+        context.send(Err(storage_dispatch_error(hashed_address)));
+    }
+    None
+}
+
+fn storage_dispatch_error(hashed_address: B256) -> StateRootTaskError {
+    StateRootTaskError::Other(format!(
+        "Failed to queue storage proof for {hashed_address:?}: storage worker pool unavailable",
+    ))
+}
+
 /// Queues V2 storage proofs for all accounts in the targets and returns receivers.
 ///
 /// This function queues all storage proof tasks to the worker pool but returns immediately
@@ -1228,14 +1330,11 @@ fn dispatch_v2_storage_proofs(
 
         storage_work_tx
             .send(StorageWorkerJob::StorageProof {
-                input, proof_result_sender: result_tx,
+                input,
+                proof_result_sender: StorageResultSender::Nested(result_tx),
                 trace: ProofJobTrace::storage(storage_work_tx.len()),
             })
-            .map_err(|_| {
-                StateRootTaskError::Other(format!(
-                    "Failed to queue storage proof for {hashed_address:?}: storage worker pool unavailable",
-                ))
-            })?;
+            .map_err(|_| storage_dispatch_error(hashed_address))?;
 
         storage_proof_receivers.insert(hashed_address, result_rx);
     }
@@ -1428,6 +1527,238 @@ mod tests {
                 ("end", "proof.account.work"),
             ]
         );
+    }
+
+    fn storage_only_input(
+        address: B256,
+        targets: Vec<ProofV2Target>,
+        tag: u64,
+    ) -> (AccountMultiproofInput, CrossbeamReceiver<ProofResultMessage>) {
+        let (sender, receiver) = unbounded();
+        let mut state = HashedPostState::default();
+        state.accounts.insert(
+            B256::ZERO,
+            Some(reth_primitives_traits::Account { nonce: tag, ..Default::default() }),
+        );
+        (
+            AccountMultiproofInput {
+                targets: MultiProofTargetsV2 {
+                    account_targets: Vec::new(),
+                    storage_targets: B256Map::from_iter([(address, targets)]),
+                },
+                proof_result_sender: ProofResultContext::new(sender, state, Instant::now()),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn forwarding_requires_empty_accounts_and_exactly_one_storage_group() {
+        let (tx, rx) = unbounded();
+        for case in 0..3 {
+            let (mut input, _) = storage_only_input(B256::ZERO, Vec::new(), case);
+            match case {
+                0 => input.targets.account_targets.push(ProofV2Target::new(B256::ZERO)),
+                1 => input.targets.storage_targets.clear(),
+                _ => {
+                    input.targets.storage_targets.insert(B256::repeat_byte(1), Vec::new());
+                }
+            }
+            let expected_accounts = input.targets.account_targets.clone();
+            let expected_storage = input.targets.storage_targets.clone();
+            let input = forward_storage_only_job(&tx, input).expect("must retain ordinary path");
+            assert_eq!(
+                input
+                    .targets
+                    .account_targets
+                    .iter()
+                    .map(|t| (t.key_nibbles, t.parent))
+                    .collect::<Vec<_>>(),
+                expected_accounts.iter().map(|t| (t.key_nibbles, t.parent)).collect::<Vec<_>>()
+            );
+            assert_eq!(input.targets.storage_targets.len(), expected_storage.len());
+            for (address, targets) in expected_storage {
+                assert_eq!(
+                    input.targets.storage_targets[&address]
+                        .iter()
+                        .map(|t| (t.key_nibbles, t.parent))
+                        .collect::<Vec<_>>(),
+                    targets.iter().map(|t| (t.key_nibbles, t.parent)).collect::<Vec<_>>()
+                );
+            }
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn forwarded_closed_dispatch_and_dropped_work_keep_error_completion() {
+        let address = B256::repeat_byte(7);
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let old_error =
+            dispatch_v2_storage_proofs(&tx, &[], B256Map::from_iter([(address, Vec::new())]))
+                .unwrap_err();
+        let (input, result) = storage_only_input(address, Vec::new(), 1);
+        assert!(forward_storage_only_job(&tx, input).is_none());
+        let message = result.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(message.result.unwrap_err().to_string(), old_error.to_string());
+        assert_eq!(message.state.accounts[&B256::ZERO].unwrap().nonce, 1);
+        assert!(result.try_recv().is_err());
+
+        let (tx, rx) = unbounded();
+        let (input, result) = storage_only_input(address, Vec::new(), 2);
+        assert!(forward_storage_only_job(&tx, input).is_none());
+        drop(rx.recv().unwrap());
+        let message = result.recv_timeout(Duration::from_secs(1)).unwrap();
+        let expected: StateRootTaskError = StateProofError::Database(DatabaseError::Other(
+            format!("Storage proof channel closed for {address:?}",),
+        ))
+        .into();
+        assert_eq!(message.result.unwrap_err().to_string(), expected.to_string());
+        assert_eq!(message.state.accounts[&B256::ZERO].unwrap().nonce, 2);
+        assert!(result.try_recv().is_err());
+
+        // A canceled consumer must neither block storage shutdown nor panic on the drop error.
+        let (input, result) = storage_only_input(address, Vec::new(), 3);
+        drop(result);
+        assert!(forward_storage_only_job(&tx, input).is_none());
+        drop(rx.recv().unwrap());
+    }
+
+    #[test]
+    fn forwarded_storage_errors_match_nested_conversion_and_complete_once() {
+        let (tx, rx) = unbounded();
+        for tag in 1..=3 {
+            let (input, result) =
+                storage_only_input(B256::repeat_byte(tag), Vec::new(), u64::from(tag));
+            assert!(forward_storage_only_job(&tx, input).is_none());
+            let StorageWorkerJob::StorageProof { input, proof_result_sender, .. } =
+                rx.recv().unwrap();
+            assert!(!input.needs_root);
+            let make_error = || match tag {
+                1 => StateProofError::Database(DatabaseError::Other("provider failure".into())),
+                2 => StateProofError::Rlp(alloy_rlp::Error::InputTooShort),
+                _ => StateProofError::TrieInconsistency("invalid proof".into()),
+            };
+            let expected = StateRootTaskError::from(make_error()).to_string();
+            assert!(proof_result_sender.send(input.hashed_address, Err(make_error())));
+            let message = result.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(message.result.unwrap_err().to_string(), expected);
+            assert_eq!(message.state.accounts[&B256::ZERO].unwrap().nonce, u64::from(tag));
+            assert!(result.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn interleaved_forwarded_jobs_match_real_provider_proofs_and_cache() {
+        use reth_provider::StateWriter;
+        use reth_trie::{proof_v2::StorageProofCalculator, HashedStorage};
+        let factory = create_test_provider_factory_with_chain_spec(Arc::new(ChainSpec::default()));
+        let anchor = reth_db_common::init::init_genesis(&factory).unwrap();
+        let address = B256::repeat_byte(5);
+        let slot_a = B256::repeat_byte(1);
+        let slot_b = B256::repeat_byte(2);
+        let state = HashedPostState::from_hashed_storage(
+            address,
+            HashedStorage::from_iter([(slot_a, U256::from(11)), (slot_b, U256::from(22))]),
+        )
+        .with_accounts([(
+            address,
+            Some(reth_primitives_traits::Account { nonce: 1, ..Default::default() }),
+        )])
+        .into_sorted();
+        let writer = factory.provider_rw().unwrap();
+        writer.write_hashed_state(&state).unwrap();
+        writer.commit().unwrap();
+        let factory = reth_storage_overlay::OverlayStateProviderFactory::new(factory, reth_storage_overlay::OverlayManager::<reth_ethereum_primitives::EthPrimitives>::default().overlay_builder(anchor));
+        let (tx, rx) = unbounded();
+        let mut pairs = Vec::new();
+        for (tag, targets) in [
+            (1, Vec::new()),
+            (2, vec![ProofV2Target::new(slot_a)]),
+            (3, vec![ProofV2Target::new(B256::repeat_byte(3))]),
+        ] {
+            let nested = dispatch_v2_storage_proofs(
+                &tx,
+                &[],
+                B256Map::from_iter([(address, targets.clone())]),
+            )
+            .unwrap();
+            let (input, result) = storage_only_input(address, targets, tag);
+            assert!(forward_storage_only_job(&tx, input).is_none());
+            pairs.push((tag, nested, result));
+        }
+        // Cancel another result receiver; the proof still follows the normal compute/cache path.
+        let (input, canceled) = storage_only_input(address, Vec::new(), 4);
+        drop(canceled);
+        assert!(forward_storage_only_job(&tx, input).is_none());
+        drop(tx);
+        let roots = Arc::new(DashMap::<B256, B256>::default());
+        let worker = StorageProofWorker::new(
+            test_ctx(factory.clone()),
+            rx,
+            0,
+            Arc::new(AvailabilitySheet::new(1)),
+            roots.clone(),
+            #[cfg(feature = "metrics")]
+            ProofTaskTrieMetrics::default(),
+            #[cfg(feature = "metrics")]
+            ProofTaskCursorMetrics::new(),
+        );
+        worker.run(None).unwrap();
+        let provider = factory.database_provider_ro().unwrap();
+        let calculator = Rc::new(RefCell::new(StorageProofCalculator::new_storage(
+            provider.storage_trie_cursor(address).unwrap(),
+            provider.hashed_storage_cursor(address).unwrap(),
+        )));
+        let mut account_calculator = proof_v2::ProofCalculator::new(
+            provider.account_trie_cursor().unwrap(),
+            provider.hashed_account_cursor().unwrap(),
+        );
+        for (tag, nested, receiver) in pairs {
+            // Reconstruct the exact former empty-account path: no account nodes, then collect.
+            let mut encoder =
+                AsyncAccountValueEncoder::new(nested, roots.clone(), calculator.clone());
+            let account_proofs = account_calculator.proof(&mut encoder, &mut []).unwrap();
+            assert!(account_proofs.is_empty());
+            let (storage_proofs, _) = encoder.finalize().unwrap();
+            let message = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+            let actual = message.result.unwrap();
+            assert_eq!(actual.account_proofs, account_proofs);
+            assert_eq!(actual.storage_proofs, storage_proofs);
+            assert_eq!(message.state.accounts[&B256::ZERO].unwrap().nonce, tag);
+            assert!(receiver.try_recv().is_err());
+        }
+        // A later nonempty account proof resets its cursors and matches a fresh calculator.
+        let mut reused_encoder =
+            AsyncAccountValueEncoder::new(B256Map::default(), roots.clone(), calculator.clone());
+        let reused = account_calculator
+            .proof(&mut reused_encoder, &mut [ProofV2Target::new(address)])
+            .unwrap();
+        reused_encoder.finalize().unwrap();
+        let mut fresh = proof_v2::ProofCalculator::new(
+            provider.account_trie_cursor().unwrap(),
+            provider.hashed_account_cursor().unwrap(),
+        );
+        let mut fresh_encoder =
+            AsyncAccountValueEncoder::new(B256Map::default(), roots.clone(), calculator.clone());
+        let expected = fresh.proof(&mut fresh_encoder, &mut [ProofV2Target::new(address)]).unwrap();
+        fresh_encoder.finalize().unwrap();
+        assert!(!reused.is_empty());
+        assert_eq!(reused, expected);
+        // Forward another job without touching the already-used account calculator, then reuse it.
+        let (tx, rx) = unbounded();
+        let (input, receiver) = storage_only_input(address, Vec::new(), 5);
+        assert!(forward_storage_only_job(&tx, input).is_none());
+        drop(rx.recv().unwrap());
+        assert!(receiver.recv().unwrap().result.is_err());
+        let mut encoder =
+            AsyncAccountValueEncoder::new(B256Map::default(), roots.clone(), calculator);
+        let after_forward =
+            account_calculator.proof(&mut encoder, &mut [ProofV2Target::new(address)]).unwrap();
+        encoder.finalize().unwrap();
+        assert_eq!(after_forward, expected);
+        assert!(roots.contains_key(&address), "canceled results must still publish valid roots");
     }
 
     fn test_ctx<Factory>(factory: Factory) -> ProofTaskCtx<Factory> {
