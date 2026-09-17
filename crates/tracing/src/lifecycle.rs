@@ -71,7 +71,9 @@ impl CaptureDetail {
         (meta.target().starts_with("tempo_consensus") &&
             matches!(meta.name(), "handle_propose" | "handle_verify" | "verify")) ||
             (meta.target() == "engine::tree::payload_validator" &&
-                matches!(meta.name(), "execute_block" | "execute_block_bal"))
+                matches!(meta.name(), "execute_block" | "execute_block_bal")) ||
+            (meta.target() == "trie::proof_task" &&
+                matches!(meta.name(), "storage_worker" | "account_worker"))
     }
 }
 
@@ -107,6 +109,8 @@ impl Visit for MilestoneStage {
                 "load_start" |
                 "load_end" |
                 "execution_totals" |
+                "proof_storage_worker_totals" |
+                "proof_account_worker_totals" |
                 "backpressure_start" |
                 "proposal_failed"
         );
@@ -933,6 +937,84 @@ mod tests {
         assert_eq!(account["fields"]["worker_cpu_measured"], 0);
         assert_eq!(account["fields"]["worker_success"], 0);
         assert!(account["fields"].get("worker_thread_cpu_ns").is_none());
+        assert_eq!(rows.last().unwrap()["dropped"], 0);
+    }
+
+    #[test]
+    fn milestones_keep_worker_parents_through_other_subscriber_scopes() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        let path = std::env::temp_dir().join(format!("coarse-worker-cpu-{}.jsonl", monotonic_ns()));
+        let detail = CaptureDetail::Milestones;
+        let (layer, guard) =
+            LifecycleLayer::start(File::create(&path).unwrap(), [7; 32], monotonic_ns(), detail)
+                .unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+            .with(layer.with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                detail.capture_metadata(meta)
+            })));
+        tracing::subscriber::with_default(subscriber, || {
+            let execution = tracing::debug_span!(target: "engine::tree::payload_validator", "execute_block", block_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            execution.in_scope(|| {
+                let filtered = tracing::debug_span!(target: "trie::proof_task", "ProofWorkerHandle::new");
+                // The formatting subscriber enables this span, but lifecycle excludes it.
+                assert!(!filtered.is_disabled());
+                filtered.in_scope(|| {
+                    let parent = tracing::Span::current();
+                    assert_eq!(parent.id(), filtered.id());
+                    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                    std::thread::spawn(move || tracing::dispatcher::with_default(&dispatch, || {
+                        let storage = tracing::debug_span!(target: "trie::proof_task", parent: &parent, "storage_worker");
+                        let account = tracing::debug_span!(target: "trie::proof_task", parent: &parent, "account_worker");
+                        // Even an unrelated current scope cannot replace the explicit parent.
+                        let unrelated = tracing::debug_span!(target: "engine::tree::payload_validator", "execute_block_bal");
+                        unrelated.in_scope(|| {
+                            tracing::debug_span!(target: "lifecycle", "proof.storage.work").in_scope(|| {
+                                tracing::info!(target: "lifecycle", parent: &storage, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64);
+                                tracing::info!(target: "lifecycle", parent: &account, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64);
+                                tracing::info!(target: "lifecycle", stage="operation_completed");
+                            });
+                        });
+                    })).join().unwrap();
+                });
+            });
+        });
+        drop(guard);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let rows: Vec<Value> =
+            text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let execution = rows.iter().find(|r| r["name"] == "execute_block").unwrap();
+        assert_eq!(execution["fields"]["block_hash"].as_str().unwrap().len(), 24);
+        for (name, stage) in [
+            ("storage_worker", "proof_storage_worker_totals"),
+            ("account_worker", "proof_account_worker_totals"),
+        ] {
+            let worker = rows.iter().find(|r| r["name"] == name).unwrap();
+            assert_eq!(worker["parent"], execution["id"]);
+            let totals = rows.iter().find(|r| r["fields"]["stage"] == stage).unwrap();
+            assert_eq!(totals["id"], worker["id"]);
+            if name == "storage_worker" {
+                assert_eq!(totals["fields"]["worker_thread_cpu_ns"], 0);
+                assert_eq!(totals["fields"]["worker_cpu_measured"], 1);
+            } else {
+                assert!(totals["fields"].get("worker_thread_cpu_ns").is_none());
+                assert_eq!(totals["fields"]["worker_cpu_measured"], 0);
+            }
+        }
+        assert_eq!(rows.iter().filter(|r| r["type"] == "start").count(), 4);
+        assert_eq!(rows.iter().filter(|r| r["type"] == "end").count(), 4);
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r["type"].as_str(), Some("enter" | "exit" | "aggregate"))));
+        for omitted in [
+            "ProofWorkerHandle::new",
+            "proof.storage.work",
+            "operation_completed",
+            "aaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!text.contains(omitted), "unexpected detailed or private value: {omitted}");
+        }
         assert_eq!(rows.last().unwrap()["dropped"], 0);
     }
 
