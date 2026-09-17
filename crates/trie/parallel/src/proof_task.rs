@@ -614,7 +614,9 @@ impl ProofJobTrace {
         let Self { queue, parent } = self;
         drop(queue);
         ProofServiceTrace {
-            span: debug_span!(target: "lifecycle", parent: parent, "proof.storage.work").entered(),
+            // The originating service may already have completed. Keep this final
+            // reference alive until the subscriber has created and parented the child.
+            span: debug_span!(target: "lifecycle", parent: &parent, "proof.storage.work").entered(),
             completed: false,
         }
     }
@@ -623,7 +625,7 @@ impl ProofJobTrace {
         let Self { queue, parent } = self;
         drop(queue);
         ProofServiceTrace {
-            span: debug_span!(target: "lifecycle", parent: parent, "proof.account.work").entered(),
+            span: debug_span!(target: "lifecycle", parent: &parent, "proof.account.work").entered(),
             completed: false,
         }
     }
@@ -1272,6 +1274,38 @@ mod tests {
     use reth_chainspec::ChainSpec;
     use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
     use std::sync::Arc;
+
+    #[test]
+    fn queued_service_retains_completed_parent_until_child_creation() {
+        use tracing_subscriber::prelude::*;
+        for storage in [true, false] {
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::registry()
+                    .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink)),
+            );
+            let queued = tracing::dispatcher::with_default(&dispatch, || {
+                let account = ProofJobTrace::account(0).start_account();
+                assert!(!account.span.is_disabled());
+                let queued =
+                    if storage { ProofJobTrace::storage(0) } else { ProofJobTrace::account(0) };
+                // Forwarding completes the originating service before dequeue.
+                // The queued context now owns its only remaining references.
+                account.complete();
+                queued
+            });
+            std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    if storage {
+                        queued.start_storage().complete();
+                    } else {
+                        queued.start_account().complete();
+                    }
+                });
+            })
+            .join()
+            .expect("creating the child must retain its completed parent");
+        }
+    }
 
     /// The capture subscriber closes spans when their last reference disappears. Queue
     /// spans must therefore close before work starts, and must never parent that work.
