@@ -17,6 +17,8 @@ pub(crate) struct JobCounts {
     pub(crate) storage_groups: u64,
     pub(crate) storage_only_single_group: u64,
     pub(crate) root_requests: u64,
+    pub(crate) inline_storage_attempts: u64,
+    pub(crate) inline_storage_targets: u64,
     pub(crate) saturated: bool,
 }
 
@@ -38,8 +40,23 @@ impl JobCounts {
             storage_groups: 0,
             storage_only_single_group: 0,
             root_requests: 0,
+            inline_storage_attempts: 0,
+            inline_storage_targets: 0,
             saturated: false,
         }
+    }
+
+    /// Account-worker inline calculations are attempts, never storage-pool dequeues.
+    /// No target length is inspected when capture is disabled.
+    pub(crate) fn observe_inline(counts: Option<&mut Self>, targets: impl FnOnce() -> usize) {
+        let Some(counts) = counts else { return };
+        debug_assert_eq!(counts.kind, JobKind::Account);
+        let targets = u64::try_from(targets()).unwrap_or_else(|_| {
+            counts.saturated = true;
+            u64::MAX
+        });
+        add(&mut counts.inline_storage_attempts, 1, &mut counts.saturated);
+        add(&mut counts.inline_storage_targets, targets, &mut counts.saturated);
     }
 
     /// The closure is not called without a capture observer. Counts precede processing;
@@ -89,6 +106,21 @@ const fn add(total: &mut u64, value: u64, saturated: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_counts_are_optional_saturating_attempts_not_dequeues() {
+        JobCounts::observe_inline(None, || panic!("disabled observer"));
+        let mut counts = JobCounts::new(JobKind::Account);
+        for n in [0, 1, 8] {
+            JobCounts::observe_inline(Some(&mut counts), || n);
+        }
+        assert_eq!((counts.inline_storage_attempts, counts.inline_storage_targets), (3, 9));
+        assert_eq!((counts.jobs, counts.targets, counts.root_requests), (0, 0, 0));
+        counts.inline_storage_targets = u64::MAX;
+        JobCounts::observe_inline(Some(&mut counts), || 1);
+        assert!(counts.saturated);
+        assert_eq!(counts.inline_storage_targets, u64::MAX);
+    }
 
     #[test]
     fn disabled_observer_does_not_read_job_sizes() {
