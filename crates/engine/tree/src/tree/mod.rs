@@ -71,6 +71,7 @@ pub mod payload_validator;
 mod persistence_state;
 pub mod precompile_cache;
 pub mod state_root_strategy;
+mod task_span;
 #[cfg(test)]
 mod tests;
 mod trie_updates;
