@@ -940,7 +940,7 @@ where
         let consensus = self.consensus.clone();
         let parent_span = Span::current();
         self.runtime.spawn_blocking_named("payload-convert", move || {
-            let _span = crate::tree::task_span::payload_conversion(parent_span).entered();
+            let _span = crate::tree::task_span::payload_conversion(&parent_span).entered();
             let block = match input {
                 BlockOrPayload::Block(block) => block.split().0,
                 BlockOrPayload::Payload(payload) => {
