@@ -593,12 +593,7 @@ impl DefaultStateRootStrategy {
             let prune_before =
                 sparse_trie_prune_before(pending_sparse_trie_prune_blocks.as_deref(), new_epoch);
 
-            let _enter = debug_span!(
-                target: "engine::tree::payload_processor",
-                parent: parent_span,
-                "sparse_trie_task"
-            )
-            .entered();
+            let _enter = crate::tree::task_span::sparse_trie(parent_span).entered();
 
             let new_sparse_state_trie = || {
                 debug!(
