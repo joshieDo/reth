@@ -1,5 +1,6 @@
 //! Optional current-thread accounting around a proof worker's synchronous run.
 
+use crate::job_counts::{JobCounts, JobKind};
 use reth_metrics::thread::{ThreadResourceUsage, ThreadResourceUsageDelta};
 use std::{
     sync::OnceLock,
@@ -47,11 +48,30 @@ impl WorkerCpuTimer {
         (wall, cpu_nanos(self.cpu.elapsed()))
     }
 
-    pub(crate) fn record(self, parent: &tracing::Span, stage: &'static str, success: bool) {
+    pub(crate) fn record(
+        self,
+        parent: &tracing::Span,
+        stage: &'static str,
+        success: bool,
+        jobs: Option<&JobCounts>,
+    ) {
         let (worker_run_ns, worker_thread_cpu_ns) = self.finish();
         tracing::info!(target: "lifecycle", parent: parent, stage, worker_run_ns, worker_thread_cpu_ns,
             worker_cpu_measured = u64::from(worker_thread_cpu_ns.is_some()),
-            worker_success = u64::from(success));
+            worker_success = u64::from(success),
+            worker_job_counts_measured = u64::from(jobs.is_some()),
+            worker_jobs = jobs.map(|j| j.jobs),
+            worker_account_targets = jobs.filter(|j| j.kind == JobKind::Account).map(|j| j.targets),
+            worker_storage_targets = jobs.filter(|j| j.kind == JobKind::Storage).map(|j| j.targets),
+            worker_storage_groups = jobs.filter(|j| j.kind == JobKind::Account).map(|j| j.storage_groups),
+            worker_root_requests = jobs.filter(|j| j.kind == JobKind::Storage).map(|j| j.root_requests),
+            worker_target_max = jobs.map(|j| j.max_targets),
+            worker_jobs_targets_0 = jobs.map(|j| j.bins[0]),
+            worker_jobs_targets_1 = jobs.map(|j| j.bins[1]),
+            worker_jobs_targets_2_8 = jobs.map(|j| j.bins[2]),
+            worker_jobs_targets_9_32 = jobs.map(|j| j.bins[3]),
+            worker_jobs_targets_33_plus = jobs.map(|j| j.bins[4]),
+            worker_job_counts_saturated = jobs.map(|j| u64::from(j.saturated)));
     }
 }
 

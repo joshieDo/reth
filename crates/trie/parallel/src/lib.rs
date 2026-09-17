@@ -26,3 +26,5 @@ pub mod proof_task_metrics;
 
 #[cfg(feature = "metrics")]
 mod worker_cpu;
+
+mod job_counts;
