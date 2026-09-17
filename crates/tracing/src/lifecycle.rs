@@ -120,9 +120,38 @@ impl Visit for MilestoneStage {
 #[derive(Debug)]
 enum CaptureRecord {
     Json(Value),
+    Start(Box<SpanStart>),
     Enter { id: u64, ts: u64, thread: u64 },
     Exit { id: u64, ts: u64, thread: u64 },
     End { id: u64, ts: u64, thread: u64 },
+}
+
+/// Only the variable-size start record is boxed, keeping queue slots unchanged.
+/// Metadata strings are static; fields have already passed the privacy filter.
+#[derive(Debug)]
+struct SpanStart {
+    id: u64,
+    ts: u64,
+    thread: u64,
+    name: &'static str,
+    category: &'static str,
+    parent: Option<u64>,
+    fields: Map<String, Value>,
+}
+
+impl SpanStart {
+    fn write_json(&self, out: &mut impl Write) -> io::Result<()> {
+        // Preserve sorted JSON keys and delegate string/field escaping to serde.
+        out.write_all(b"{\"category\":")?;
+        serde_json::to_writer(&mut *out, self.category).map_err(io::Error::other)?;
+        out.write_all(b",\"fields\":")?;
+        serde_json::to_writer(&mut *out, &self.fields).map_err(io::Error::other)?;
+        write!(out, ",\"id\":{},\"name\":", self.id)?;
+        serde_json::to_writer(&mut *out, self.name).map_err(io::Error::other)?;
+        out.write_all(b",\"parent\":")?;
+        serde_json::to_writer(&mut *out, &self.parent).map_err(io::Error::other)?;
+        write!(out, ",\"thread\":{},\"ts\":{},\"type\":\"start\"}}", self.thread, self.ts)
+    }
 }
 
 impl From<Value> for CaptureRecord {
@@ -135,6 +164,7 @@ impl CaptureRecord {
     fn write_json(&self, out: &mut impl Write) -> io::Result<()> {
         let (kind, id, ts, thread) = match self {
             Self::Json(value) => return serde_json::to_writer(out, value).map_err(io::Error::other),
+            Self::Start(value) => return value.write_json(out),
             Self::Enter { id, ts, thread } => ("enter", id, ts, thread),
             Self::Exit { id, ts, thread } => ("exit", id, ts, thread),
             Self::End { id, ts, thread } => ("end", id, ts, thread),
@@ -337,11 +367,15 @@ where
         let parent = span.parent().and_then(|p| p.extensions().get::<CapturedSpan>().map(|s| s.id));
         let mut fields = self.fields();
         attrs.record(&mut fields);
-        let mut value = self.stamp("start", capture_id);
-        value["name"] = attrs.metadata().name().into();
-        value["category"] = category(attrs.metadata().target()).into();
-        value["parent"] = parent.into();
-        value["fields"] = Value::Object(fields.values);
+        let value = CaptureRecord::Start(Box::new(SpanStart {
+            id: capture_id,
+            ts: monotonic_ns().saturating_sub(self.epoch),
+            thread: thread_id(),
+            name: attrs.metadata().name(),
+            category: category(attrs.metadata().target()),
+            parent,
+            fields: fields.values,
+        }));
         span.extensions_mut().insert(CapturedSpan {
             id: capture_id,
             aggregates: Aggregates::default(),
@@ -716,6 +750,54 @@ mod tests {
         let mut bytes = Vec::new();
         record.write_json(&mut bytes).unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn typed_start_preserves_json_escaping_and_optional_parent() {
+        for id in [0, 1, u64::MAX] {
+            for parent in [None, Some(0), Some(u64::MAX)] {
+                for name in ["storage_worker", "quoted\"\\\n\t\u{0000}λ"] {
+                    let fields = Map::from_iter([
+                        ("block_hash".into(), Value::String("pseudonymous".into())),
+                        ("transactions".into(), id.into()),
+                    ]);
+                    let expected = json!({"type":"start", "id":id, "ts":id,
+                        "thread":id, "name":name, "category":"trie", "parent":parent,
+                        "fields":fields});
+                    let record = CaptureRecord::Start(Box::new(SpanStart {
+                        id,
+                        ts: id,
+                        thread: id,
+                        name,
+                        category: "trie",
+                        parent,
+                        fields,
+                    }));
+                    let mut bytes = Vec::new();
+                    record.write_json(&mut bytes).unwrap();
+                    assert_eq!(bytes, serde_json::to_vec(&expected).unwrap());
+                    assert_eq!(as_value(record), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_start_propagates_short_writer_failure() {
+        let record = CaptureRecord::Start(Box::new(SpanStart {
+            id: 1,
+            ts: 2,
+            thread: 3,
+            name: "storage_worker",
+            category: "trie",
+            parent: None,
+            fields: Map::new(),
+        }));
+        // Fail both in a literal and in a serde-escaped value, never accept truncation.
+        for capacity in [0, 14, 22, 70] {
+            let mut buffer = vec![0; capacity];
+            assert!(record.write_json(&mut io::Cursor::new(buffer.as_mut_slice())).is_err());
+        }
     }
 
     #[test]
