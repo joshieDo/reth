@@ -15,7 +15,7 @@ use reth_trie::{
 };
 use revm::state::EvmState;
 use std::{fmt, sync::Arc};
-use tracing::trace;
+use tracing::{trace, Span};
 
 /// Messages used internally by the multi proof task.
 #[derive(Debug)]
@@ -54,6 +54,8 @@ pub struct StateRootComputeOutcome {
 /// Created by the engine's state-root strategy.
 #[derive(Debug)]
 pub struct StateRootHandle {
+    /// Retained only until the payload builder records the exact task handoff.
+    task_span: Option<Span>,
     /// The state root that the cached sparse trie is anchored at (parent block's state root).
     cached_trie_state_root: B256,
     /// Best-effort hint capability, taken once by prewarm wiring.
@@ -87,6 +89,7 @@ impl StateRootHandle {
     ) -> Self {
         let sink: Arc<dyn StateRootSink> = Arc::new(SparseTrieStateRootSink::new(updates_tx));
         Self {
+            task_span: None,
             cached_trie_state_root,
             hint: Some(StateRootHintStream::new(Arc::clone(&sink))),
             authoritative: Some(StateRootUpdateStream::new(sink)),
@@ -94,6 +97,15 @@ impl StateRootHandle {
             state_root_rx: Some(state_root_rx),
             hashed_state_rx: Some(hashed_state_rx),
         }
+    }
+
+    /// Associates this handle with the exact span that spawned its root pipeline.
+    ///
+    /// The payload conversion preserves this handle for a single diagnostic handoff;
+    /// it does not change cancellation or computation ownership.
+    pub fn with_task_span(mut self, span: Span) -> Self {
+        self.task_span = Some(span);
+        self
     }
 
     /// Returns the state root that the cached sparse trie is anchored at.
@@ -177,6 +189,7 @@ impl StateRootHandle {
     pub fn into_payload_state_root_handle(mut self) -> PayloadStateRootHandle {
         let hook = self.take_execution_hook();
         PayloadStateRootHandle {
+            task_span: self.task_span.take(),
             name: "sparse-trie",
             hook: Some(hook),
             cancel_guard: Some(self.cancel_guard),
@@ -204,6 +217,7 @@ impl StateRootTaskCancelGuard {
 
 /// Opaque state-root task handle passed to payload builders.
 pub struct PayloadStateRootHandle {
+    task_span: Option<Span>,
     name: &'static str,
     /// Execution hook that streams per-transaction updates; taken once when building starts.
     hook: Option<StateRootUpdateHook>,
@@ -239,7 +253,26 @@ impl PayloadStateRootHandle {
         >,
         hashed_state_rx: Option<std::sync::mpsc::Receiver<Arc<HashedPostState>>>,
     ) -> Self {
-        Self { name, hook, cancel_guard: None, state_root_rx: Some(state_root_rx), hashed_state_rx }
+        Self {
+            task_span: None,
+            name,
+            hook,
+            cancel_guard: None,
+            state_root_rx: Some(state_root_rx),
+            hashed_state_rx,
+        }
+    }
+
+    /// Records that the current payload-building span consumes this exact root task.
+    ///
+    /// This emits one tracing follows-from edge, not a parent change or a claim that
+    /// the task started after the builder. A filtered endpoint produces no edge.
+    /// Repeated calls do nothing. The retained diagnostic span is released here;
+    /// the hook, result channels and cancellation guard are unaffected.
+    pub fn link_to_current_span(&mut self) {
+        if let Some(task_span) = self.task_span.take() {
+            Span::current().follows_from(task_span.id());
+        }
     }
 
     /// Returns the task name used in logs.
@@ -691,6 +724,88 @@ mod tests {
 
         let _hook = handle.take_execution_hook();
         let _ = handle.take_hashed_update_stream();
+    }
+
+    #[test]
+    fn payload_root_link_uses_owned_task_once_without_retaining_cancellation() {
+        use std::sync::Mutex;
+        use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
+
+        #[derive(Clone, Default)]
+        struct Links(Arc<Mutex<Vec<(u64, u64)>>>);
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Links {
+            fn on_follows_from(
+                &self,
+                id: &tracing::Id,
+                follows: &tracing::Id,
+                _ctx: Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push((id.into_u64(), follows.into_u64()));
+            }
+        }
+        let links = Links::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(links.clone()));
+        tracing::dispatcher::with_default(&dispatch, || {
+            let make = || {
+                let task = tracing::debug_span!("spawn_state_root");
+                let id = task.id().unwrap().into_u64();
+                let (updates_tx, _updates_rx) = crossbeam_channel::unbounded();
+                let (guard, cancel_rx) = StateRootTaskCancelGuard::channel();
+                let (_root_tx, root_rx) = std::sync::mpsc::channel();
+                let (_hashed_tx, hashed_rx) = std::sync::mpsc::channel();
+                let handle =
+                    StateRootHandle::new(B256::ZERO, updates_tx, guard, root_rx, hashed_rx)
+                        .with_task_span(task)
+                        .into_payload_state_root_handle();
+                (id, handle, cancel_rx)
+            };
+            let (task_a, mut handle_a, cancel_a) = make();
+            let (task_b, mut handle_b, cancel_b) = make();
+            // Consume in reverse order: association must follow ownership, not recency.
+            let build_b = tracing::debug_span!("build_payload");
+            let build_a = tracing::debug_span!("build_payload");
+            build_b.in_scope(|| {
+                handle_b.link_to_current_span();
+                handle_b.link_to_current_span();
+            });
+            build_a.in_scope(|| handle_a.link_to_current_span());
+            assert_eq!(
+                *links.0.lock().unwrap(),
+                vec![
+                    (build_b.id().unwrap().into_u64(), task_b),
+                    (build_a.id().unwrap().into_u64(), task_a)
+                ]
+            );
+            assert!(handle_a.task_span.is_none());
+            assert!(handle_b.task_span.is_none());
+            assert!(matches!(cancel_a.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+            assert!(matches!(cancel_b.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+            drop(handle_a);
+            assert!(matches!(
+                cancel_a.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Disconnected)
+            ));
+            assert!(matches!(cancel_b.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+            drop(handle_b);
+            assert!(matches!(
+                cancel_b.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Disconnected)
+            ));
+        });
+    }
+
+    #[test]
+    fn payload_root_link_accepts_uninstrumented_and_filtered_handles() {
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let mut handle = PayloadStateRootHandle::new("custom", None, rx, None);
+            handle.link_to_current_span();
+            handle.task_span = Some(tracing::Span::none());
+            handle.link_to_current_span();
+            assert!(handle.task_span.is_none());
+            // The receiver remains available after either no-op.
+            let _receiver = handle.take_state_root_rx();
+        });
     }
 
     /// Lifecycle of the opaque handle a strategy hands to the payload builder: the execution

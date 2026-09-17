@@ -556,6 +556,7 @@ impl DefaultStateRootStrategy {
             state_root_rx,
             hashed_state_rx,
         )
+        .with_task_span(Span::current())
     }
 
     /// Spawns the sparse-trie task and preserves its trie for the next state-root job.
