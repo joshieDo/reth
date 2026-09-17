@@ -20,8 +20,7 @@ pub mod state_root_task;
 /// Async value encoder for V2 proofs.
 pub(crate) mod value_encoder;
 
-/// Proof task manager metrics.
-#[cfg(feature = "metrics")]
+/// Proof task manager cursor caches and optional metrics.
 pub mod proof_task_metrics;
 
 #[cfg(feature = "metrics")]

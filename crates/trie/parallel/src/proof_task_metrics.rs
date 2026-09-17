@@ -1,13 +1,15 @@
+#[cfg(feature = "metrics")]
 use crate::value_encoder::ValueEncoderStats;
+#[cfg(feature = "metrics")]
 use reth_metrics::{metrics::Histogram, Metrics};
-use reth_trie::{
-    hashed_cursor::{HashedCursorMetrics, HashedCursorMetricsCache},
-    trie_cursor::{TrieCursorMetrics, TrieCursorMetricsCache},
-    TrieType,
-};
+#[cfg(feature = "metrics")]
+use reth_trie::{hashed_cursor::HashedCursorMetrics, trie_cursor::TrieCursorMetrics, TrieType};
+use reth_trie::{hashed_cursor::HashedCursorMetricsCache, trie_cursor::TrieCursorMetricsCache};
+#[cfg(feature = "metrics")]
 use std::time::Duration;
 
 /// Metrics for the proof task.
+#[cfg(feature = "metrics")]
 #[derive(Clone, Metrics)]
 #[metrics(scope = "trie.proof_task")]
 pub struct ProofTaskTrieMetrics {
@@ -30,6 +32,7 @@ pub struct ProofTaskTrieMetrics {
     account_worker_storage_wait_seconds: Histogram,
 }
 
+#[cfg(feature = "metrics")]
 impl ProofTaskTrieMetrics {
     /// Record storage worker idle time.
     pub fn record_storage_worker_idle_time(&self, duration: Duration) {
@@ -53,6 +56,7 @@ impl ProofTaskTrieMetrics {
 }
 
 /// Cursor metrics for proof task operations.
+#[cfg(feature = "metrics")]
 #[derive(Clone, Debug)]
 pub struct ProofTaskCursorMetrics {
     /// Metrics for account trie cursor operations.
@@ -65,6 +69,7 @@ pub struct ProofTaskCursorMetrics {
     pub storage_hashed_cursor: HashedCursorMetrics,
 }
 
+#[cfg(feature = "metrics")]
 impl ProofTaskCursorMetrics {
     /// Create a new instance with properly initialized cursor metrics.
     pub fn new() -> Self {
@@ -89,6 +94,7 @@ impl ProofTaskCursorMetrics {
     }
 }
 
+#[cfg(feature = "metrics")]
 impl Default for ProofTaskCursorMetrics {
     fn default() -> Self {
         Self::new()
@@ -96,6 +102,9 @@ impl Default for ProofTaskCursorMetrics {
 }
 
 /// Cached cursor metrics for proof task operations.
+///
+/// Available without the `metrics` feature because the proof calculators use
+/// instrumented cursor wrappers independently of histogram publication.
 #[derive(Clone, Debug, Default, Copy)]
 pub struct ProofTaskCursorMetricsCache {
     /// Cached metrics for account trie cursor operations.

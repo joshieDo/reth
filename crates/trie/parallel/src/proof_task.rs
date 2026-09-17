@@ -34,6 +34,7 @@ use crate::job_counts::JobKind;
 use crate::{
     error::StateRootTaskError,
     job_counts::{JobCounts, JobSize},
+    proof_task_metrics::ProofTaskCursorMetricsCache,
     value_encoder::{AsyncAccountValueEncoder, ValueEncoderStats},
 };
 use alloy_primitives::{
@@ -64,9 +65,7 @@ use std::{
 use tracing::{debug, debug_span, error, instrument, trace};
 
 #[cfg(feature = "metrics")]
-use crate::proof_task_metrics::{
-    ProofTaskCursorMetrics, ProofTaskCursorMetricsCache, ProofTaskTrieMetrics,
-};
+use crate::proof_task_metrics::{ProofTaskCursorMetrics, ProofTaskTrieMetrics};
 
 /// Type alias for the V2 account proof calculator with instrumented cursors.
 type V2AccountProofCalculator<'a, Provider> = proof_v2::ProofCalculator<
