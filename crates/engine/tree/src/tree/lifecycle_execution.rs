@@ -24,6 +24,12 @@ impl ExecutionLoopMeasurement {
 }
 
 impl ExecutionLoopTimer {
+    /// Match the event kind used for totals; reduced capture deliberately rejects span/HINT
+    /// metadata.
+    pub(super) fn accounting_enabled() -> bool {
+        tracing::event_enabled!(target: "lifecycle", tracing::Level::INFO)
+    }
+
     pub(super) fn start(enabled: bool) -> Option<Self> {
         enabled.then(|| Self { cpu: ThreadResourceUsage::now(), wall: Instant::now() })
     }
@@ -52,6 +58,25 @@ fn cpu_nanos(usage: Option<ThreadResourceUsageDelta>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_accounting_gate_accepts_event_only_subscriber() {
+        use reth_tracing::tracing_subscriber::{layer::SubscriberExt, Layer};
+        let subscriber = reth_tracing::tracing_subscriber::registry().with(
+            reth_tracing::tracing_subscriber::fmt::layer().with_writer(std::io::sink).with_filter(
+                reth_tracing::tracing_subscriber::filter::filter_fn(|meta| {
+                    meta.is_event() && meta.target() == "lifecycle"
+                }),
+            ),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(target: "lifecycle", tracing::Level::INFO));
+            assert!(ExecutionLoopTimer::start(ExecutionLoopTimer::accounting_enabled()).is_some());
+        });
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            assert!(ExecutionLoopTimer::start(ExecutionLoopTimer::accounting_enabled()).is_none());
+        });
+    }
 
     #[test]
     fn disabled_accounting_does_not_start_timer() {

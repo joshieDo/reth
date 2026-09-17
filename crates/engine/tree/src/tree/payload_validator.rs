@@ -1283,7 +1283,7 @@ where
         let mut execution_ns = 0u64;
         let mut wait_ns = 0u64;
         let mut receipt_ns = 0u64;
-        let accounting = tracing::enabled!(target: "lifecycle", Level::INFO);
+        let accounting = ExecutionLoopTimer::accounting_enabled();
         let loop_timer = ExecutionLoopTimer::start(accounting);
         loop {
             // Measure time spent waiting for next transaction from iterator

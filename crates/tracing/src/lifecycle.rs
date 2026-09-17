@@ -937,6 +937,28 @@ mod tests {
     }
 
     #[test]
+    fn milestone_accounting_uses_event_enablement() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer().with_writer(std::io::sink).with_filter(
+                    tracing_subscriber::filter::filter_fn(move |meta| {
+                        detail.capture_metadata(meta)
+                    }),
+                ),
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(tracing::event_enabled!(target: "lifecycle", tracing::Level::INFO));
+                if detail == CaptureDetail::Milestones {
+                    assert!(!tracing::enabled!(target: "lifecycle", tracing::Level::INFO));
+                    assert!(tracing::debug_span!(target: "lifecycle", "proof.storage.work")
+                        .is_disabled());
+                }
+            });
+        }
+    }
+
+    #[test]
     fn milestones_preserve_identity_without_false_ancestor_completion() {
         let _serial = CAPTURE_TEST.lock().unwrap();
         let path =
