@@ -31,6 +31,7 @@
 
 use crate::{
     error::StateRootTaskError,
+    root_work::{RootWorkKind, RootWorkObserver},
     value_encoder::{AsyncAccountValueEncoder, ValueEncoderStats},
 };
 use alloy_primitives::{
@@ -233,11 +234,15 @@ impl ProofWorkerHandle {
                 );
                 #[cfg(feature = "metrics")]
                 let cpu_timer = crate::worker_cpu::WorkerCpuTimer::start();
-                let result = worker.run();
+                #[cfg(feature = "metrics")]
+                let root_work = cpu_timer.as_ref().map(|_| Rc::new(RootWorkObserver::default()));
+                #[cfg(not(feature = "metrics"))]
+                let root_work = None;
+                let result = worker.run(root_work.clone());
                 #[cfg(feature = "metrics")]
                 if let Some(timer) = cpu_timer {
                     let parent = if span.is_disabled() { &storage_parent_span } else { &span };
-                    timer.record(parent, "proof_storage_worker_totals", result.is_ok());
+                    timer.record(parent, "proof_storage_worker_totals", result.is_ok(), root_work.as_deref());
                 }
                 if let Err(error) = result {
                     error!(
@@ -288,11 +293,15 @@ impl ProofWorkerHandle {
                 );
                 #[cfg(feature = "metrics")]
                 let cpu_timer = crate::worker_cpu::WorkerCpuTimer::start();
-                let result = worker.run();
+                #[cfg(feature = "metrics")]
+                let root_work = cpu_timer.as_ref().map(|_| Rc::new(RootWorkObserver::default()));
+                #[cfg(not(feature = "metrics"))]
+                let root_work = None;
+                let result = worker.run(root_work.clone());
                 #[cfg(feature = "metrics")]
                 if let Some(timer) = cpu_timer {
                     let parent = if span.is_disabled() { &account_parent_span } else { &span };
-                    timer.record(parent, "proof_account_worker_totals", result.is_ok());
+                    timer.record(parent, "proof_account_worker_totals", result.is_ok(), root_work.as_deref());
                 }
                 if let Err(error) = result {
                     error!(
@@ -464,6 +473,8 @@ where
         &self,
         input: StorageProofInput,
         calculator: &mut proof_v2::StorageProofCalculator<TC, HC>,
+        root_work: Option<&RootWorkObserver>,
+        cached_roots: &DashMap<B256, B256>,
     ) -> Result<StorageProofResult, StateProofError>
     where
         TC: TrieStorageCursor,
@@ -490,6 +501,12 @@ where
             // changing the target's parent context, then reset the storage cursors by starting the
             // targeted proof.
             let root = if needs_root && targets.iter().all(|target| target.parent.is_known()) {
+                if let Some(observer) = root_work {
+                    observer.observe(
+                        RootWorkKind::StoragePartial,
+                        cached_roots.contains_key(&hashed_address),
+                    );
+                }
                 let root_node = calculator.storage_root_node(hashed_address)?;
                 calculator.compute_root_hash(core::slice::from_ref(&root_node))?
             } else {
@@ -731,7 +748,7 @@ where
     ///
     /// If this function panics, the worker thread terminates but other workers
     /// continue operating and the system degrades gracefully.
-    fn run(mut self) -> ProviderResult<()> {
+    fn run(mut self, root_work: Option<Rc<RootWorkObserver>>) -> ProviderResult<()> {
         // Create provider from factory
         let provider = self.task_ctx.factory.database_provider_ro()?;
         let proof_tx = ProofTaskTx::new(provider, self.worker_id);
@@ -790,6 +807,7 @@ where
                 input,
                 proof_result_sender,
                 &mut storage_proofs_processed,
+                root_work.as_deref(),
             );
             work.complete();
 
@@ -827,6 +845,7 @@ where
         input: StorageProofInput,
         proof_result_sender: CrossbeamSender<StorageProofResultMessage>,
         storage_proofs_processed: &mut u64,
+        root_work: Option<&RootWorkObserver>,
     ) where
         Provider: TrieCursorFactory + HashedCursorFactory,
         TC: TrieStorageCursor,
@@ -843,7 +862,12 @@ where
             "Processing V2 storage proof"
         );
 
-        let result = proof_tx.compute_v2_storage_proof(input, v2_calculator);
+        let result = proof_tx.compute_v2_storage_proof(
+            input,
+            v2_calculator,
+            root_work,
+            &self.cached_storage_roots,
+        );
 
         let proof_elapsed = proof_start.elapsed();
         *storage_proofs_processed += 1;
@@ -948,7 +972,7 @@ where
     ///
     /// If this function panics, the worker thread terminates but other workers
     /// continue operating and the system degrades gracefully.
-    fn run(mut self) -> ProviderResult<()> {
+    fn run(mut self, root_work: Option<Rc<RootWorkObserver>>) -> ProviderResult<()> {
         let provider = self.task_ctx.factory.database_provider_ro()?;
 
         trace!(
@@ -1039,6 +1063,7 @@ where
                 v2_storage_calculator.clone(),
                 *input,
                 &mut account_proofs_processed,
+                root_work.clone(),
             );
             total_idle_time += value_encoder_stats.storage_wait_time;
             value_encoder_stats_cache.extend(&value_encoder_stats);
@@ -1077,6 +1102,7 @@ where
         v2_account_calculator: &mut V2AccountProofCalculator<'a, Provider>,
         v2_storage_calculator: Rc<RefCell<V2StorageProofCalculator<'a, Provider>>>,
         targets: MultiProofTargetsV2,
+        root_work: Option<Rc<RootWorkObserver>>,
     ) -> Result<(DecodedMultiProofV2, ValueEncoderStats), StateRootTaskError>
     where
         Provider: TrieCursorFactory + HashedCursorFactory + 'a,
@@ -1100,6 +1126,7 @@ where
             storage_proof_receivers,
             self.cached_storage_roots.clone(),
             v2_storage_calculator,
+            root_work,
         );
 
         let account_proofs = debug_span!(target: "lifecycle", "proof.account.walk")
@@ -1123,6 +1150,7 @@ where
         v2_storage_calculator: Rc<RefCell<V2StorageProofCalculator<'a, Provider>>>,
         input: AccountMultiproofInput,
         account_proofs_processed: &mut u64,
+        root_work: Option<Rc<RootWorkObserver>>,
     ) -> ValueEncoderStats
     where
         Provider: TrieCursorFactory + HashedCursorFactory + 'a,
@@ -1134,6 +1162,7 @@ where
             v2_account_calculator,
             v2_storage_calculator,
             targets,
+            root_work,
         ) {
             Ok((proof, stats)) => (Ok(proof), stats),
             Err(e) => (Err(e), ValueEncoderStats::default()),
@@ -1373,6 +1402,57 @@ mod tests {
                 ("end", "proof.account.work"),
             ]
         );
+    }
+
+    #[test]
+    fn root_opportunities_observe_partial_roots_without_changing_proofs() {
+        use reth_trie::{test_utils::TrieTestHarness, ProofV2TargetParent};
+        let harness = TrieTestHarness::new(
+            [(B256::repeat_byte(0x10), U256::from(1)), (B256::repeat_byte(0x20), U256::from(2))]
+                .into(),
+        );
+        let trie_factory = harness.trie_cursor_factory();
+        let hashed_factory = harness.hashed_cursor_factory();
+        let mut calculator = proof_v2::StorageProofCalculator::new_storage(
+            trie_factory.storage_trie_cursor(B256::ZERO).unwrap(),
+            hashed_factory.hashed_storage_cursor(B256::ZERO).unwrap(),
+        );
+        let chain_spec = Arc::new(ChainSpec::default());
+        let anchor = chain_spec.genesis_hash();
+        let factory = reth_storage_overlay::OverlayStateProviderFactory::new(
+            create_test_provider_factory_with_chain_spec(chain_spec),
+            reth_storage_overlay::OverlayManager::<reth_ethereum_primitives::EthPrimitives>::default()
+                .overlay_builder(anchor),
+        );
+        let tx = ProofTaskTx::new(factory.database_provider_ro().unwrap(), 0);
+        let cache = DashMap::default();
+        let observer = RootWorkObserver::default();
+        let target =
+            ProofV2Target::new(B256::repeat_byte(0x10)).with_parent(ProofV2TargetParent::new(0));
+        let input = || StorageProofInput::new(B256::ZERO, vec![target], true);
+        let expected = tx.compute_v2_storage_proof(input(), &mut calculator, None, &cache).unwrap();
+        let cold =
+            tx.compute_v2_storage_proof(input(), &mut calculator, Some(&observer), &cache).unwrap();
+        assert_eq!(cold.proof, expected.proof);
+        assert_eq!(cold.root, expected.root);
+        // Observation must not replace calculation, even if the cache contains a
+        // deliberately incorrect value in this isolated fixture.
+        cache.insert(B256::ZERO, B256::repeat_byte(99));
+        let warm =
+            tx.compute_v2_storage_proof(input(), &mut calculator, Some(&observer), &cache).unwrap();
+        assert_eq!(warm.proof, expected.proof);
+        assert_eq!(warm.root, expected.root);
+        assert_eq!(observer.snapshot().storage_partial_roots, 2);
+        assert_eq!(observer.snapshot().storage_partial_cached, 1);
+        for input in [
+            StorageProofInput::new(B256::ZERO, vec![target], false),
+            StorageProofInput::new(B256::ZERO, vec![ProofV2Target::new(target.key())], true),
+            StorageProofInput::new(B256::ZERO, vec![], true),
+        ] {
+            tx.compute_v2_storage_proof(input, &mut calculator, Some(&observer), &cache).unwrap();
+        }
+        assert_eq!(observer.snapshot().storage_partial_roots, 2);
+        assert_eq!(observer.snapshot().storage_partial_cached, 1);
     }
 
     fn test_ctx<Factory>(factory: Factory) -> ProofTaskCtx<Factory> {

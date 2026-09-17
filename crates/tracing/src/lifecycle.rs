@@ -624,6 +624,13 @@ fn numeric_field(name: &str) -> bool {
             "worker_thread_cpu_ns" |
             "worker_cpu_measured" |
             "worker_success" |
+            "root_probes_measured" |
+            "storage_partial_roots" |
+            "storage_partial_cached" |
+            "account_sync_roots" |
+            "account_sync_cached" |
+            "account_missing_roots" |
+            "account_missing_cached" |
             "execution_resources_measured" |
             "execution_voluntary_context_switches" |
             "execution_involuntary_context_switches" |
@@ -910,8 +917,12 @@ mod tests {
                     let worker = tracing::debug_span!(target: "trie::proof_task", parent: &parent, "storage_worker");
                     // The explicit event parent must work without a thread-local entered span.
                     assert!(tracing::Span::current().is_none());
-                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64, native_tid=77777u64);
-                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64);
+                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64, root_probes_measured=1u64,
+                        storage_partial_roots=Some(2u64), storage_partial_cached=Some(0u64),
+                        account_sync_roots=Some(0u64), account_sync_cached=Some(0u64),
+                        account_missing_roots=Some(0u64), account_missing_cached=Some(0u64),
+                        native_tid=77777u64);
+                    tracing::info!(target: "lifecycle", parent: &worker, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64, root_probes_measured=0u64, storage_partial_roots=None::<u64>);
                 });
             }).join().unwrap();
         });
@@ -930,12 +941,17 @@ mod tests {
         assert_eq!(storage["fields"]["worker_thread_cpu_ns"], 0);
         assert_eq!(storage["fields"]["worker_cpu_measured"], 1);
         assert_eq!(storage["fields"]["worker_success"], 1);
+        assert_eq!(storage["fields"]["root_probes_measured"], 1);
+        assert_eq!(storage["fields"]["storage_partial_roots"], 2);
+        assert_eq!(storage["fields"]["storage_partial_cached"], 0);
         let account =
             rows.iter().find(|r| r["fields"]["stage"] == "proof_account_worker_totals").unwrap();
         assert_eq!(account["id"], worker["id"]);
         assert_eq!(account["fields"]["worker_run_ns"], 60);
         assert_eq!(account["fields"]["worker_cpu_measured"], 0);
         assert_eq!(account["fields"]["worker_success"], 0);
+        assert_eq!(account["fields"]["root_probes_measured"], 0);
+        assert!(account["fields"].get("storage_partial_roots").is_none());
         assert!(account["fields"].get("worker_thread_cpu_ns").is_none());
         assert_eq!(rows.last().unwrap()["dropped"], 0);
     }
@@ -970,7 +986,7 @@ mod tests {
                         let unrelated = tracing::debug_span!(target: "engine::tree::payload_validator", "execute_block_bal");
                         unrelated.in_scope(|| {
                             tracing::debug_span!(target: "lifecycle", "proof.storage.work").in_scope(|| {
-                                tracing::info!(target: "lifecycle", parent: &storage, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64);
+                                tracing::info!(target: "lifecycle", parent: &storage, stage="proof_storage_worker_totals", worker_run_ns=50u64, worker_thread_cpu_ns=Some(0u64), worker_cpu_measured=1u64, worker_success=1u64, root_probes_measured=1u64, storage_partial_roots=3u64, storage_partial_cached=2u64);
                                 tracing::info!(target: "lifecycle", parent: &account, stage="proof_account_worker_totals", worker_run_ns=60u64, worker_thread_cpu_ns=None::<u64>, worker_cpu_measured=0u64, worker_success=0u64);
                                 tracing::info!(target: "lifecycle", stage="operation_completed");
                             });
@@ -997,6 +1013,8 @@ mod tests {
             if name == "storage_worker" {
                 assert_eq!(totals["fields"]["worker_thread_cpu_ns"], 0);
                 assert_eq!(totals["fields"]["worker_cpu_measured"], 1);
+                assert_eq!(totals["fields"]["storage_partial_roots"], 3);
+                assert_eq!(totals["fields"]["storage_partial_cached"], 2);
             } else {
                 assert!(totals["fields"].get("worker_thread_cpu_ns").is_none());
                 assert_eq!(totals["fields"]["worker_cpu_measured"], 0);

@@ -1,4 +1,7 @@
-use crate::proof_task::StorageProofResultMessage;
+use crate::{
+    proof_task::StorageProofResultMessage,
+    root_work::{RootWorkKind, RootWorkObserver},
+};
 use alloy_primitives::{map::B256Map, B256};
 use alloy_rlp::Encodable;
 use core::cell::RefCell;
@@ -67,6 +70,7 @@ pub(crate) enum AsyncAccountDeferredValueEncoder<TC, HC> {
         storage_calculator: Rc<RefCell<StorageProofCalculator<TC, HC>>>,
         /// Cache to store computed storage roots for future reuse.
         cached_storage_roots: Arc<DashMap<B256, B256>>,
+        root_work: Option<Rc<RootWorkObserver>>,
     },
     /// The storage root was found in cache.
     FromCache { account: Account, root: B256 },
@@ -78,6 +82,7 @@ pub(crate) enum AsyncAccountDeferredValueEncoder<TC, HC> {
         account: Account,
         /// Cache to store computed storage roots for future reuse.
         cached_storage_roots: Arc<DashMap<B256, B256>>,
+        root_work: Option<Rc<RootWorkObserver>>,
     },
 }
 
@@ -140,6 +145,7 @@ where
                 stats,
                 storage_calculator,
                 cached_storage_roots,
+                root_work,
             } => {
                 let hashed_address = *hashed_address;
                 let account = *account;
@@ -172,6 +178,12 @@ where
                         // to be encoded as part of general trie traversal, so we need to handle
                         // that case here.
                         stats.borrow_mut().dispatched_missing_root_count += 1;
+                        if let Some(observer) = root_work {
+                            observer.observe(
+                                RootWorkKind::AccountMissing,
+                                cached_storage_roots.contains_key(&hashed_address),
+                            );
+                        }
 
                         let mut calculator = storage_calculator.borrow_mut();
                         let root_node = calculator.storage_root_node(hashed_address)?;
@@ -187,9 +199,21 @@ where
                 (account, root)
             }
             Self::FromCache { account, root } => (*account, *root),
-            Self::Sync { storage_calculator, hashed_address, account, cached_storage_roots } => {
+            Self::Sync {
+                storage_calculator,
+                hashed_address,
+                account,
+                cached_storage_roots,
+                root_work,
+            } => {
                 let hashed_address = *hashed_address;
                 let account = *account;
+                if let Some(observer) = root_work {
+                    observer.observe(
+                        RootWorkKind::AccountSync,
+                        cached_storage_roots.contains_key(&hashed_address),
+                    );
+                }
                 let mut calculator = storage_calculator.borrow_mut();
                 let root_node = calculator.storage_root_node(hashed_address)?;
                 let storage_root = calculator
@@ -229,6 +253,7 @@ pub(crate) struct AsyncAccountValueEncoder<TC, HC> {
     storage_calculator: Rc<RefCell<StorageProofCalculator<TC, HC>>>,
     /// Shared stats for tracking wait time and variant counts.
     stats: Rc<RefCell<ValueEncoderStats>>,
+    root_work: Option<Rc<RootWorkObserver>>,
 }
 
 impl<TC, HC> AsyncAccountValueEncoder<TC, HC> {
@@ -243,6 +268,7 @@ impl<TC, HC> AsyncAccountValueEncoder<TC, HC> {
         dispatched: B256Map<CrossbeamReceiver<StorageProofResultMessage>>,
         cached_storage_roots: Arc<DashMap<B256, B256>>,
         storage_calculator: Rc<RefCell<StorageProofCalculator<TC, HC>>>,
+        root_work: Option<Rc<RootWorkObserver>>,
     ) -> Self {
         Self {
             dispatched,
@@ -250,6 +276,7 @@ impl<TC, HC> AsyncAccountValueEncoder<TC, HC> {
             storage_proof_results: Default::default(),
             storage_calculator,
             stats: Default::default(),
+            root_work,
         }
     }
 
@@ -319,6 +346,7 @@ where
                 stats: self.stats.clone(),
                 storage_calculator: self.storage_calculator.clone(),
                 cached_storage_roots: self.cached_storage_roots.clone(),
+                root_work: self.root_work.clone(),
             }
         }
 
@@ -338,6 +366,88 @@ where
             hashed_address,
             account,
             cached_storage_roots: self.cached_storage_roots.clone(),
+            root_work: self.root_work.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{proof_task::StorageProofResult, root_work::RootWorkCounts};
+    use reth_trie::{
+        hashed_cursor::HashedCursorFactory, test_utils::TrieTestHarness,
+        trie_cursor::TrieCursorFactory,
+    };
+
+    #[test]
+    fn root_opportunities_count_delayed_fallbacks_without_reusing_cache() {
+        let harness = TrieTestHarness::new(
+            [(B256::repeat_byte(0x10), alloy_primitives::U256::from(1))].into(),
+        );
+        let trie_factory = harness.trie_cursor_factory();
+        let hashed_factory = harness.hashed_cursor_factory();
+        let calculator = Rc::new(RefCell::new(StorageProofCalculator::new_storage(
+            trie_factory.storage_trie_cursor(B256::ZERO).unwrap(),
+            hashed_factory.hashed_storage_cursor(B256::ZERO).unwrap(),
+        )));
+        let root_node = calculator.borrow_mut().storage_root_node(B256::ZERO).unwrap();
+        let root = calculator.borrow_mut().compute_root_hash(&[root_node]).unwrap().unwrap();
+        let mut expected = Vec::new();
+        Account::default().into_trie_account(root).encode(&mut expected);
+        let cache = Arc::new(DashMap::default());
+        let observer = Rc::new(RootWorkObserver::default());
+        for dispatched in [false, true] {
+            cache.clear();
+            let mut pending = B256Map::default();
+            if dispatched {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                tx.send(StorageProofResultMessage {
+                    hashed_address: B256::ZERO,
+                    result: Ok(StorageProofResult { proof: Vec::new(), root: None }),
+                })
+                .unwrap();
+                pending.insert(B256::ZERO, rx);
+            }
+            let mut encoder = AsyncAccountValueEncoder::new(
+                pending,
+                cache.clone(),
+                calculator.clone(),
+                Some(observer.clone()),
+            );
+            let deferred = encoder.deferred_encoder(B256::ZERO, Account::default());
+            // Simulate a cache fill after the deferred encoder was created. A
+            // bogus root proves the diagnostic still computes the original result.
+            cache.insert(B256::ZERO, B256::repeat_byte(99));
+            let mut actual = Vec::new();
+            deferred.encode(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(*cache.get(&B256::ZERO).unwrap(), root);
+            encoder.finalize().unwrap();
+        }
+        assert_eq!(
+            observer.snapshot(),
+            RootWorkCounts {
+                account_sync_roots: 1,
+                account_sync_cached: 1,
+                account_missing_roots: 1,
+                account_missing_cached: 1,
+                ..Default::default()
+            }
+        );
+        cache.clear();
+        let mut encoder = AsyncAccountValueEncoder::new(
+            Default::default(),
+            cache,
+            calculator,
+            Some(observer.clone()),
+        );
+        drop(encoder.deferred_encoder(B256::ZERO, Account::default()));
+        encoder.finalize().unwrap();
+        assert_eq!(
+            observer.snapshot().account_sync_roots,
+            1,
+            "dropping unused sync work must not count an attempted root computation"
+        );
     }
 }

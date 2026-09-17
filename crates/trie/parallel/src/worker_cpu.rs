@@ -1,5 +1,6 @@
 //! Optional current-thread accounting around a proof worker's synchronous run.
 
+use crate::root_work::RootWorkObserver;
 use reth_metrics::thread::{ThreadResourceUsage, ThreadResourceUsageDelta};
 use std::{
     sync::OnceLock,
@@ -40,9 +41,23 @@ impl WorkerCpuTimer {
         (wall, cpu_nanos(self.cpu.elapsed()))
     }
 
-    pub(crate) fn record(self, parent: &tracing::Span, stage: &'static str, success: bool) {
+    pub(crate) fn record(
+        self,
+        parent: &tracing::Span,
+        stage: &'static str,
+        success: bool,
+        roots: Option<&RootWorkObserver>,
+    ) {
         let (worker_run_ns, worker_thread_cpu_ns) = self.finish();
+        let roots = roots.map(RootWorkObserver::snapshot);
         tracing::info!(target: "lifecycle", parent: parent, stage, worker_run_ns, worker_thread_cpu_ns,
+            root_probes_measured = u64::from(roots.is_some()),
+            storage_partial_roots = roots.map(|r| r.storage_partial_roots),
+            storage_partial_cached = roots.map(|r| r.storage_partial_cached),
+            account_sync_roots = roots.map(|r| r.account_sync_roots),
+            account_sync_cached = roots.map(|r| r.account_sync_cached),
+            account_missing_roots = roots.map(|r| r.account_missing_roots),
+            account_missing_cached = roots.map(|r| r.account_missing_cached),
             worker_cpu_measured = u64::from(worker_thread_cpu_ns.is_some()),
             worker_success = u64::from(success));
     }
