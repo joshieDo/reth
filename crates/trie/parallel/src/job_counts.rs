@@ -48,6 +48,7 @@ impl JobCounts {
 
     /// Account-worker inline calculations are attempts, never storage-pool dequeues.
     /// No target length is inspected when capture is disabled.
+    #[allow(dead_code, reason = "matched observer-only control records zero inline attempts")]
     pub(crate) fn observe_inline(counts: Option<&mut Self>, targets: impl FnOnce() -> usize) {
         let Some(counts) = counts else { return };
         debug_assert_eq!(counts.kind, JobKind::Account);
