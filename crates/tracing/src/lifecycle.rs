@@ -105,6 +105,7 @@ impl Visit for MilestoneStage {
             value,
             "proposal_start" |
                 "payload_built" |
+                "builder_execution_done" |
                 "proposal_ready" |
                 "digest_released" |
                 "body_ready" |
@@ -128,6 +129,8 @@ impl Visit for MilestoneStage {
                 "read_sample" |
                 "execution_cache_readiness" |
                 "proof_dispatch_totals" |
+                "proof_state_at_updates_finished" |
+                "state_root_result_ready" |
                 "execution_totals" |
                 "proof_storage_worker_totals" |
                 "proof_account_worker_totals" |
@@ -735,6 +738,7 @@ impl SafeFields<'_> {
 const STAGES: &[&str] = &[
     "proposal_start",
     "payload_built",
+    "builder_execution_done",
     "proposal_ready",
     "digest_released",
     "body_ready",
@@ -776,6 +780,8 @@ const STAGES: &[&str] = &[
     "read_sample",
     "execution_cache_readiness",
     "proof_dispatch_totals",
+    "proof_state_at_updates_finished",
+    "state_root_result_ready",
     "execution_totals",
     "proof_storage_worker_totals",
     "proof_account_worker_totals",
@@ -824,6 +830,44 @@ fn numeric_field(name: &str) -> bool {
             "read_begin_ns" |
             "read_end_ns" |
             "read_thread" |
+            "success" |
+            "in_flight" |
+            "pending_account_targets" |
+            "pending_storage_targets" |
+            "account_queue_depth" |
+            "storage_queue_depth" |
+            "result_queue_depth" |
+            "prewarm_queue_delay_count" |
+            "prewarm_queue_delay_ns" |
+            "prewarm_queue_delay_max_ns" |
+            "prewarm_queue_delay_lt_10us" |
+            "prewarm_queue_delay_lt_100us" |
+            "prewarm_queue_delay_lt_1ms" |
+            "prewarm_queue_delay_lt_10ms" |
+            "prewarm_queue_delay_ge_10ms" |
+            "prewarm_start_behind" |
+            "prewarm_start_current" |
+            "prewarm_start_ahead_1_16" |
+            "prewarm_start_ahead_17_64" |
+            "prewarm_start_ahead_gt_64" |
+            "prewarm_queued_max" |
+            "prewarm_running_max" |
+            "prewarm_outstanding_max" |
+            "storage_backing_inflight_count" |
+            "storage_backing_inflight_ns" |
+            "storage_backing_inflight_max_ns" |
+            "storage_backing_completed_count" |
+            "storage_backing_completed_ns" |
+            "storage_backing_completed_max_ns" |
+            "storage_backing_never_count" |
+            "storage_backing_never_ns" |
+            "storage_backing_never_max_ns" |
+            "storage_backing_unknown_count" |
+            "storage_backing_unknown_ns" |
+            "storage_backing_unknown_max_ns" |
+            "storage_backing_failed_count" |
+            "storage_backing_failed_ns" |
+            "storage_backing_failed_max_ns" |
             "cache_checkout_reason" |
             "cache_diag_keys_tracked" |
             "cache_diag_key_capacity" |
@@ -1486,7 +1530,34 @@ mod tests {
                     split_force_account_queue_nonempty=1u64,
                     split_force_storage_queue_nonempty=1u64);
                 tracing::info!(target: "lifecycle", parent: &parent, stage="execution_cache_readiness",
-                    cache_checkout_reason=2u64, storage_miss_prewarm_never_observed=0u64);
+                    cache_checkout_reason=2u64, storage_miss_prewarm_never_observed=0u64,
+                    prewarm_queue_delay_count=1u64, prewarm_queue_delay_ns=1u64,
+                    prewarm_queue_delay_max_ns=1u64, prewarm_queue_delay_lt_10us=1u64,
+                    prewarm_queue_delay_lt_100us=1u64, prewarm_queue_delay_lt_1ms=1u64,
+                    prewarm_queue_delay_lt_10ms=1u64, prewarm_queue_delay_ge_10ms=1u64,
+                    prewarm_start_behind=1u64, prewarm_start_current=1u64,
+                    prewarm_start_ahead_1_16=1u64, prewarm_start_ahead_17_64=1u64,
+                    prewarm_start_ahead_gt_64=1u64, prewarm_queued_max=1u64,
+                    prewarm_running_max=1u64, prewarm_outstanding_max=1u64,
+                    storage_backing_inflight_count=1u64, storage_backing_inflight_ns=1u64,
+                    storage_backing_inflight_max_ns=1u64, storage_backing_completed_count=1u64,
+                    storage_backing_completed_ns=1u64, storage_backing_completed_max_ns=1u64,
+                    storage_backing_never_count=1u64, storage_backing_never_ns=1u64,
+                    storage_backing_never_max_ns=1u64, storage_backing_unknown_count=1u64,
+                    storage_backing_unknown_ns=1u64, storage_backing_unknown_max_ns=1u64,
+                    storage_backing_failed_count=1u64, storage_backing_failed_ns=1u64,
+                    storage_backing_failed_max_ns=1u64, private_counter=999u64);
+                tracing::info!(target: "lifecycle", parent: &parent,
+                    stage="builder_execution_done", private_builder="must-not-escape");
+                tracing::info!(target: "lifecycle", parent: &parent,
+                    stage="state_root_result_ready", success=1u64,
+                    private_result=999u64);
+                tracing::info!(target: "lifecycle", parent: &dispatch_parent,
+                    stage="proof_state_at_updates_finished", in_flight=2u64,
+                    pending_targets=3u64, pending_account_targets=1u64,
+                    pending_storage_targets=2u64, account_queue_depth=4u64,
+                    storage_queue_depth=5u64, result_queue_depth=6u64,
+                    private_queue="must-not-escape");
                 // A string cannot pass through a numeric field.
                 tracing::info!(target: "lifecycle", parent: &parent, stage="read_totals",
                     read_ns="must-not-escape");
@@ -1503,10 +1574,14 @@ mod tests {
             let dispatch_owner =
                 rows.iter().find(|row| row["name"] == "sparse_trie_task").unwrap()["id"].clone();
             let events: Vec<_> = rows.iter().filter(|row| row["type"] == "event").collect();
-            assert_eq!(events.len(), 6);
-            assert!(events.iter().enumerate().all(
-                |(index, row)| &row["id"] == if index == 3 { &dispatch_owner } else { &owner }
-            ));
+            assert_eq!(events.len(), 9);
+            assert!(events.iter().all(|row| {
+                let dispatch_event = matches!(
+                    row["fields"]["stage"].as_str(),
+                    Some("proof_dispatch_totals" | "proof_state_at_updates_finished")
+                );
+                &row["id"] == if dispatch_event { &dispatch_owner } else { &owner }
+            }));
             assert_eq!(events[0]["fields"]["read_calls"], 0);
             assert_eq!(events[1]["fields"]["read_thread"], 2);
             assert_eq!(events[2]["fields"]["read_samples_omitted"], 99);
@@ -1514,8 +1589,73 @@ mod tests {
             assert_eq!(events[3]["fields"]["split_when_storage_queue_nonempty"], 1);
             assert_eq!(events[3]["fields"]["split_force_account_queue_nonempty"], 1);
             assert_eq!(events[3]["fields"]["split_force_storage_queue_nonempty"], 1);
-            assert_eq!(events[4]["fields"]["cache_checkout_reason"], 2);
-            assert!(events[5]["fields"].get("read_ns").is_none());
+            let cache = events
+                .iter()
+                .find(|row| row["fields"]["stage"] == "execution_cache_readiness")
+                .unwrap();
+            assert_eq!(cache["fields"]["cache_checkout_reason"], 2);
+            for field in [
+                "prewarm_queue_delay_count",
+                "prewarm_queue_delay_ns",
+                "prewarm_queue_delay_max_ns",
+                "prewarm_queue_delay_lt_10us",
+                "prewarm_queue_delay_lt_100us",
+                "prewarm_queue_delay_lt_1ms",
+                "prewarm_queue_delay_lt_10ms",
+                "prewarm_queue_delay_ge_10ms",
+                "prewarm_start_behind",
+                "prewarm_start_current",
+                "prewarm_start_ahead_1_16",
+                "prewarm_start_ahead_17_64",
+                "prewarm_start_ahead_gt_64",
+                "prewarm_queued_max",
+                "prewarm_running_max",
+                "prewarm_outstanding_max",
+                "storage_backing_inflight_count",
+                "storage_backing_inflight_ns",
+                "storage_backing_inflight_max_ns",
+                "storage_backing_completed_count",
+                "storage_backing_completed_ns",
+                "storage_backing_completed_max_ns",
+                "storage_backing_never_count",
+                "storage_backing_never_ns",
+                "storage_backing_never_max_ns",
+                "storage_backing_unknown_count",
+                "storage_backing_unknown_ns",
+                "storage_backing_unknown_max_ns",
+                "storage_backing_failed_count",
+                "storage_backing_failed_ns",
+                "storage_backing_failed_max_ns",
+            ] {
+                assert_eq!(cache["fields"][field], 1, "missing numeric field {field}");
+            }
+            assert!(cache["fields"].get("private_counter").is_none());
+
+            let builder = events
+                .iter()
+                .find(|row| row["fields"]["stage"] == "builder_execution_done")
+                .unwrap();
+            assert_eq!(builder["id"], owner);
+            let root_ready = events
+                .iter()
+                .find(|row| row["fields"]["stage"] == "state_root_result_ready")
+                .unwrap();
+            assert_eq!(root_ready["fields"]["success"], 1);
+            let updates_finished = events
+                .iter()
+                .find(|row| row["fields"]["stage"] == "proof_state_at_updates_finished")
+                .unwrap();
+            assert_eq!(updates_finished["id"], dispatch_owner);
+            assert_eq!(updates_finished["fields"]["in_flight"], 2);
+            assert_eq!(updates_finished["fields"]["pending_targets"], 3);
+            assert_eq!(updates_finished["fields"]["pending_account_targets"], 1);
+            assert_eq!(updates_finished["fields"]["pending_storage_targets"], 2);
+            assert_eq!(updates_finished["fields"]["account_queue_depth"], 4);
+            assert_eq!(updates_finished["fields"]["storage_queue_depth"], 5);
+            assert_eq!(updates_finished["fields"]["result_queue_depth"], 6);
+            let rejected_numeric =
+                events.iter().rev().find(|row| row["fields"]["stage"] == "read_totals").unwrap();
+            assert!(rejected_numeric["fields"].get("read_ns").is_none());
         }
     }
 

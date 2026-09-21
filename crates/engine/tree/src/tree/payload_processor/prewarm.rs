@@ -187,7 +187,12 @@ where
                     tx_count += 1;
                     let parent_span = Span::current();
                     let cpu_job = observer.dispatch();
+                    let mut readiness_dispatch =
+                        ctx.saved_cache.as_ref().and_then(SavedCache::readiness_prewarm_dispatch);
                     s.spawn(move |_| {
+                        if let Some(dispatch) = readiness_dispatch.as_mut() {
+                            dispatch.start(index, ctx.executed_tx_index.load(Ordering::Relaxed));
+                        }
                         let _enter = trace_span!(
                             target: "engine::tree::payload_processor::prewarm",
                             parent: parent_span,

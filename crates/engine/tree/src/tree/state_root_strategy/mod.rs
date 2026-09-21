@@ -593,7 +593,8 @@ impl DefaultStateRootStrategy {
             let prune_before =
                 sparse_trie_prune_before(pending_sparse_trie_prune_blocks.as_deref(), new_epoch);
 
-            let _enter = crate::tree::task_span::sparse_trie(&parent_span).entered();
+            let task_span = crate::tree::task_span::sparse_trie(&parent_span);
+            let _enter = task_span.enter();
 
             let new_sparse_state_trie = || {
                 debug!(
@@ -627,8 +628,9 @@ impl DefaultStateRootStrategy {
                         }
                         Ok(None) => new_sparse_state_trie(),
                         Err(err) => {
-                            let _ =
-                                state_root_tx.send(Err(StateRootTaskError::Other(err.to_string())));
+                            let result = Err(StateRootTaskError::Other(err.to_string()));
+                            emit_state_root_result_ready(&task_span, false);
+                            let _ = state_root_tx.send(result);
                             return;
                         }
                     }
@@ -670,6 +672,7 @@ impl DefaultStateRootStrategy {
                 None
             };
 
+            emit_state_root_result_ready(&task_span, result.is_ok());
             if state_root_tx.send(result).is_err() {
                 // A continuation task can take the pending trie during the narrow window between
                 // publishing it and detecting the abandoned receiver here. Returning drops the
@@ -727,6 +730,15 @@ impl DefaultStateRootStrategy {
             executor.spawn_drop(deferred);
         });
     }
+}
+
+fn emit_state_root_result_ready(parent: &tracing::Span, success: bool) {
+    tracing::info!(
+        target: "lifecycle",
+        parent: parent,
+        stage = "state_root_result_ready",
+        success = u64::from(success),
+    );
 }
 
 struct SparseTrieTaskOptions<N: NodePrimitives> {
@@ -1300,6 +1312,64 @@ mod tests {
     use reth_testing_utils::generators;
     use reth_trie::test_utils::state_root;
     use revm::state::{AccountInfo, AccountStatus, EvmState, EvmStorageSlot, TransactionId};
+
+    #[test]
+    fn state_root_result_ready_has_explicit_parent_and_numeric_success() {
+        use std::sync::Mutex;
+        use tracing::{
+            field::{Field, Visit},
+            span::{Attributes, Id, Record},
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Option<(u64, u64)>>>);
+
+        struct SuccessVisitor(Option<u64>);
+
+        impl Visit for SuccessVisitor {
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "success" {
+                    self.0 = Some(value);
+                }
+            }
+        }
+
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(17)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() != "lifecycle" {
+                    return
+                }
+                let mut visitor = SuccessVisitor(None);
+                event.record(&mut visitor);
+                if let Some(success) = visitor.0 {
+                    let parent = event.parent().expect("milestone must have an explicit parent");
+                    *self.0.lock().unwrap() = Some((parent.into_u64(), success));
+                }
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let root = tracing::info_span!("root_task");
+            let _entered = root.enter();
+            emit_state_root_result_ready(&root, true);
+        });
+
+        assert_eq!(*capture.0.lock().unwrap(), Some((17, 1)));
+    }
 
     #[test]
     fn sparse_trie_prune_before_uses_requested_range() {

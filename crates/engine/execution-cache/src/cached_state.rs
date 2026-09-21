@@ -29,7 +29,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::{debug_span, info, instrument, trace, warn, Span};
 
@@ -103,6 +103,109 @@ impl MissCounters {
     }
 }
 
+#[derive(Debug, Default)]
+struct LatencyCounters {
+    count: AtomicU64,
+    ns: AtomicU64,
+    max_ns: AtomicU64,
+}
+
+impl LatencyCounters {
+    fn record(&self, elapsed: Duration) {
+        let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Default)]
+struct StorageBackingLatency {
+    // Every actual authoritative backing call is counted, including calls that return an error.
+    inflight: LatencyCounters,
+    completed: LatencyCounters,
+    failed: LatencyCounters,
+    never_observed: LatencyCounters,
+    unknown: LatencyCounters,
+}
+
+impl StorageBackingLatency {
+    fn counters(&self, state: MissPrewarmState) -> &LatencyCounters {
+        match state {
+            MissPrewarmState::Inflight => &self.inflight,
+            MissPrewarmState::Completed => &self.completed,
+            MissPrewarmState::Failed => &self.failed,
+            MissPrewarmState::NeverObserved => &self.never_observed,
+            MissPrewarmState::UnknownDueCap | MissPrewarmState::UnknownContention => &self.unknown,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PrewarmQueueCounters {
+    delay: LatencyCounters,
+    delay_lt_10us: AtomicU64,
+    delay_lt_100us: AtomicU64,
+    delay_lt_1ms: AtomicU64,
+    delay_lt_10ms: AtomicU64,
+    delay_ge_10ms: AtomicU64,
+    start_behind: AtomicU64,
+    start_current: AtomicU64,
+    start_ahead_1_16: AtomicU64,
+    start_ahead_17_64: AtomicU64,
+    start_ahead_gt_64: AtomicU64,
+    queued: AtomicU64,
+    running: AtomicU64,
+    outstanding: AtomicU64,
+    queued_max: AtomicU64,
+    running_max: AtomicU64,
+    outstanding_max: AtomicU64,
+}
+
+impl PrewarmQueueCounters {
+    fn dispatch(&self) {
+        let queued = self.queued.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        self.queued_max.fetch_max(queued, Ordering::Relaxed);
+        let outstanding = self.outstanding.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        self.outstanding_max.fetch_max(outstanding, Ordering::Relaxed);
+    }
+
+    fn start(&self, elapsed: Duration, index: usize, executed_index: usize) {
+        self.delay.record(elapsed);
+        let ns = elapsed.as_nanos();
+        let bucket = if ns < 10_000 {
+            &self.delay_lt_10us
+        } else if ns < 100_000 {
+            &self.delay_lt_100us
+        } else if ns < 1_000_000 {
+            &self.delay_lt_1ms
+        } else if ns < 10_000_000 {
+            &self.delay_lt_10ms
+        } else {
+            &self.delay_ge_10ms
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+
+        let lead = index.saturating_sub(executed_index);
+        let lead_counter = if index < executed_index {
+            &self.start_behind
+        } else if lead == 0 {
+            &self.start_current
+        } else if lead <= 16 {
+            &self.start_ahead_1_16
+        } else if lead <= 64 {
+            &self.start_ahead_17_64
+        } else {
+            &self.start_ahead_gt_64
+        };
+        lead_counter.fetch_add(1, Ordering::Relaxed);
+
+        let running = self.running.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        self.running_max.fetch_max(running, Ordering::Relaxed);
+        self.queued.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Block-local, bounded correlation state for execution-cache and prewarm diagnostics.
 struct ReadinessDiagnostics {
     shards: [PrewarmKeyShard; READINESS_KEY_SHARDS],
@@ -110,6 +213,8 @@ struct ReadinessDiagnostics {
     account_misses: MissCounters,
     storage_misses: MissCounters,
     code_misses: MissCounters,
+    storage_backing_latency: StorageBackingLatency,
+    prewarm_queue: PrewarmQueueCounters,
     lock_contention: AtomicU64,
     prewarm_totals: Arc<ReadTotals>,
     emitted: AtomicBool,
@@ -140,6 +245,8 @@ impl ReadinessDiagnostics {
             account_misses: MissCounters::default(),
             storage_misses: MissCounters::default(),
             code_misses: MissCounters::default(),
+            storage_backing_latency: StorageBackingLatency::default(),
+            prewarm_queue: PrewarmQueueCounters::default(),
             lock_contention: AtomicU64::new(0),
             prewarm_totals: ReadTotals::new(),
             emitted: AtomicBool::new(false),
@@ -181,7 +288,7 @@ impl ReadinessDiagnostics {
         PrewarmReadGuard { state, successful: false }
     }
 
-    fn record_miss(&self, key: ReadinessKey) {
+    fn record_miss(&self, key: ReadinessKey) -> MissPrewarmState {
         let shard = self.shard(key);
         let state = if let Some(keys) = shard.keys.try_lock() {
             let coverage_lost = shard.coverage_lost.load(Ordering::Acquire);
@@ -217,6 +324,25 @@ impl ReadinessDiagnostics {
             ReadinessKey::Account(_) => self.account_misses.record(state),
             ReadinessKey::Storage(..) => self.storage_misses.record(state),
             ReadinessKey::Code(_) => self.code_misses.record(state),
+        }
+        state
+    }
+
+    fn begin_storage_backing_read(
+        self: &Arc<Self>,
+        account: Address,
+        storage_key: StorageKey,
+    ) -> StorageBackingReadGuard {
+        let state = self.record_miss(ReadinessKey::Storage(account, storage_key));
+        StorageBackingReadGuard { diagnostics: Arc::clone(self), state, start: Instant::now() }
+    }
+
+    fn prewarm_dispatch(self: &Arc<Self>) -> PrewarmDispatchGuard {
+        self.prewarm_queue.dispatch();
+        PrewarmDispatchGuard {
+            diagnostics: Arc::clone(self),
+            dispatched: Instant::now(),
+            started: false,
         }
     }
 
@@ -263,6 +389,37 @@ impl ReadinessDiagnostics {
             code_miss_prewarm_never_observed = self.code_misses.never_observed.load(Ordering::Relaxed),
             code_miss_prewarm_unknown_due_cap = self.code_misses.unknown_due_cap.load(Ordering::Relaxed),
             code_miss_prewarm_unknown_contention = self.code_misses.unknown_contention.load(Ordering::Relaxed),
+            storage_backing_inflight_count = self.storage_backing_latency.inflight.count.load(Ordering::Relaxed),
+            storage_backing_inflight_ns = self.storage_backing_latency.inflight.ns.load(Ordering::Relaxed),
+            storage_backing_inflight_max_ns = self.storage_backing_latency.inflight.max_ns.load(Ordering::Relaxed),
+            storage_backing_completed_count = self.storage_backing_latency.completed.count.load(Ordering::Relaxed),
+            storage_backing_completed_ns = self.storage_backing_latency.completed.ns.load(Ordering::Relaxed),
+            storage_backing_completed_max_ns = self.storage_backing_latency.completed.max_ns.load(Ordering::Relaxed),
+            storage_backing_never_count = self.storage_backing_latency.never_observed.count.load(Ordering::Relaxed),
+            storage_backing_never_ns = self.storage_backing_latency.never_observed.ns.load(Ordering::Relaxed),
+            storage_backing_never_max_ns = self.storage_backing_latency.never_observed.max_ns.load(Ordering::Relaxed),
+            storage_backing_unknown_count = self.storage_backing_latency.unknown.count.load(Ordering::Relaxed),
+            storage_backing_unknown_ns = self.storage_backing_latency.unknown.ns.load(Ordering::Relaxed),
+            storage_backing_unknown_max_ns = self.storage_backing_latency.unknown.max_ns.load(Ordering::Relaxed),
+            storage_backing_failed_count = self.storage_backing_latency.failed.count.load(Ordering::Relaxed),
+            storage_backing_failed_ns = self.storage_backing_latency.failed.ns.load(Ordering::Relaxed),
+            storage_backing_failed_max_ns = self.storage_backing_latency.failed.max_ns.load(Ordering::Relaxed),
+            prewarm_queue_delay_count = self.prewarm_queue.delay.count.load(Ordering::Relaxed),
+            prewarm_queue_delay_ns = self.prewarm_queue.delay.ns.load(Ordering::Relaxed),
+            prewarm_queue_delay_max_ns = self.prewarm_queue.delay.max_ns.load(Ordering::Relaxed),
+            prewarm_queue_delay_lt_10us = self.prewarm_queue.delay_lt_10us.load(Ordering::Relaxed),
+            prewarm_queue_delay_lt_100us = self.prewarm_queue.delay_lt_100us.load(Ordering::Relaxed),
+            prewarm_queue_delay_lt_1ms = self.prewarm_queue.delay_lt_1ms.load(Ordering::Relaxed),
+            prewarm_queue_delay_lt_10ms = self.prewarm_queue.delay_lt_10ms.load(Ordering::Relaxed),
+            prewarm_queue_delay_ge_10ms = self.prewarm_queue.delay_ge_10ms.load(Ordering::Relaxed),
+            prewarm_start_behind = self.prewarm_queue.start_behind.load(Ordering::Relaxed),
+            prewarm_start_current = self.prewarm_queue.start_current.load(Ordering::Relaxed),
+            prewarm_start_ahead_1_16 = self.prewarm_queue.start_ahead_1_16.load(Ordering::Relaxed),
+            prewarm_start_ahead_17_64 = self.prewarm_queue.start_ahead_17_64.load(Ordering::Relaxed),
+            prewarm_start_ahead_gt_64 = self.prewarm_queue.start_ahead_gt_64.load(Ordering::Relaxed),
+            prewarm_queued_max = self.prewarm_queue.queued_max.load(Ordering::Relaxed),
+            prewarm_running_max = self.prewarm_queue.running_max.load(Ordering::Relaxed),
+            prewarm_outstanding_max = self.prewarm_queue.outstanding_max.load(Ordering::Relaxed),
         );
         self.prewarm_totals.emit(parent, Role::Prewarm);
     }
@@ -289,6 +446,60 @@ impl Drop for PrewarmReadGuard {
         let _ = state.inflight.fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
             Some(inflight.saturating_sub(1))
         });
+    }
+}
+
+struct StorageBackingReadGuard {
+    diagnostics: Arc<ReadinessDiagnostics>,
+    state: MissPrewarmState,
+    start: Instant,
+}
+
+impl Drop for StorageBackingReadGuard {
+    fn drop(&mut self) {
+        self.diagnostics.storage_backing_latency.counters(self.state).record(self.start.elapsed());
+    }
+}
+
+/// Diagnostics-only lifetime token for a receiver transaction prewarm task.
+///
+/// It retains only the block-local diagnostics allocation. Calling [`Self::start`] records the
+/// scheduler delay and the transaction's lead over the canonical completed-transaction counter.
+pub struct PrewarmDispatchGuard {
+    diagnostics: Arc<ReadinessDiagnostics>,
+    dispatched: Instant,
+    started: bool,
+}
+
+impl fmt::Debug for PrewarmDispatchGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrewarmDispatchGuard").field("started", &self.started).finish()
+    }
+}
+
+impl PrewarmDispatchGuard {
+    /// Marks the task as started before worker-local EVM initialization.
+    pub fn start(&mut self, transaction_index: usize, executed_transaction_index: usize) {
+        if self.started {
+            return
+        }
+        self.started = true;
+        self.diagnostics.prewarm_queue.start(
+            self.dispatched.elapsed(),
+            transaction_index,
+            executed_transaction_index,
+        );
+    }
+}
+
+impl Drop for PrewarmDispatchGuard {
+    fn drop(&mut self) {
+        if self.started {
+            self.diagnostics.prewarm_queue.running.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            self.diagnostics.prewarm_queue.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.diagnostics.prewarm_queue.outstanding.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1209,15 +1420,18 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
                         diagnostics.begin_prewarm(ReadinessKey::Storage(account, storage_key))
                     })
                 });
-                if self.readiness_access == ReadinessAccess::Authoritative {
-                    if let Some(diagnostics) = readiness {
-                        diagnostics.record_miss(ReadinessKey::Storage(account, storage_key));
-                    }
-                }
+                let backing_read = (self.readiness_access == ReadinessAccess::Authoritative)
+                    .then(|| {
+                        readiness.as_ref().map(|diagnostics| {
+                            diagnostics.begin_storage_backing_read(account, storage_key)
+                        })
+                    })
+                    .flatten();
                 let result = self
                     .state_provider
                     .storage(account, storage_key)
                     .map(Option::unwrap_or_default);
+                drop(backing_read);
                 if result.is_ok() {
                     if let Some(prewarm) = prewarm.as_mut() {
                         prewarm.finish_success();
@@ -1239,10 +1453,13 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
             Ok(nonzero_storage_value(value))
         } else {
             self.record_storage_miss();
-            if let Some(diagnostics) = &self.readiness {
-                diagnostics.record_miss(ReadinessKey::Storage(account, storage_key));
-            }
-            self.state_provider.storage(account, storage_key)
+            let backing_read = self
+                .readiness
+                .as_ref()
+                .map(|diagnostics| diagnostics.begin_storage_backing_read(account, storage_key));
+            let result = self.state_provider.storage(account, storage_key);
+            drop(backing_read);
+            result
         }
     }
 }
@@ -1521,6 +1738,11 @@ impl ExecutionCache {
         self.readiness().map(|diagnostics| Arc::clone(&diagnostics.prewarm_totals))
     }
 
+    /// Starts diagnostics for a receiver transaction when it is dispatched to the prewarm pool.
+    fn prewarm_dispatch(&self) -> Option<PrewarmDispatchGuard> {
+        self.readiness().map(|diagnostics| diagnostics.prewarm_dispatch())
+    }
+
     /// Emits the bounded per-checkout cache diagnostics and prewarm read totals.
     pub fn emit_readiness(&self, parent: &Span, checkout_reason: u64) {
         if let Some(diagnostics) = self.readiness() {
@@ -1795,6 +2017,13 @@ impl SavedCache {
         self.caches.prewarm_read_totals()
     }
 
+    /// Starts a diagnostics-only receiver prewarm dispatch token.
+    ///
+    /// The returned token retains only block-local counters, not the execution cache handle.
+    pub fn readiness_prewarm_dispatch(&self) -> Option<PrewarmDispatchGuard> {
+        self.caches.prewarm_dispatch()
+    }
+
     /// Emits this checkout's bounded readiness summary.
     pub fn emit_readiness(&self, parent: &Span) {
         self.caches.emit_readiness(parent, self.checkout_reason.as_u64());
@@ -1987,6 +2216,100 @@ mod tests {
 
         assert_eq!(diagnostics.storage_misses.completed.load(Ordering::Relaxed), 1);
         assert_eq!(diagnostics.storage_misses.never_observed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn readiness_storage_backing_latencies_partition_miss_classifications() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let keys = storage_keys_for_shard(&diagnostics, 0, 5);
+        let ReadinessKey::Storage(account, inflight_key) = keys[0] else { unreachable!() };
+        let inflight = diagnostics.begin_prewarm(keys[0]);
+        drop(diagnostics.begin_storage_backing_read(account, inflight_key));
+        drop(inflight);
+
+        let ReadinessKey::Storage(account, completed_key) = keys[1] else { unreachable!() };
+        let mut completed = diagnostics.begin_prewarm(keys[1]);
+        completed.finish_success();
+        drop(completed);
+        drop(diagnostics.begin_storage_backing_read(account, completed_key));
+
+        let ReadinessKey::Storage(account, failed_key) = keys[2] else { unreachable!() };
+        drop(diagnostics.begin_prewarm(keys[2]));
+        drop(diagnostics.begin_storage_backing_read(account, failed_key));
+
+        let ReadinessKey::Storage(account, never_key) = keys[3] else { unreachable!() };
+        drop(diagnostics.begin_storage_backing_read(account, never_key));
+
+        let ReadinessKey::Storage(account, unknown_key) = keys[4] else { unreachable!() };
+        let shard_lock = diagnostics.shard(keys[4]).keys.lock();
+        drop(diagnostics.begin_storage_backing_read(account, unknown_key));
+        drop(shard_lock);
+
+        let cap_key = storage_keys_for_shard(&diagnostics, 1, 1)[0];
+        diagnostics.shards[1].cap_reached.store(true, Ordering::Release);
+        let ReadinessKey::Storage(account, cap_storage_key) = cap_key else { unreachable!() };
+        drop(diagnostics.begin_storage_backing_read(account, cap_storage_key));
+
+        let latency = &diagnostics.storage_backing_latency;
+        assert_eq!(latency.inflight.count.load(Ordering::Relaxed), 1);
+        assert_eq!(latency.completed.count.load(Ordering::Relaxed), 1);
+        assert_eq!(latency.failed.count.load(Ordering::Relaxed), 1);
+        assert_eq!(latency.never_observed.count.load(Ordering::Relaxed), 1);
+        assert_eq!(latency.unknown.count.load(Ordering::Relaxed), 2);
+
+        let latency_count = [
+            &latency.inflight,
+            &latency.completed,
+            &latency.failed,
+            &latency.never_observed,
+            &latency.unknown,
+        ]
+        .into_iter()
+        .map(|counter| counter.count.load(Ordering::Relaxed))
+        .sum::<u64>();
+        let classified_count = diagnostics.storage_misses.inflight.load(Ordering::Relaxed) +
+            diagnostics.storage_misses.completed.load(Ordering::Relaxed) +
+            diagnostics.storage_misses.failed.load(Ordering::Relaxed) +
+            diagnostics.storage_misses.never_observed.load(Ordering::Relaxed) +
+            diagnostics.storage_misses.unknown_due_cap.load(Ordering::Relaxed) +
+            diagnostics.storage_misses.unknown_contention.load(Ordering::Relaxed);
+        assert_eq!(latency_count, classified_count);
+    }
+
+    #[test]
+    fn readiness_prewarm_queue_counts_delay_lead_and_lifetimes() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let mut first = diagnostics.prewarm_dispatch();
+        let second = diagnostics.prewarm_dispatch();
+        assert_eq!(diagnostics.prewarm_queue.queued.load(Ordering::Relaxed), 2);
+        assert_eq!(diagnostics.prewarm_queue.queued_max.load(Ordering::Relaxed), 2);
+        assert_eq!(diagnostics.prewarm_queue.outstanding_max.load(Ordering::Relaxed), 2);
+        first.start(4, 5);
+        assert_eq!(diagnostics.prewarm_queue.running.load(Ordering::Relaxed), 1);
+        drop(first);
+        drop(second);
+
+        for (index, executed) in [(5, 5), (6, 5), (22, 5), (70, 5)] {
+            let mut dispatch = diagnostics.prewarm_dispatch();
+            dispatch.start(index, executed);
+        }
+
+        let queue = &diagnostics.prewarm_queue;
+        assert_eq!(queue.delay.count.load(Ordering::Relaxed), 5);
+        assert_eq!(queue.start_behind.load(Ordering::Relaxed), 1);
+        assert_eq!(queue.start_current.load(Ordering::Relaxed), 1);
+        assert_eq!(queue.start_ahead_1_16.load(Ordering::Relaxed), 1);
+        assert_eq!(queue.start_ahead_17_64.load(Ordering::Relaxed), 1);
+        assert_eq!(queue.start_ahead_gt_64.load(Ordering::Relaxed), 1);
+        let histogram_count = queue.delay_lt_10us.load(Ordering::Relaxed) +
+            queue.delay_lt_100us.load(Ordering::Relaxed) +
+            queue.delay_lt_1ms.load(Ordering::Relaxed) +
+            queue.delay_lt_10ms.load(Ordering::Relaxed) +
+            queue.delay_ge_10ms.load(Ordering::Relaxed);
+        assert_eq!(histogram_count, queue.delay.count.load(Ordering::Relaxed));
+        assert_eq!(queue.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.running.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.outstanding.load(Ordering::Relaxed), 0);
     }
 
     #[test]

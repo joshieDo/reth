@@ -500,6 +500,16 @@ where
                 None
             }
             SparseTrieTaskMessage::FinishedStateUpdates => {
+                if let Some(diagnostics) = &self.dispatch_diagnostics {
+                    diagnostics.emit_updates_finished_snapshot(
+                        self.in_flight_proof_batches,
+                        self.pending_targets.account_len(),
+                        self.pending_targets.storage_len(),
+                        self.proof_worker_handle.pending_account_tasks(),
+                        self.proof_worker_handle.pending_storage_tasks(),
+                        self.proof_result_rx.len(),
+                    );
+                }
                 let hashed_state = Arc::new(core::mem::take(&mut self.final_hashed_state));
                 let _ = self.final_hashed_state_tx.take().unwrap().send(Arc::clone(&hashed_state));
                 self.finished_state_updates = true;
@@ -1246,6 +1256,29 @@ impl ProofDispatchDiagnostics {
             outstanding_max = self.outstanding_max,
         );
     }
+
+    fn emit_updates_finished_snapshot(
+        &self,
+        in_flight: usize,
+        pending_account_targets: usize,
+        pending_storage_targets: usize,
+        account_queue_depth: usize,
+        storage_queue_depth: usize,
+        result_queue_depth: usize,
+    ) {
+        tracing::info!(
+            target: "lifecycle",
+            parent: &self.parent,
+            stage = "proof_state_at_updates_finished",
+            in_flight = in_flight as u64,
+            pending_targets = pending_account_targets.saturating_add(pending_storage_targets) as u64,
+            pending_account_targets = pending_account_targets as u64,
+            pending_storage_targets = pending_storage_targets as u64,
+            account_queue_depth = account_queue_depth as u64,
+            storage_queue_depth = storage_queue_depth as u64,
+            result_queue_depth = result_queue_depth as u64,
+        );
+    }
 }
 
 const fn split_reason_index(reason: ProofDispatchReason) -> Option<usize> {
@@ -1343,6 +1376,16 @@ impl PendingTargets {
     /// Returns `true` if there are no pending targets.
     const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Returns the number of pending account targets.
+    fn account_len(&self) -> usize {
+        self.targets.account_targets.len()
+    }
+
+    /// Returns the number of pending storage targets.
+    fn storage_len(&self) -> usize {
+        self.targets.storage_targets.values().map(Vec::len).sum()
     }
 
     /// Takes the pending targets, replacing with empty defaults.
@@ -1491,6 +1534,86 @@ mod tests {
             drop(diagnostics);
         });
         assert_eq!(*capture.0.lock().unwrap(), Some((7, 7)));
+    }
+
+    #[test]
+    fn updates_finished_snapshot_has_explicit_parent_and_numeric_state() {
+        use std::{collections::BTreeMap, sync::Mutex};
+        use tracing::{
+            field::{Field, Visit},
+            span::{Attributes, Id, Record},
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Option<(u64, BTreeMap<String, u64>)>>>);
+
+        struct FieldVisitor<'a>(&'a mut BTreeMap<String, u64>);
+
+        impl Visit for FieldVisitor<'_> {
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.insert(field.name().to_string(), value);
+            }
+        }
+
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(11)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() != "lifecycle" {
+                    return
+                }
+                let mut fields = BTreeMap::new();
+                event.record(&mut FieldVisitor(&mut fields));
+                if fields.contains_key("in_flight") {
+                    let parent = event.parent().expect("snapshot must have an explicit parent");
+                    *self.0.lock().unwrap() = Some((parent.into_u64(), fields));
+                }
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let diagnostics = ProofDispatchDiagnostics {
+                parent: tracing::info_span!("root_task"),
+                dispatches: 0,
+                targets: 0,
+                chunks: 0,
+                reason_counts: [0; 4],
+                queue_samples: 0,
+                account_queue_high_water: 0,
+                storage_queue_high_water: 0,
+                account_queue_depth_bins: [0; 4],
+                storage_queue_depth_bins: [0; 4],
+                split_reason_account_queue_nonempty: [0; 3],
+                split_reason_storage_queue_nonempty: [0; 3],
+                split_when_queue_nonempty: 0,
+                split_when_storage_queue_nonempty: 0,
+                outstanding_max: 0,
+            };
+            diagnostics.emit_updates_finished_snapshot(13, 3, 5, 7, 11, 2);
+        });
+
+        let captured = capture.0.lock().unwrap();
+        let (parent, fields) = captured.as_ref().expect("snapshot event");
+        assert_eq!(*parent, 11);
+        assert_eq!(fields["in_flight"], 13);
+        assert_eq!(fields["pending_targets"], 8);
+        assert_eq!(fields["pending_account_targets"], 3);
+        assert_eq!(fields["pending_storage_targets"], 5);
+        assert_eq!(fields["account_queue_depth"], 7);
+        assert_eq!(fields["storage_queue_depth"], 11);
+        assert_eq!(fields["result_queue_depth"], 2);
     }
 
     #[test]
