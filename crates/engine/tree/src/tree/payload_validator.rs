@@ -120,6 +120,7 @@ use alloy_primitives::{
     B256,
 };
 use reth_tasks::LazyHandle;
+use reth_tracing::readiness::{Role as ReadinessRole, Scope as ReadinessScope};
 
 use crate::tree::{
     payload_processor::receipt_root_task::{IndexedReceipt, ReceiptRootTaskHandle},
@@ -722,6 +723,15 @@ where
         // The receipt root task is spawned before execution and receives receipts incrementally
         // as transactions complete, allowing parallel computation during execution.
         let execute_block_start = Instant::now();
+        if reth_tracing::readiness::enabled() {
+            info!(
+                target: "lifecycle",
+                stage = "read_coverage",
+                read_execution_mode = if parallel_bal_execution { 2u64 } else { 1u64 },
+            );
+        }
+        let readiness =
+            (!parallel_bal_execution).then(|| ReadinessScope::enter(ReadinessRole::Execution));
         let execution_result = if parallel_bal_execution {
             self.execute_block_bal(env, &input, &handle, &make_state_provider)
         } else {
@@ -737,6 +747,7 @@ where
                 Err(err) => Err(err.into()),
             }
         };
+        drop(readiness);
         let execution_duration = execute_block_start.elapsed();
         if let (Some(metrics), Some(stats)) = (&state_provider_metrics, &state_provider_stats) {
             metrics.record_totals(stats);

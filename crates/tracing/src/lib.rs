@@ -81,6 +81,8 @@ mod lifecycle;
 #[cfg(feature = "std")]
 pub mod log_handle;
 #[cfg(feature = "std")]
+pub mod readiness;
+#[cfg(feature = "std")]
 mod test_tracer;
 #[cfg(feature = "std")]
 mod throttle;

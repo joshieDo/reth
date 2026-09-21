@@ -15,6 +15,7 @@ use reth_db_api::{
 };
 use reth_libmdbx::{Error as MDBXError, TransactionKind, WriteFlags, RO, RW};
 use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError, DatabaseWriteOperation};
+use reth_tracing::readiness::ReadTimer;
 use std::{borrow::Cow, collections::Bound, marker::PhantomData, ops::RangeBounds};
 
 /// Read only Cursor.
@@ -90,35 +91,43 @@ macro_rules! compress_to_buf_or_ref {
 
 impl<K: TransactionKind, T: Table> DbCursorRO<T> for Cursor<K, T> {
     fn first(&mut self) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.first())
     }
 
     fn seek_exact(&mut self, key: <T as Table>::Key) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.set_key(key.encode().as_ref()))
     }
 
     fn seek(&mut self, key: <T as Table>::Key) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.set_range(key.encode().as_ref()))
     }
 
     fn next(&mut self) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.next())
     }
 
     fn prev(&mut self) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.prev())
     }
 
     fn last(&mut self) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.last())
     }
 
     fn current(&mut self) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.get_current())
     }
 
     fn walk(&mut self, start_key: Option<T::Key>) -> Result<Walker<'_, T, Self>, DatabaseError> {
         let start = if let Some(start_key) = start_key {
+            let _read = ReadTimer::start_database(T::NAME);
             decode::<T>(self.inner.set_range(start_key.encode().as_ref())).transpose()
         } else {
             self.first().transpose()
@@ -131,6 +140,7 @@ impl<K: TransactionKind, T: Table> DbCursorRO<T> for Cursor<K, T> {
         &mut self,
         range: impl RangeBounds<T::Key>,
     ) -> Result<RangeWalker<'_, T, Self>, DatabaseError> {
+        let _read = ReadTimer::start_database(T::NAME);
         let start = match range.start_bound().cloned() {
             Bound::Included(key) => self.inner.set_range(key.encode().as_ref()),
             Bound::Excluded(_key) => {
@@ -147,6 +157,7 @@ impl<K: TransactionKind, T: Table> DbCursorRO<T> for Cursor<K, T> {
         start_key: Option<T::Key>,
     ) -> Result<ReverseWalker<'_, T, Self>, DatabaseError> {
         let start = if let Some(start_key) = start_key {
+            let _read = ReadTimer::start_database(T::NAME);
             decode::<T>(self.inner.set_range(start_key.encode().as_ref()))
         } else {
             self.last()
@@ -160,16 +171,19 @@ impl<K: TransactionKind, T: Table> DbCursorRO<T> for Cursor<K, T> {
 impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
     /// Returns the previous `(key, value)` pair of a DUPSORT table.
     fn prev_dup(&mut self) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.prev_dup())
     }
 
     /// Returns the next `(key, value)` pair of a DUPSORT table.
     fn next_dup(&mut self) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.next_dup())
     }
 
     /// Returns the last `value` of the current duplicate `key`.
     fn last_dup(&mut self) -> ValueOnlyResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         self.inner
             .last_dup()
             .map_err(|e| DatabaseError::Read(e.into()))?
@@ -179,11 +193,13 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
 
     /// Returns the next `(key, value)` pair skipping the duplicates.
     fn next_no_dup(&mut self) -> PairResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         decode::<T>(self.inner.next_nodup())
     }
 
     /// Returns the next `value` of a duplicate `key`.
     fn next_dup_val(&mut self) -> ValueOnlyResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         self.inner
             .next_dup()
             .map_err(|e| DatabaseError::Read(e.into()))?
@@ -196,6 +212,7 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
         key: <T as Table>::Key,
         subkey: <T as DupSort>::SubKey,
     ) -> ValueOnlyResult<T> {
+        let _read = ReadTimer::start_database(T::NAME);
         self.inner
             .get_both_range(key.encode().as_ref(), subkey.encode().as_ref())
             .map_err(|e| DatabaseError::Read(e.into()))?
@@ -216,6 +233,7 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
         let start = match (key, subkey) {
             (Some(key), Some(subkey)) => {
                 let encoded_key = key.encode();
+                let _read = ReadTimer::start_database(T::NAME);
                 self.inner
                     .get_both_range(encoded_key.as_ref(), subkey.encode().as_ref())
                     .map_err(|e| DatabaseError::Read(e.into()))?
@@ -223,6 +241,7 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
             }
             (Some(key), None) => {
                 let encoded_key = key.encode();
+                let _read = ReadTimer::start_database(T::NAME);
                 self.inner
                     .set(encoded_key.as_ref())
                     .map_err(|e| DatabaseError::Read(e.into()))?
@@ -231,6 +250,7 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
             (None, Some(subkey)) => {
                 if let Some((key, _)) = self.first()? {
                     let encoded_key = key.encode();
+                    let _read = ReadTimer::start_database(T::NAME);
                     self.inner
                         .get_both_range(encoded_key.as_ref(), subkey.encode().as_ref())
                         .map_err(|e| DatabaseError::Read(e.into()))?

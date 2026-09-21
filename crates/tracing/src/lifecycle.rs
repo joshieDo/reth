@@ -120,6 +120,12 @@ impl Visit for MilestoneStage {
                 "cancelled" |
                 "load_start" |
                 "load_end" |
+                "read_coverage" |
+                "read_totals" |
+                "read_samples" |
+                "read_sample" |
+                "execution_cache_readiness" |
+                "proof_dispatch_totals" |
                 "execution_totals" |
                 "proof_storage_worker_totals" |
                 "proof_account_worker_totals" |
@@ -415,7 +421,7 @@ impl LifecycleLayer {
             let _ = out.write_all(b"\n");
             let _ = out.flush();
         })?;
-        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(), "prewarm_cpu":if prewarm_cpu { "leaf_v1" } else { "disabled" }, "scheduler":if scheduler_epoch.is_some() { "registered_threads_v1" } else { "disabled" }}));
+        writer.send(json!({"type":"header", "schema":1, "clock":"shared_monotonic_relative_ns", "detail":detail.label(), "prewarm_cpu":if prewarm_cpu { "leaf_v1" } else { "disabled" }, "read_readiness":if crate::readiness::enabled() { "v1" } else { "disabled" }, "scheduler":if scheduler_epoch.is_some() { "registered_threads_v1" } else { "disabled" }}));
         let root_aggregates = Aggregates::default();
         let guard = LifecycleGuard {
             writer: Arc::clone(&writer),
@@ -762,6 +768,12 @@ const STAGES: &[&str] = &[
     "frame_send",
     "frame_receive",
     "durable",
+    "read_coverage",
+    "read_totals",
+    "read_samples",
+    "read_sample",
+    "execution_cache_readiness",
+    "proof_dispatch_totals",
     "execution_totals",
     "proof_storage_worker_totals",
     "proof_account_worker_totals",
@@ -793,7 +805,67 @@ fn numeric_field(name: &str) -> bool {
     let name = canonical_field(name);
     matches!(
         name,
-        "prewarm_role" |
+        "read_execution_mode" |
+            "read_role" |
+            "read_class" |
+            "read_calls" |
+            "read_ns" |
+            "read_max_ns" |
+            "read_lt_10us" |
+            "read_lt_100us" |
+            "read_lt_1ms" |
+            "read_lt_10ms" |
+            "read_ge_10ms" |
+            "read_samples_retained" |
+            "read_samples_omitted" |
+            "read_sample_cap" |
+            "read_begin_ns" |
+            "read_end_ns" |
+            "read_thread" |
+            "cache_checkout_reason" |
+            "cache_diag_keys_tracked" |
+            "cache_diag_key_capacity" |
+            "cache_diag_cap_reached" |
+            "cache_diag_lock_contention" |
+            "dispatches" |
+            "targets" |
+            "chunks" |
+            "reason_unsplit" |
+            "reason_force" |
+            "reason_account_idle" |
+            "reason_storage_idle" |
+            "queue_samples" |
+            "account_queue_high_water" |
+            "storage_queue_high_water" |
+            "account_queue_depth_0" |
+            "account_queue_depth_1_8" |
+            "account_queue_depth_9_32" |
+            "account_queue_depth_33_plus" |
+            "storage_queue_depth_0" |
+            "storage_queue_depth_1_8" |
+            "storage_queue_depth_9_32" |
+            "storage_queue_depth_33_plus" |
+            "split_when_queue_nonempty" |
+            "outstanding_max" |
+            "account_miss_prewarm_inflight" |
+            "account_miss_prewarm_failed" |
+            "account_miss_prewarm_completed" |
+            "account_miss_prewarm_never_observed" |
+            "account_miss_prewarm_unknown_due_cap" |
+            "account_miss_prewarm_unknown_contention" |
+            "storage_miss_prewarm_inflight" |
+            "storage_miss_prewarm_failed" |
+            "storage_miss_prewarm_completed" |
+            "storage_miss_prewarm_never_observed" |
+            "storage_miss_prewarm_unknown_due_cap" |
+            "storage_miss_prewarm_unknown_contention" |
+            "code_miss_prewarm_inflight" |
+            "code_miss_prewarm_failed" |
+            "code_miss_prewarm_completed" |
+            "code_miss_prewarm_never_observed" |
+            "code_miss_prewarm_unknown_due_cap" |
+            "code_miss_prewarm_unknown_contention" |
+            "prewarm_role" |
             "prewarm_mode" |
             "prewarm_leaf" |
             "prewarm_cpu_measured" |
@@ -924,7 +996,7 @@ extern "C" fn reth_lifecycle_thread_register(ordinal: u64, epoch: u64) {
     REGISTRATION_CALLS.with(|calls| calls.set(calls.get() + 1));
 }
 
-fn thread_id(scheduler_epoch: Option<u64>) -> u64 {
+pub(crate) fn thread_id(scheduler_epoch: Option<u64>) -> u64 {
     THREAD.with(|id| {
         if id.get() == 0 {
             id.set(NEXT_THREAD.fetch_add(1, Ordering::Relaxed));
@@ -941,7 +1013,7 @@ fn thread_id(scheduler_epoch: Option<u64>) -> u64 {
     })
 }
 
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
     #[cfg(unix)]
     {
         let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -1305,6 +1377,121 @@ mod tests {
         assert_eq!(rows[9]["written"], 9);
         assert_eq!(rows[9]["dropped"], 0);
         assert_eq!(rows[9]["io_error"], false);
+    }
+
+    #[test]
+    fn readiness_opt_in_records_real_timers() {
+        if std::env::var_os("READINESS_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lifecycle::tests::readiness_opt_in_records_real_timers",
+                    "--nocapture",
+                ])
+                .env("READINESS_TEST_CHILD", "1")
+                .env("TEMPO_READ_READINESS", "1")
+                .env("RETH_LIFECYCLE_FILE", "unused-test-config")
+                .env("RETH_LIFECYCLE_EPOCH_NS", "0")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return
+        }
+        let path = std::env::temp_dir().join(format!("readiness-real-{}.jsonl", monotonic_ns()));
+        let (layer, guard) = LifecycleLayer::start(
+            File::create(&path).unwrap(),
+            [7; 32],
+            0,
+            CaptureDetail::Milestones,
+        )
+        .unwrap();
+        let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+            tracing_subscriber::filter::filter_fn(|meta| {
+                CaptureDetail::Milestones.capture_metadata(meta)
+            }),
+        ));
+        tracing::subscriber::with_default(subscriber, || {
+            let parent = tracing::debug_span!(target: "trie::proof_task", "storage_worker");
+            let _parent = parent.enter();
+            let _scope = crate::readiness::Scope::enter(crate::readiness::Role::StorageProof);
+            let timer = crate::readiness::ReadTimer::start(crate::readiness::ReadClass::DbStorage);
+            assert!(timer.is_some());
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            drop(timer);
+        });
+        drop(guard);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let rows: Vec<Value> =
+            text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows[0]["read_readiness"], "v1");
+        let total = rows.iter().find(|row| row["fields"]["stage"] == "read_totals").unwrap();
+        assert_eq!(total["fields"]["read_class"], 4);
+        assert_eq!(total["fields"]["read_calls"], 1);
+        assert!(total["fields"]["read_ns"].as_u64().unwrap() >= 100_000);
+        let sample = rows.iter().find(|row| row["fields"]["stage"] == "read_sample").unwrap();
+        assert!(
+            sample["fields"]["read_begin_ns"].as_u64().unwrap() <=
+                sample["fields"]["read_end_ns"].as_u64().unwrap()
+        );
+        assert!(
+            sample["fields"]["read_end_ns"].as_u64().unwrap() <= sample["ts"].as_u64().unwrap()
+        );
+        assert_eq!(sample["id"], total["id"]);
+    }
+
+    #[test]
+    fn readiness_events_keep_numeric_fields_and_parent_in_both_details() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            let path =
+                std::env::temp_dir().join(format!("lifecycle-readiness-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                detail,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+                tracing_subscriber::filter::filter_fn(move |meta| detail.capture_metadata(meta)),
+            ));
+            tracing::subscriber::with_default(subscriber, || {
+                let parent = tracing::debug_span!(target: "trie::proof_task", "storage_worker");
+                tracing::info!(target: "lifecycle", parent: &parent, stage="read_totals",
+                    read_role=4u64, read_class=7u64, read_calls=0u64, read_ns=0u64,
+                    read_lt_100us=0u64, address="must-not-escape", native_tid=77777u64);
+                tracing::info!(target: "lifecycle", parent: &parent, stage="read_sample",
+                    read_role=4u64, read_class=7u64, read_begin_ns=10u64, read_end_ns=20u64,
+                    read_thread=2u64, filename="must-not-escape", key="must-not-escape");
+                tracing::info!(target: "lifecycle", parent: &parent, stage="read_samples",
+                    read_samples_retained=1u64, read_samples_omitted=99u64, read_sample_cap=8u64);
+                tracing::info!(target: "lifecycle", parent: &parent, stage="proof_dispatch_totals",
+                    dispatches=2u64, reason_force=1u64, split_when_queue_nonempty=1u64);
+                tracing::info!(target: "lifecycle", parent: &parent, stage="execution_cache_readiness",
+                    cache_checkout_reason=2u64, storage_miss_prewarm_never_observed=0u64);
+                // A string cannot pass through a numeric field.
+                tracing::info!(target: "lifecycle", parent: &parent, stage="read_totals",
+                    read_ns="must-not-escape");
+            });
+            drop(guard);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(!text.contains("must-not-escape"));
+            assert!(!text.contains("native_tid"));
+            let rows: Vec<Value> =
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let owner = rows.iter().find(|row| row["type"] == "start").unwrap()["id"].clone();
+            let events: Vec<_> = rows.iter().filter(|row| row["type"] == "event").collect();
+            assert_eq!(events.len(), 6);
+            assert!(events.iter().all(|row| row["id"] == owner));
+            assert_eq!(events[0]["fields"]["read_calls"], 0);
+            assert_eq!(events[1]["fields"]["read_thread"], 2);
+            assert_eq!(events[2]["fields"]["read_samples_omitted"], 99);
+            assert_eq!(events[3]["fields"]["split_when_queue_nonempty"], 1);
+            assert_eq!(events[4]["fields"]["cache_checkout_reason"], 2);
+            assert!(events[5]["fields"].get("read_ns").is_none());
+        }
     }
 
     #[test]

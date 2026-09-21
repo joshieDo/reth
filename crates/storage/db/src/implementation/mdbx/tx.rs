@@ -300,6 +300,7 @@ impl<K: TransactionKind> DbTx for Tx<K> {
         &self,
         key: &<T::Key as Encode>::Encoded,
     ) -> Result<Option<T::Value>, DatabaseError> {
+        let _read = reth_tracing::readiness::ReadTimer::start_database(T::NAME);
         self.execute_with_operation_metric::<T, _>(Operation::Get, None, |tx| {
             tx.get(self.get_dbi::<T>()?, key.as_ref())
                 .map_err(|e| DatabaseError::Read(e.into()))?
@@ -326,11 +327,13 @@ impl<K: TransactionKind> DbTx for Tx<K> {
 
     // Iterate over read only values in database.
     fn cursor_read<T: Table>(&self) -> Result<Self::Cursor<T>, DatabaseError> {
+        let _read = reth_tracing::readiness::ReadTimer::start_database(T::NAME);
         self.new_cursor()
     }
 
     /// Iterate over read only values in database.
     fn cursor_dup_read<T: DupSort>(&self) -> Result<Self::DupCursor<T>, DatabaseError> {
+        let _read = reth_tracing::readiness::ReadTimer::start_database(T::NAME);
         self.new_cursor()
     }
 

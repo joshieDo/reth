@@ -28,6 +28,31 @@ use reth_primitives_traits::FastInstant as Instant;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, instrument, warn};
 
+/// Why a payload received its execution-cache state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum CacheCheckoutReason {
+    /// No saved cache existed, so a fresh cache was allocated.
+    FreshAbsent = 1,
+    /// A matching saved cache was still held by another block.
+    MatchingInUse = 2,
+    /// A saved cache for another parent was still held by another block.
+    OtherInUse = 3,
+    /// The available saved cache matched the requested parent.
+    ReuseMatching = 4,
+    /// The available saved cache belonged to another parent and was reset.
+    ResetParent = 5,
+    /// State caching was disabled for this block.
+    Disabled = 6,
+}
+
+impl CacheCheckoutReason {
+    /// Numeric value used by the privacy-safe readiness schema.
+    pub const fn as_u64(self) -> u64 {
+        self as u64
+    }
+}
+
 /// A guarded, thread-safe cache of execution state that tracks the most recent block's caches.
 ///
 /// This is the cross-block cache used to accelerate sequential payload processing.
@@ -57,6 +82,12 @@ impl PayloadExecutionCache {
     /// - No other tasks are currently using it (checked via Arc reference count)
     #[instrument(level = "debug", target = "engine::tree::payload_processor", skip(self))]
     pub fn get_cache_for(&self, parent_hash: B256) -> Option<SavedCache> {
+        self.checkout(parent_hash).0
+    }
+
+    /// Checks out cache state together with the reason it was reused or rejected.
+    #[instrument(level = "debug", target = "engine::tree::payload_processor", skip(self))]
+    pub fn checkout(&self, parent_hash: B256) -> (Option<SavedCache>, CacheCheckoutReason) {
         let start = Instant::now();
         let mut cache = self.inner.lock();
 
@@ -92,16 +123,22 @@ impl PayloadExecutionCache {
                     // This prevents the canonical chain from matching on the stale hash
                     // and picking up polluted data if the fork block fails.
                     c.clear_with_hash(parent_hash);
+                    c.begin_readiness_checkout(CacheCheckoutReason::ResetParent);
+                    return (Some(c.clone()), CacheCheckoutReason::ResetParent)
                 }
-                return Some(c.clone())
+                c.begin_readiness_checkout(CacheCheckoutReason::ReuseMatching);
+                return (Some(c.clone()), CacheCheckoutReason::ReuseMatching)
             } else if hash_matches {
                 self.metrics.execution_cache_in_use.increment(1);
+                return (None, CacheCheckoutReason::MatchingInUse)
+            } else {
+                return (None, CacheCheckoutReason::OtherInUse)
             }
         } else {
             debug!(target: "engine::caching", %parent_hash, "No cache found");
         }
 
-        None
+        (None, CacheCheckoutReason::FreshAbsent)
     }
 
     /// Waits until the execution cache becomes available for use.
@@ -238,5 +275,24 @@ mod tests {
     fn empty_cache_returns_none() {
         let cache = PayloadExecutionCache::default();
         assert!(cache.get_cache_for(B256::ZERO).is_none());
+    }
+
+    #[test]
+    fn checkout_reasons_distinguish_absent_reuse_and_contention() {
+        let cache = PayloadExecutionCache::default();
+        let hash = B256::from([9u8; 32]);
+        let (missing, reason) = cache.checkout(hash);
+        assert!(missing.is_none());
+        assert_eq!(reason, CacheCheckoutReason::FreshAbsent);
+
+        cache.update_with_guard(|slot| {
+            *slot = Some(SavedCache::new(hash, ExecutionCache::new(1_000)))
+        });
+        let (first, reason) = cache.checkout(hash);
+        assert_eq!(reason, CacheCheckoutReason::ReuseMatching);
+
+        let (_, reason) = cache.checkout(hash);
+        assert_eq!(reason, CacheCheckoutReason::MatchingInUse);
+        drop(first);
     }
 }

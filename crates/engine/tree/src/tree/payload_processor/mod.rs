@@ -3,8 +3,8 @@
 use super::precompile_cache::PrecompileCacheMap;
 use crate::tree::{
     payload_processor::prewarm::{PrewarmCacheTask, PrewarmContext, PrewarmMode, PrewarmTaskEvent},
-    CachedStateCacheMetrics, CachedStateMetrics, CachedStateMetricsSource, ExecutionCache,
-    ExecutionEnv, PayloadExecutionCache, SavedCache, TreeConfig,
+    CacheCheckoutReason, CachedStateCacheMetrics, CachedStateMetrics, CachedStateMetricsSource,
+    ExecutionCache, ExecutionEnv, PayloadExecutionCache, SavedCache, TreeConfig,
 };
 use alloy_eips::eip1898::BlockWithParent;
 use alloy_primitives::B256;
@@ -39,7 +39,7 @@ use std::{
         mpsc, Arc, OnceLock,
     },
 };
-use tracing::{debug, instrument, trace, warn, Span};
+use tracing::{debug, info, instrument, trace, warn, Span};
 
 pub mod bal;
 pub mod bal_prewarm_pool;
@@ -416,6 +416,13 @@ where
             PrewarmMode::Skipped
         };
         let saved_cache = self.disable_state_cache.not().then(|| self.cache_for(env.parent_hash));
+        if self.disable_state_cache && reth_tracing::readiness::enabled() {
+            info!(
+                target: "lifecycle",
+                stage = "execution_cache_readiness",
+                cache_checkout_reason = CacheCheckoutReason::Disabled.as_u64(),
+            );
+        }
 
         let executed_tx_index = Arc::new(AtomicUsize::new(0));
         // configure prewarming
@@ -459,7 +466,8 @@ where
     /// instance.
     #[instrument(level = "debug", target = "engine::caching", skip(self))]
     pub fn cache_for(&self, parent_hash: B256) -> SavedCache {
-        if let Some(cache) = self.execution_cache.get_cache_for(parent_hash) {
+        let (cache, reason) = self.execution_cache.checkout(parent_hash);
+        if let Some(cache) = cache {
             debug!("reusing execution cache");
             cache
         } else {
@@ -469,7 +477,9 @@ where
             if let Some(metrics) = &self.cache_metrics {
                 metrics.record_cache_creation(start.elapsed());
             }
-            SavedCache::new(parent_hash, cache)
+            let mut saved = SavedCache::new(parent_hash, cache);
+            saved.begin_readiness_checkout(reason);
+            saved
         }
     }
 

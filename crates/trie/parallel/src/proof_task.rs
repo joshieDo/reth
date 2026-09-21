@@ -239,6 +239,8 @@ impl ProofWorkerHandle {
                 let mut job_counts = cpu_timer.as_ref().map(|_| JobCounts::new(JobKind::Storage));
                 #[cfg(not(feature = "metrics"))]
                 let mut job_counts = None;
+                let _readiness =
+                    reth_tracing::readiness::Scope::enter(reth_tracing::readiness::Role::StorageProof);
                 let result = worker.run(job_counts.as_mut());
                 #[cfg(feature = "metrics")]
                 if let Some(timer) = cpu_timer {
@@ -298,6 +300,8 @@ impl ProofWorkerHandle {
                 let mut job_counts = cpu_timer.as_ref().map(|_| JobCounts::new(JobKind::Account));
                 #[cfg(not(feature = "metrics"))]
                 let mut job_counts = None;
+                let _readiness =
+                    reth_tracing::readiness::Scope::enter(reth_tracing::readiness::Role::AccountProof);
                 let result = worker.run(job_counts.as_mut());
                 #[cfg(feature = "metrics")]
                 if let Some(timer) = cpu_timer {

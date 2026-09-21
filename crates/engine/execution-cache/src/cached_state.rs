@@ -1,5 +1,5 @@
 //! Execution cache implementation for block processing.
-use crate::TxPoolPrewarmCacheSnapshot;
+use crate::{CacheCheckoutReason, TxPoolPrewarmCacheSnapshot};
 use alloy_primitives::{
     map::{DefaultHashBuilder, FbBuildHasher},
     Address, StorageKey, StorageValue, B256,
@@ -15,20 +15,232 @@ use reth_provider::{
     StateProvider, StateRootProvider, StorageRootProvider,
 };
 use reth_revm::db::BundleState;
+use reth_tracing::readiness::{ReadClass, ReadTimer, ReadTotals, Role};
 use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use std::{
     cell::Cell,
+    collections::HashMap,
     fmt,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
 };
-use tracing::{debug_span, instrument, trace, warn};
+use tracing::{debug_span, info, instrument, trace, warn, Span};
+
+/// Maximum number of exact state keys retained for prewarm-read correlation per block.
+const READINESS_KEY_CAPACITY: usize = 16_384;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ReadinessKey {
+    Account(Address),
+    Storage(Address, StorageKey),
+    Code(B256),
+}
+
+#[derive(Default)]
+struct PrewarmKeyState {
+    inflight: AtomicUsize,
+    completed: AtomicBool,
+}
+
+#[derive(Default)]
+struct PrewarmKeys {
+    entries: HashMap<ReadinessKey, Arc<PrewarmKeyState>>,
+    cap_reached: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MissPrewarmState {
+    Inflight,
+    /// At least one observed backing-provider read succeeded. This does not assert that its value
+    /// was published to, or remains present in, the cache.
+    Completed,
+    Failed,
+    NeverObserved,
+    UnknownDueCap,
+    UnknownContention,
+}
+
+#[derive(Debug, Default)]
+struct MissCounters {
+    inflight: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    never_observed: AtomicU64,
+    unknown_due_cap: AtomicU64,
+    unknown_contention: AtomicU64,
+}
+
+impl MissCounters {
+    fn record(&self, state: MissPrewarmState) {
+        let counter = match state {
+            MissPrewarmState::Inflight => &self.inflight,
+            MissPrewarmState::Completed => &self.completed,
+            MissPrewarmState::Failed => &self.failed,
+            MissPrewarmState::NeverObserved => &self.never_observed,
+            MissPrewarmState::UnknownDueCap => &self.unknown_due_cap,
+            MissPrewarmState::UnknownContention => &self.unknown_contention,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Block-local, bounded correlation state for execution-cache and prewarm diagnostics.
+struct ReadinessDiagnostics {
+    keys: parking_lot::Mutex<PrewarmKeys>,
+    account_misses: MissCounters,
+    storage_misses: MissCounters,
+    code_misses: MissCounters,
+    lock_contention: AtomicU64,
+    coverage_lost: std::sync::atomic::AtomicBool,
+    prewarm_totals: Arc<ReadTotals>,
+}
+
+impl fmt::Debug for ReadinessDiagnostics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadinessDiagnostics")
+            .field("key_capacity", &READINESS_KEY_CAPACITY)
+            .field("lock_contention", &self.lock_contention.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReadinessDiagnostics {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            keys: parking_lot::Mutex::new(PrewarmKeys {
+                entries: HashMap::with_capacity(READINESS_KEY_CAPACITY),
+                cap_reached: false,
+            }),
+            account_misses: MissCounters::default(),
+            storage_misses: MissCounters::default(),
+            code_misses: MissCounters::default(),
+            lock_contention: AtomicU64::new(0),
+            coverage_lost: std::sync::atomic::AtomicBool::new(false),
+            prewarm_totals: ReadTotals::new(),
+        })
+    }
+
+    fn begin_prewarm(self: &Arc<Self>, key: ReadinessKey) -> PrewarmReadGuard {
+        let Some(mut keys) = self.keys.try_lock() else {
+            self.lock_contention.fetch_add(1, Ordering::Relaxed);
+            self.coverage_lost.store(true, Ordering::Release);
+            return PrewarmReadGuard { state: None, successful: false }
+        };
+        let state = if let Some(state) = keys.entries.get(&key) {
+            let state = Arc::clone(state);
+            let _ = state.inflight.fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
+                Some(inflight.saturating_add(1))
+            });
+            Some(state)
+        } else if keys.entries.len() < READINESS_KEY_CAPACITY {
+            let state = Arc::new(PrewarmKeyState::default());
+            state.inflight.store(1, Ordering::Release);
+            keys.entries.insert(key, Arc::clone(&state));
+            Some(state)
+        } else {
+            keys.cap_reached = true;
+            None
+        };
+        PrewarmReadGuard { state, successful: false }
+    }
+
+    fn record_miss(&self, key: ReadinessKey) {
+        let state = if let Some(keys) = self.keys.try_lock() {
+            let coverage_lost = self.coverage_lost.load(Ordering::Acquire);
+            match keys.entries.get(&key) {
+                Some(key_state) if key_state.inflight.load(Ordering::Acquire) != 0 => {
+                    MissPrewarmState::Inflight
+                }
+                Some(key_state) if key_state.completed.load(Ordering::Acquire) => {
+                    MissPrewarmState::Completed
+                }
+                Some(_) if coverage_lost => MissPrewarmState::UnknownContention,
+                Some(_) => MissPrewarmState::Failed,
+                None if coverage_lost => MissPrewarmState::UnknownContention,
+                None if keys.cap_reached => MissPrewarmState::UnknownDueCap,
+                None => MissPrewarmState::NeverObserved,
+            }
+        } else {
+            self.lock_contention.fetch_add(1, Ordering::Relaxed);
+            MissPrewarmState::UnknownContention
+        };
+        match key {
+            ReadinessKey::Account(_) => self.account_misses.record(state),
+            ReadinessKey::Storage(..) => self.storage_misses.record(state),
+            ReadinessKey::Code(_) => self.code_misses.record(state),
+        }
+    }
+
+    fn emit(&self, parent: &Span, checkout_reason: u64) {
+        let (keys_tracked, cap_reached) = self
+            .keys
+            .try_lock()
+            .map(|keys| (keys.entries.len() as u64, u64::from(keys.cap_reached)))
+            .unwrap_or_else(|| {
+                self.lock_contention.fetch_add(1, Ordering::Relaxed);
+                (0, 1)
+            });
+        info!(
+            target: "lifecycle",
+            parent: parent,
+            stage = "execution_cache_readiness",
+            cache_checkout_reason = checkout_reason,
+            cache_diag_keys_tracked = keys_tracked,
+            cache_diag_key_capacity = READINESS_KEY_CAPACITY as u64,
+            cache_diag_cap_reached = cap_reached,
+            cache_diag_lock_contention = self.lock_contention.load(Ordering::Relaxed),
+            account_miss_prewarm_inflight = self.account_misses.inflight.load(Ordering::Relaxed),
+            account_miss_prewarm_completed = self.account_misses.completed.load(Ordering::Relaxed),
+            account_miss_prewarm_failed = self.account_misses.failed.load(Ordering::Relaxed),
+            account_miss_prewarm_never_observed = self.account_misses.never_observed.load(Ordering::Relaxed),
+            account_miss_prewarm_unknown_due_cap = self.account_misses.unknown_due_cap.load(Ordering::Relaxed),
+            account_miss_prewarm_unknown_contention = self.account_misses.unknown_contention.load(Ordering::Relaxed),
+            storage_miss_prewarm_inflight = self.storage_misses.inflight.load(Ordering::Relaxed),
+            storage_miss_prewarm_completed = self.storage_misses.completed.load(Ordering::Relaxed),
+            storage_miss_prewarm_failed = self.storage_misses.failed.load(Ordering::Relaxed),
+            storage_miss_prewarm_never_observed = self.storage_misses.never_observed.load(Ordering::Relaxed),
+            storage_miss_prewarm_unknown_due_cap = self.storage_misses.unknown_due_cap.load(Ordering::Relaxed),
+            storage_miss_prewarm_unknown_contention = self.storage_misses.unknown_contention.load(Ordering::Relaxed),
+            code_miss_prewarm_inflight = self.code_misses.inflight.load(Ordering::Relaxed),
+            code_miss_prewarm_completed = self.code_misses.completed.load(Ordering::Relaxed),
+            code_miss_prewarm_failed = self.code_misses.failed.load(Ordering::Relaxed),
+            code_miss_prewarm_never_observed = self.code_misses.never_observed.load(Ordering::Relaxed),
+            code_miss_prewarm_unknown_due_cap = self.code_misses.unknown_due_cap.load(Ordering::Relaxed),
+            code_miss_prewarm_unknown_contention = self.code_misses.unknown_contention.load(Ordering::Relaxed),
+        );
+        self.prewarm_totals.emit(parent, Role::Prewarm);
+    }
+}
+
+struct PrewarmReadGuard {
+    state: Option<Arc<PrewarmKeyState>>,
+    successful: bool,
+}
+
+impl PrewarmReadGuard {
+    /// Marks the backing provider read as successfully completed.
+    fn finish_success(&mut self) {
+        self.successful = true;
+    }
+}
+
+impl Drop for PrewarmReadGuard {
+    fn drop(&mut self) {
+        let Some(state) = &self.state else { return };
+        if self.successful {
+            state.completed.store(true, Ordering::Release);
+        }
+        let _ = state.inflight.fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
+            Some(inflight.saturating_sub(1))
+        });
+    }
+}
 
 /// Alignment in bytes for entries in the fixed-cache.
 ///
@@ -119,6 +331,12 @@ pub struct CachedStateProvider<S> {
     /// Whether cache misses should populate the shared execution cache.
     fill_mode: CacheFillMode,
 
+    /// Diagnostic role of reads through this provider.
+    readiness_access: ReadinessAccess,
+
+    /// Immutable handle to this checkout's block-local diagnostics.
+    readiness: Option<Arc<ReadinessDiagnostics>>,
+
     /// Optional cache statistics for detailed block logging. Only tracked when slow block
     /// threshold is configured.
     cache_stats: Option<Arc<CacheStats>>,
@@ -127,7 +345,7 @@ pub struct CachedStateProvider<S> {
 impl<S> CachedStateProvider<S> {
     /// Creates a new [`CachedStateProvider`] from an [`ExecutionCache`], state provider, and
     /// optional [`CachedStateMetrics`].
-    pub const fn new(
+    pub fn new(
         state_provider: S,
         caches: ExecutionCache,
         metrics: Option<CachedStateMetrics>,
@@ -138,19 +356,23 @@ impl<S> CachedStateProvider<S> {
     /// Creates a cache-filling [`CachedStateProvider`].
     ///
     /// Doesn't accept metrics because prewarming path does not need to report hit/misses.
-    pub const fn new_prewarm(state_provider: S, caches: ExecutionCache) -> Self {
-        Self::new_with_mode(state_provider, caches, CacheFillMode::FillOnMiss, None, None)
+    pub fn new_prewarm(state_provider: S, caches: ExecutionCache) -> Self {
+        let mut provider =
+            Self::new_with_mode(state_provider, caches, CacheFillMode::FillOnMiss, None, None);
+        provider.readiness_access = ReadinessAccess::Prewarm;
+        provider
     }
 
     /// Creates a [`CachedStateProvider`] with explicit cache fill behavior and optional
     /// block-local cache stats.
-    pub const fn new_with_mode(
+    pub fn new_with_mode(
         state_provider: S,
         caches: ExecutionCache,
         fill_mode: CacheFillMode,
         metrics: Option<CachedStateMetrics>,
         cache_stats: Option<Arc<CacheStats>>,
     ) -> Self {
+        let readiness = caches.readiness();
         Self {
             state_provider,
             caches,
@@ -159,6 +381,8 @@ impl<S> CachedStateProvider<S> {
             execution_metric_counts: CacheMetricCounts::new(),
             txpool_metric_counts: CacheMetricCounts::new(),
             fill_mode,
+            readiness_access: ReadinessAccess::Authoritative,
+            readiness,
             cache_stats,
         }
     }
@@ -283,6 +507,12 @@ impl<S> CachedStateProvider<S> {
     const fn should_fill_on_miss(&self) -> bool {
         matches!(self.fill_mode, CacheFillMode::FillOnMiss)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessAccess {
+    Authoritative,
+    Prewarm,
 }
 
 impl<S> Drop for CachedStateProvider<S> {
@@ -846,6 +1076,7 @@ impl<K: PartialEq, V> StatsHandler<K, V> for CacheStatsHandler {
 
 impl<S: AccountReader> AccountReader for CachedStateProvider<S> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        let _read_timer = ReadTimer::start(ReadClass::Account);
         if let Some(snapshot) = &self.txpool_snapshot {
             if let Some(account) = snapshot.account(address) {
                 self.record_txpool_account_hit();
@@ -856,7 +1087,23 @@ impl<S: AccountReader> AccountReader for CachedStateProvider<S> {
 
         if self.should_fill_on_miss() {
             match self.caches.get_or_try_insert_account_with(*address, || {
-                self.state_provider.basic_account(address)
+                let readiness = self.readiness.clone();
+                let mut prewarm = readiness.as_ref().and_then(|diagnostics| {
+                    (self.readiness_access == ReadinessAccess::Prewarm)
+                        .then(|| diagnostics.begin_prewarm(ReadinessKey::Account(*address)))
+                });
+                if self.readiness_access == ReadinessAccess::Authoritative {
+                    if let Some(diagnostics) = readiness {
+                        diagnostics.record_miss(ReadinessKey::Account(*address));
+                    }
+                }
+                let result = self.state_provider.basic_account(address);
+                if result.is_ok() {
+                    if let Some(prewarm) = prewarm.as_mut() {
+                        prewarm.finish_success();
+                    }
+                }
+                result
             })? {
                 CachedStatus::NotCached(value) => {
                     self.record_account_miss();
@@ -872,6 +1119,9 @@ impl<S: AccountReader> AccountReader for CachedStateProvider<S> {
             Ok(account)
         } else {
             self.record_account_miss();
+            if let Some(diagnostics) = &self.readiness {
+                diagnostics.record_miss(ReadinessKey::Account(*address));
+            }
             self.state_provider.basic_account(address)
         }
     }
@@ -892,6 +1142,7 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
         account: Address,
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
+        let _read_timer = ReadTimer::start(ReadClass::Storage);
         if let Some(snapshot) = &self.txpool_snapshot {
             if let Some(value) = snapshot.storage(account, storage_key) {
                 self.record_txpool_storage_hit();
@@ -902,7 +1153,27 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
 
         if self.should_fill_on_miss() {
             match self.caches.get_or_try_insert_storage_with(account, storage_key, || {
-                self.state_provider.storage(account, storage_key).map(Option::unwrap_or_default)
+                let readiness = self.readiness.clone();
+                let mut prewarm = readiness.as_ref().and_then(|diagnostics| {
+                    (self.readiness_access == ReadinessAccess::Prewarm).then(|| {
+                        diagnostics.begin_prewarm(ReadinessKey::Storage(account, storage_key))
+                    })
+                });
+                if self.readiness_access == ReadinessAccess::Authoritative {
+                    if let Some(diagnostics) = readiness {
+                        diagnostics.record_miss(ReadinessKey::Storage(account, storage_key));
+                    }
+                }
+                let result = self
+                    .state_provider
+                    .storage(account, storage_key)
+                    .map(Option::unwrap_or_default);
+                if result.is_ok() {
+                    if let Some(prewarm) = prewarm.as_mut() {
+                        prewarm.finish_success();
+                    }
+                }
+                result
             })? {
                 CachedStatus::NotCached(value) => {
                     self.record_storage_miss();
@@ -918,6 +1189,9 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
             Ok(nonzero_storage_value(value))
         } else {
             self.record_storage_miss();
+            if let Some(diagnostics) = &self.readiness {
+                diagnostics.record_miss(ReadinessKey::Storage(account, storage_key));
+            }
             self.state_provider.storage(account, storage_key)
         }
     }
@@ -925,6 +1199,7 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
 
 impl<S: BytecodeReader> BytecodeReader for CachedStateProvider<S> {
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
+        let _read_timer = ReadTimer::start(ReadClass::Code);
         if let Some(snapshot) = &self.txpool_snapshot {
             if let Some(code) = snapshot.bytecode(code_hash) {
                 self.record_txpool_code_hit();
@@ -935,7 +1210,23 @@ impl<S: BytecodeReader> BytecodeReader for CachedStateProvider<S> {
 
         if self.should_fill_on_miss() {
             match self.caches.get_or_try_insert_code_with(*code_hash, || {
-                self.state_provider.bytecode_by_hash(code_hash)
+                let readiness = self.readiness.clone();
+                let mut prewarm = readiness.as_ref().and_then(|diagnostics| {
+                    (self.readiness_access == ReadinessAccess::Prewarm)
+                        .then(|| diagnostics.begin_prewarm(ReadinessKey::Code(*code_hash)))
+                });
+                if self.readiness_access == ReadinessAccess::Authoritative {
+                    if let Some(diagnostics) = readiness {
+                        diagnostics.record_miss(ReadinessKey::Code(*code_hash));
+                    }
+                }
+                let result = self.state_provider.bytecode_by_hash(code_hash);
+                if result.is_ok() {
+                    if let Some(prewarm) = prewarm.as_mut() {
+                        prewarm.finish_success();
+                    }
+                }
+                result
             })? {
                 CachedStatus::NotCached(code) => {
                     self.record_code_miss();
@@ -951,6 +1242,9 @@ impl<S: BytecodeReader> BytecodeReader for CachedStateProvider<S> {
             Ok(code)
         } else {
             self.record_code_miss();
+            if let Some(diagnostics) = &self.readiness {
+                diagnostics.record_miss(ReadinessKey::Code(*code_hash));
+            }
             self.state_provider.bytecode_by_hash(code_hash)
         }
     }
@@ -1103,6 +1397,9 @@ struct ExecutionCacheInner {
 
     /// One-time notification when SELFDESTRUCT is encountered
     selfdestruct_encountered: Once,
+
+    /// Per-checkout readiness diagnostics. Replaced only while the cache is exclusively held.
+    readiness: parking_lot::Mutex<Option<Arc<ReadinessDiagnostics>>>,
 }
 
 impl ExecutionCache {
@@ -1151,7 +1448,34 @@ impl ExecutionCache {
             storage_stats,
             account_stats,
             selfdestruct_encountered: Once::new(),
+            readiness: parking_lot::Mutex::new(None),
         }))
+    }
+
+    /// Starts a fresh diagnostic generation for a cache checkout.
+    pub fn start_readiness(&self) {
+        if reth_tracing::readiness::enabled() {
+            *self.0.readiness.lock() = Some(ReadinessDiagnostics::new());
+        }
+    }
+
+    fn readiness(&self) -> Option<Arc<ReadinessDiagnostics>> {
+        if !reth_tracing::readiness::enabled() {
+            return None
+        }
+        self.0.readiness.try_lock().and_then(|diagnostics| diagnostics.clone())
+    }
+
+    /// Returns the shared prewarm read totals for this checkout.
+    pub fn prewarm_read_totals(&self) -> Option<Arc<ReadTotals>> {
+        self.readiness().map(|diagnostics| Arc::clone(&diagnostics.prewarm_totals))
+    }
+
+    /// Emits the bounded per-checkout cache diagnostics and prewarm read totals.
+    pub fn emit_readiness(&self, parent: &Span, checkout_reason: u64) {
+        if let Some(diagnostics) = self.readiness() {
+            diagnostics.emit(parent, checkout_reason);
+        }
     }
 
     /// Returns the number of active handles to the shared cache.
@@ -1366,12 +1690,31 @@ pub struct SavedCache {
 
     /// The caches used for the provider.
     caches: ExecutionCache,
+
+    /// Checkout reason for this block's diagnostic generation.
+    checkout_reason: CacheCheckoutReason,
 }
 
 impl SavedCache {
     /// Creates a new instance with the internals
     pub const fn new(hash: B256, caches: ExecutionCache) -> Self {
-        Self { hash, caches }
+        Self { hash, caches, checkout_reason: CacheCheckoutReason::FreshAbsent }
+    }
+
+    /// Starts a fresh, block-local readiness generation after an exclusive checkout.
+    pub fn begin_readiness_checkout(&mut self, reason: CacheCheckoutReason) {
+        self.checkout_reason = reason;
+        self.caches.start_readiness();
+    }
+
+    /// Returns the shared prewarm read totals for this checkout.
+    pub fn prewarm_read_totals(&self) -> Option<Arc<ReadTotals>> {
+        self.caches.prewarm_read_totals()
+    }
+
+    /// Emits this checkout's bounded readiness summary.
+    pub fn emit_readiness(&self, parent: &Span) {
+        self.caches.emit_readiness(parent, self.checkout_reason.as_u64());
     }
 
     /// Returns the hash for this cache
@@ -1424,6 +1767,100 @@ mod tests {
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_revm::db::{AccountStatus, BundleAccount};
     use revm::state::AccountInfo;
+
+    #[test]
+    fn readiness_correlates_inflight_and_completed_prewarm_reads() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let key = ReadinessKey::Account(Address::with_last_byte(1));
+        let mut first = diagnostics.begin_prewarm(key);
+        let mut second = diagnostics.begin_prewarm(key);
+
+        diagnostics.record_miss(key);
+        assert_eq!(diagnostics.account_misses.inflight.load(Ordering::Relaxed), 1);
+
+        first.finish_success();
+        drop(first);
+        diagnostics.record_miss(key);
+        assert_eq!(diagnostics.account_misses.inflight.load(Ordering::Relaxed), 2);
+
+        second.finish_success();
+        drop(second);
+        diagnostics.record_miss(key);
+        assert_eq!(diagnostics.account_misses.completed.load(Ordering::Relaxed), 1);
+
+        let failed = ReadinessKey::Account(Address::with_last_byte(2));
+        drop(diagnostics.begin_prewarm(failed));
+        diagnostics.record_miss(failed);
+        assert_eq!(diagnostics.account_misses.failed.load(Ordering::Relaxed), 1);
+
+        diagnostics.record_miss(ReadinessKey::Account(Address::with_last_byte(3)));
+        assert_eq!(diagnostics.account_misses.never_observed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn readiness_key_capacity_reports_unknown_without_exporting_keys() {
+        let diagnostics = ReadinessDiagnostics::new();
+        for slot in 0..READINESS_KEY_CAPACITY {
+            drop(
+                diagnostics
+                    .begin_prewarm(ReadinessKey::Storage(Address::ZERO, U256::from(slot).into())),
+            );
+        }
+
+        let overflow = ReadinessKey::Storage(Address::with_last_byte(1), U256::MAX.into());
+        drop(diagnostics.begin_prewarm(overflow));
+        diagnostics.record_miss(overflow);
+
+        assert_eq!(diagnostics.keys.lock().entries.len(), READINESS_KEY_CAPACITY);
+        assert_eq!(diagnostics.storage_misses.unknown_due_cap.load(Ordering::Relaxed), 1);
+        let rendered = format!("{diagnostics:?}");
+        assert!(!rendered.contains(&format!("{:?}", U256::MAX)));
+    }
+
+    #[test]
+    fn readiness_contention_invalidates_correlation_conservatively() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let keys = diagnostics.keys.lock();
+        drop(diagnostics.begin_prewarm(ReadinessKey::Account(Address::with_last_byte(3))));
+        drop(keys);
+
+        diagnostics.record_miss(ReadinessKey::Account(Address::with_last_byte(4)));
+        assert_eq!(diagnostics.account_misses.unknown_contention.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn readiness_lost_begin_preserves_known_completed_key() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let completed = ReadinessKey::Account(Address::with_last_byte(1));
+        let mut completed_guard = diagnostics.begin_prewarm(completed);
+        completed_guard.finish_success();
+        drop(completed_guard);
+
+        let keys = diagnostics.keys.lock();
+        drop(diagnostics.begin_prewarm(ReadinessKey::Account(Address::with_last_byte(2))));
+        drop(keys);
+
+        diagnostics.record_miss(completed);
+        diagnostics.record_miss(ReadinessKey::Account(Address::with_last_byte(3)));
+        assert_eq!(diagnostics.account_misses.completed.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.account_misses.unknown_contention.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn readiness_guard_completes_while_key_map_is_locked() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let key = ReadinessKey::Account(Address::with_last_byte(1));
+        let mut guard = diagnostics.begin_prewarm(key);
+        let keys = diagnostics.keys.lock();
+        let state = Arc::clone(keys.entries.get(&key).expect("tracked key"));
+
+        guard.finish_success();
+        drop(guard);
+
+        assert_eq!(state.inflight.load(Ordering::Acquire), 0);
+        assert!(state.completed.load(Ordering::Acquire));
+        drop(keys);
+    }
 
     #[test]
     fn test_empty_storage_cached_state_provider() {

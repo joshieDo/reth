@@ -21,6 +21,7 @@ reth-metrics = { workspace = true, features = ["common"] }
 reth-primitives-traits = { workspace = true, features = ["std"] }
 reth-provider.workspace = true
 reth-revm.workspace = true
+reth-tracing.workspace = true
 reth-trie.workspace = true
 tracing.workspace = true
 

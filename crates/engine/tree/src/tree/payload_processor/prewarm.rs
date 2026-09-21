@@ -41,6 +41,7 @@ use reth_tasks::{
     },
     Runtime,
 };
+use reth_tracing::readiness::{Role, Scope};
 use reth_trie_common::MultiProofTargetsV2;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -232,6 +233,11 @@ where
         Tx: ExecutableTxFor<Evm>,
     {
         let mut cpu = cpu_job.start();
+        let _readiness = ctx
+            .saved_cache
+            .as_ref()
+            .and_then(SavedCache::prewarm_read_totals)
+            .map(|totals| Scope::enter_shared(Role::Prewarm, totals));
         WorkerPool::with_worker_mut(|worker| {
             let Some(evm) =
                 worker.get_or_init::<PrewarmEvmState<Evm>>(|| ctx.evm_for_ctx()).as_mut()
@@ -564,6 +570,10 @@ where
         }
 
         debug!(target: "engine::tree::payload_processor::prewarm", "Completed prewarm execution");
+
+        if let Some(saved_cache) = &self.ctx.saved_cache {
+            saved_cache.emit_readiness(&self.parent_span);
+        }
 
         // save caches and finish using the shared ExecutionOutcome
         if let Some(Some((execution_outcome, valid_block_rx))) = final_execution_outcome {

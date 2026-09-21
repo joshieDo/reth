@@ -110,6 +110,8 @@ pub(super) struct SparseTrieCacheTask<A = ArenaParallelSparseTrie, S = ArenaPara
     pending_targets: PendingTargets,
     /// Proof batches dispatched to workers and not yet received.
     in_flight_proof_batches: usize,
+    /// Capture-only aggregate proof dispatch diagnostics.
+    dispatch_diagnostics: Option<ProofDispatchDiagnostics>,
     /// Number of pending execution/prewarming updates received but not yet passed to
     /// `update_leaves`.
     pending_updates: usize,
@@ -183,6 +185,7 @@ where
             storage_cache_misses: 0,
             pending_targets: Default::default(),
             in_flight_proof_batches: 0,
+            dispatch_diagnostics: ProofDispatchDiagnostics::new(),
             pending_updates: Default::default(),
             initial_updates_applied: false,
             final_hashed_state: Default::default(),
@@ -894,14 +897,33 @@ where
 
         let _span = trace_span!("dispatch_pending_targets").entered();
         let (targets, chunking_length) = self.pending_targets.take();
+        let has_multiple_idle_account_workers =
+            self.proof_worker_handle.has_multiple_idle_account_workers();
+        let has_multiple_idle_storage_workers =
+            self.proof_worker_handle.has_multiple_idle_storage_workers();
+        let dispatch_sample = self.dispatch_diagnostics.as_ref().map(|_| {
+            (
+                classify_dispatch(
+                    chunking_length,
+                    self.chunk_size,
+                    self.max_targets_for_chunking,
+                    has_multiple_idle_account_workers,
+                    has_multiple_idle_storage_workers,
+                ),
+                self.proof_worker_handle.pending_account_tasks(),
+                self.proof_worker_handle.pending_storage_tasks(),
+            )
+        });
+        let diagnostics_enabled = dispatch_sample.is_some();
+        let mut chunks_dispatched = 0usize;
         let mut dispatch_error = None;
         dispatch_with_chunking(
             targets,
             chunking_length,
             self.chunk_size,
             self.max_targets_for_chunking,
-            self.proof_worker_handle.has_multiple_idle_account_workers(),
-            self.proof_worker_handle.has_multiple_idle_storage_workers(),
+            has_multiple_idle_account_workers,
+            has_multiple_idle_storage_workers,
             MultiProofTargetsV2::chunks,
             |proof_targets| {
                 if dispatch_error.is_some() {
@@ -917,6 +939,9 @@ where
                     ),
                 }) {
                     Ok(()) => {
+                        if diagnostics_enabled {
+                            chunks_dispatched += 1;
+                        }
                         self.in_flight_proof_batches += 1;
                     }
                     Err(e) => {
@@ -926,6 +951,25 @@ where
                 }
             },
         );
+
+        if let Some((decision, account_queue_depth, storage_queue_depth)) = dispatch_sample {
+            let account_queue_high_water = self.proof_worker_handle.pending_account_tasks();
+            let storage_queue_high_water = self.proof_worker_handle.pending_storage_tasks();
+            let diagnostics = self
+                .dispatch_diagnostics
+                .as_mut()
+                .expect("dispatch sample requires enabled diagnostics");
+            diagnostics.record_dispatch(
+                decision,
+                chunking_length,
+                chunks_dispatched,
+                account_queue_depth,
+                storage_queue_depth,
+                account_queue_high_water,
+                storage_queue_high_water,
+                self.in_flight_proof_batches,
+            );
+        }
 
         if let Some(error) = dispatch_error {
             return Err(error)
@@ -1051,6 +1095,151 @@ const DEFAULT_MAX_TARGETS_FOR_CHUNKING: usize = 300;
 /// Start proof fetching while the first state-update batch is still arriving.
 const INITIAL_UPDATE_BATCH_SIZE: usize = 64;
 
+/// Why a pending target set was split, or why it remained a single batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ProofDispatchReason {
+    Unsplit = 0,
+    Force = 1,
+    AccountIdle = 2,
+    StorageIdle = 3,
+}
+
+fn classify_dispatch(
+    chunking_len: usize,
+    chunk_size: usize,
+    max_targets_for_chunking: usize,
+    has_multiple_idle_account_workers: bool,
+    has_multiple_idle_storage_workers: bool,
+) -> ProofDispatchReason {
+    if chunking_len <= chunk_size {
+        return ProofDispatchReason::Unsplit
+    }
+    if chunking_len > max_targets_for_chunking {
+        return ProofDispatchReason::Force
+    }
+
+    let has_full_chunks = chunking_len >= chunk_size.saturating_mul(2);
+    if has_full_chunks && has_multiple_idle_account_workers {
+        ProofDispatchReason::AccountIdle
+    } else if has_full_chunks && has_multiple_idle_storage_workers {
+        ProofDispatchReason::StorageIdle
+    } else {
+        ProofDispatchReason::Unsplit
+    }
+}
+
+/// Per-root, identity-free proof admission diagnostics.
+struct ProofDispatchDiagnostics {
+    parent: tracing::Span,
+    dispatches: u64,
+    targets: u64,
+    chunks: u64,
+    reason_counts: [u64; 4],
+    queue_samples: u64,
+    account_queue_high_water: u64,
+    storage_queue_high_water: u64,
+    account_queue_depth_bins: [u64; 4],
+    storage_queue_depth_bins: [u64; 4],
+    split_when_queue_nonempty: u64,
+    outstanding_max: u64,
+}
+
+impl ProofDispatchDiagnostics {
+    fn new() -> Option<Self> {
+        reth_tracing::readiness::enabled().then(|| Self {
+            parent: tracing::Span::current(),
+            dispatches: 0,
+            targets: 0,
+            chunks: 0,
+            reason_counts: [0; 4],
+            queue_samples: 0,
+            account_queue_high_water: 0,
+            storage_queue_high_water: 0,
+            account_queue_depth_bins: [0; 4],
+            storage_queue_depth_bins: [0; 4],
+            split_when_queue_nonempty: 0,
+            outstanding_max: 0,
+        })
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn record_dispatch(
+        &mut self,
+        reason: ProofDispatchReason,
+        targets: usize,
+        chunks: usize,
+        account_queue_depth: usize,
+        storage_queue_depth: usize,
+        account_queue_high_water: usize,
+        storage_queue_high_water: usize,
+        outstanding: usize,
+    ) {
+        self.dispatches = self.dispatches.saturating_add(1);
+        self.targets = self.targets.saturating_add(targets as u64);
+        self.chunks = self.chunks.saturating_add(chunks as u64);
+        self.reason_counts[reason as usize] = self.reason_counts[reason as usize].saturating_add(1);
+        self.queue_samples = self.queue_samples.saturating_add(1);
+        self.account_queue_high_water = self
+            .account_queue_high_water
+            .max(account_queue_depth.max(account_queue_high_water) as u64);
+        self.storage_queue_high_water = self
+            .storage_queue_high_water
+            .max(storage_queue_depth.max(storage_queue_high_water) as u64);
+        self.account_queue_depth_bins[queue_depth_bin(account_queue_depth)] =
+            self.account_queue_depth_bins[queue_depth_bin(account_queue_depth)].saturating_add(1);
+        self.storage_queue_depth_bins[queue_depth_bin(storage_queue_depth)] =
+            self.storage_queue_depth_bins[queue_depth_bin(storage_queue_depth)].saturating_add(1);
+        if reason != ProofDispatchReason::Unsplit && account_queue_depth > 0 {
+            self.split_when_queue_nonempty = self.split_when_queue_nonempty.saturating_add(1);
+        }
+        self.outstanding_max = self.outstanding_max.max(outstanding as u64);
+    }
+
+    fn emit(&self) {
+        tracing::info!(
+            target: "lifecycle",
+            parent: &self.parent,
+            stage = "proof_dispatch_totals",
+            dispatches = self.dispatches,
+            targets = self.targets,
+            chunks = self.chunks,
+            reason_unsplit = self.reason_counts[ProofDispatchReason::Unsplit as usize],
+            reason_force = self.reason_counts[ProofDispatchReason::Force as usize],
+            reason_account_idle = self.reason_counts[ProofDispatchReason::AccountIdle as usize],
+            reason_storage_idle = self.reason_counts[ProofDispatchReason::StorageIdle as usize],
+            queue_samples = self.queue_samples,
+            account_queue_high_water = self.account_queue_high_water,
+            storage_queue_high_water = self.storage_queue_high_water,
+            account_queue_depth_0 = self.account_queue_depth_bins[0],
+            account_queue_depth_1_8 = self.account_queue_depth_bins[1],
+            account_queue_depth_9_32 = self.account_queue_depth_bins[2],
+            account_queue_depth_33_plus = self.account_queue_depth_bins[3],
+            storage_queue_depth_0 = self.storage_queue_depth_bins[0],
+            storage_queue_depth_1_8 = self.storage_queue_depth_bins[1],
+            storage_queue_depth_9_32 = self.storage_queue_depth_bins[2],
+            storage_queue_depth_33_plus = self.storage_queue_depth_bins[3],
+            split_when_queue_nonempty = self.split_when_queue_nonempty,
+            outstanding_max = self.outstanding_max,
+        );
+    }
+}
+
+impl Drop for ProofDispatchDiagnostics {
+    fn drop(&mut self) {
+        self.emit();
+    }
+}
+
+const fn queue_depth_bin(depth: usize) -> usize {
+    match depth {
+        0 => 0,
+        1..=8 => 1,
+        9..=32 => 2,
+        _ => 3,
+    }
+}
+
 /// Dispatches work items as a single unit or in chunks based on target size and worker
 /// availability.
 #[expect(clippy::too_many_arguments)]
@@ -1066,10 +1255,13 @@ fn dispatch_with_chunking<T, I>(
 ) where
     I: IntoIterator<Item = T>,
 {
-    let has_full_chunks = chunking_len >= chunk_size.saturating_mul(2);
-    let should_chunk = chunking_len > max_targets_for_chunking ||
-        (has_full_chunks &&
-            (has_multiple_idle_account_workers || has_multiple_idle_storage_workers));
+    let should_chunk = classify_dispatch(
+        chunking_len,
+        chunk_size,
+        max_targets_for_chunking,
+        has_multiple_idle_account_workers,
+        has_multiple_idle_storage_workers,
+    ) != ProofDispatchReason::Unsplit;
 
     if should_chunk && chunking_len > chunk_size {
         for chunk in chunker(items, chunk_size) {
@@ -1163,6 +1355,99 @@ mod tests {
         for task_name in ["trie-hashing", "storage-workers", "account-workers"] {
             runtime.spawn_blocking_named(task_name, || {}).get();
         }
+    }
+
+    #[test]
+    fn proof_dispatch_reason_classifies_without_changing_chunk_thresholds() {
+        assert_eq!(classify_dispatch(5, 5, 300, true, true), ProofDispatchReason::Unsplit);
+        assert_eq!(classify_dispatch(301, 5, 300, false, false), ProofDispatchReason::Force);
+        assert_eq!(classify_dispatch(10, 5, 300, true, true), ProofDispatchReason::AccountIdle);
+        assert_eq!(classify_dispatch(10, 5, 300, false, true), ProofDispatchReason::StorageIdle);
+        assert_eq!(classify_dispatch(9, 5, 300, true, true), ProofDispatchReason::Unsplit);
+    }
+
+    #[test]
+    fn proof_dispatch_diagnostics_aggregate_queue_depths() {
+        let mut diagnostics = ProofDispatchDiagnostics {
+            parent: tracing::Span::none(),
+            dispatches: 0,
+            targets: 0,
+            chunks: 0,
+            reason_counts: [0; 4],
+            queue_samples: 0,
+            account_queue_high_water: 0,
+            storage_queue_high_water: 0,
+            account_queue_depth_bins: [0; 4],
+            storage_queue_depth_bins: [0; 4],
+            split_when_queue_nonempty: 0,
+            outstanding_max: 0,
+        };
+
+        diagnostics.record_dispatch(ProofDispatchReason::Unsplit, 3, 1, 0, 8, 1, 8, 1);
+        diagnostics.record_dispatch(ProofDispatchReason::Force, 301, 61, 33, 9, 92, 10, 62);
+
+        assert_eq!(diagnostics.dispatches, 2);
+        assert_eq!(diagnostics.targets, 304);
+        assert_eq!(diagnostics.chunks, 62);
+        assert_eq!(diagnostics.reason_counts, [1, 1, 0, 0]);
+        assert_eq!(diagnostics.account_queue_depth_bins, [1, 0, 0, 1]);
+        assert_eq!(diagnostics.storage_queue_depth_bins, [0, 1, 1, 0]);
+        assert_eq!(diagnostics.account_queue_high_water, 92);
+        assert_eq!(diagnostics.storage_queue_high_water, 10);
+        assert_eq!(diagnostics.split_when_queue_nonempty, 1);
+        assert_eq!(diagnostics.outstanding_max, 62);
+    }
+
+    #[test]
+    fn proof_dispatch_summary_has_explicit_root_parent() {
+        use std::sync::Mutex;
+        use tracing::{
+            span::{Attributes, Id, Record},
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Option<(u64, u64)>>>);
+
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(7)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if event.metadata().target() == "lifecycle" {
+                    let parent = event.parent().expect("summary must have an explicit parent");
+                    *self.0.lock().unwrap() = Some((7, parent.into_u64()));
+                }
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let root = tracing::info_span!("root_task");
+            let diagnostics = ProofDispatchDiagnostics {
+                parent: root,
+                dispatches: 0,
+                targets: 0,
+                chunks: 0,
+                reason_counts: [0; 4],
+                queue_samples: 0,
+                account_queue_high_water: 0,
+                storage_queue_high_water: 0,
+                account_queue_depth_bins: [0; 4],
+                storage_queue_depth_bins: [0; 4],
+                split_when_queue_nonempty: 0,
+                outstanding_max: 0,
+            };
+            drop(diagnostics);
+        });
+        assert_eq!(*capture.0.lock().unwrap(), Some((7, 7)));
     }
 
     #[test]
