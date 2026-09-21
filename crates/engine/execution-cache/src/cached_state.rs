@@ -24,6 +24,7 @@ use std::{
     cell::Cell,
     collections::HashMap,
     fmt,
+    hash::BuildHasher,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -32,8 +33,13 @@ use std::{
 };
 use tracing::{debug_span, info, instrument, trace, warn, Span};
 
+/// Number of independently locked shards used for prewarm-read correlation.
+const READINESS_KEY_SHARDS: usize = 64;
+/// Maximum exact keys retained in each shard. Shard-local limits keep the hot path bounded and
+/// non-blocking; skew can make the usable capacity lower than the total advertised bound.
+const READINESS_KEYS_PER_SHARD: usize = 1_024;
 /// Maximum number of exact state keys retained for prewarm-read correlation per block.
-const READINESS_KEY_CAPACITY: usize = 16_384;
+const READINESS_KEY_CAPACITY: usize = READINESS_KEY_SHARDS * READINESS_KEYS_PER_SHARD;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ReadinessKey {
@@ -51,7 +57,14 @@ struct PrewarmKeyState {
 #[derive(Default)]
 struct PrewarmKeys {
     entries: HashMap<ReadinessKey, Arc<PrewarmKeyState>>,
-    cap_reached: bool,
+}
+
+struct PrewarmKeyShard {
+    keys: parking_lot::Mutex<PrewarmKeys>,
+    /// A failed begin means this shard can no longer prove that an absent or failed entry was
+    /// never concurrently observed. Other shards remain independently classifiable.
+    coverage_lost: AtomicBool,
+    cap_reached: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,12 +105,12 @@ impl MissCounters {
 
 /// Block-local, bounded correlation state for execution-cache and prewarm diagnostics.
 struct ReadinessDiagnostics {
-    keys: parking_lot::Mutex<PrewarmKeys>,
+    shards: [PrewarmKeyShard; READINESS_KEY_SHARDS],
+    shard_hasher: DefaultHashBuilder,
     account_misses: MissCounters,
     storage_misses: MissCounters,
     code_misses: MissCounters,
     lock_contention: AtomicU64,
-    coverage_lost: std::sync::atomic::AtomicBool,
     prewarm_totals: Arc<ReadTotals>,
 }
 
@@ -113,23 +126,35 @@ impl fmt::Debug for ReadinessDiagnostics {
 impl ReadinessDiagnostics {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            keys: parking_lot::Mutex::new(PrewarmKeys {
-                entries: HashMap::with_capacity(READINESS_KEY_CAPACITY),
-                cap_reached: false,
+            shards: std::array::from_fn(|_| PrewarmKeyShard {
+                keys: parking_lot::Mutex::new(PrewarmKeys {
+                    entries: HashMap::with_capacity(READINESS_KEYS_PER_SHARD),
+                }),
+                coverage_lost: AtomicBool::new(false),
+                cap_reached: AtomicBool::new(false),
             }),
+            shard_hasher: DefaultHashBuilder::default(),
             account_misses: MissCounters::default(),
             storage_misses: MissCounters::default(),
             code_misses: MissCounters::default(),
             lock_contention: AtomicU64::new(0),
-            coverage_lost: std::sync::atomic::AtomicBool::new(false),
             prewarm_totals: ReadTotals::new(),
         })
     }
 
+    fn shard_index(&self, key: ReadinessKey) -> usize {
+        self.shard_hasher.hash_one(key) as usize % READINESS_KEY_SHARDS
+    }
+
+    fn shard(&self, key: ReadinessKey) -> &PrewarmKeyShard {
+        &self.shards[self.shard_index(key)]
+    }
+
     fn begin_prewarm(self: &Arc<Self>, key: ReadinessKey) -> PrewarmReadGuard {
-        let Some(mut keys) = self.keys.try_lock() else {
+        let shard = self.shard(key);
+        let Some(mut keys) = shard.keys.try_lock() else {
             self.lock_contention.fetch_add(1, Ordering::Relaxed);
-            self.coverage_lost.store(true, Ordering::Release);
+            shard.coverage_lost.store(true, Ordering::Release);
             return PrewarmReadGuard { state: None, successful: false }
         };
         let state = if let Some(state) = keys.entries.get(&key) {
@@ -138,32 +163,44 @@ impl ReadinessDiagnostics {
                 Some(inflight.saturating_add(1))
             });
             Some(state)
-        } else if keys.entries.len() < READINESS_KEY_CAPACITY {
+        } else if keys.entries.len() < READINESS_KEYS_PER_SHARD {
             let state = Arc::new(PrewarmKeyState::default());
             state.inflight.store(1, Ordering::Release);
             keys.entries.insert(key, Arc::clone(&state));
             Some(state)
         } else {
-            keys.cap_reached = true;
+            shard.cap_reached.store(true, Ordering::Release);
             None
         };
         PrewarmReadGuard { state, successful: false }
     }
 
     fn record_miss(&self, key: ReadinessKey) {
-        let state = if let Some(keys) = self.keys.try_lock() {
-            let coverage_lost = self.coverage_lost.load(Ordering::Acquire);
+        let shard = self.shard(key);
+        let state = if let Some(keys) = shard.keys.try_lock() {
+            let coverage_lost = shard.coverage_lost.load(Ordering::Acquire);
             match keys.entries.get(&key) {
-                Some(key_state) if key_state.inflight.load(Ordering::Acquire) != 0 => {
-                    MissPrewarmState::Inflight
+                Some(key_state) => {
+                    // Sample inflight first. Success publishes `completed` before decrementing
+                    // inflight, so observing zero and then loading completed cannot misclassify a
+                    // concurrently finishing successful read as failed. Completion still wins
+                    // over a later overlapping retry.
+                    let inflight = key_state.inflight.load(Ordering::Acquire);
+                    let completed = key_state.completed.load(Ordering::Acquire);
+                    if completed {
+                        MissPrewarmState::Completed
+                    } else if inflight != 0 {
+                        MissPrewarmState::Inflight
+                    } else if coverage_lost {
+                        MissPrewarmState::UnknownContention
+                    } else {
+                        MissPrewarmState::Failed
+                    }
                 }
-                Some(key_state) if key_state.completed.load(Ordering::Acquire) => {
-                    MissPrewarmState::Completed
-                }
-                Some(_) if coverage_lost => MissPrewarmState::UnknownContention,
-                Some(_) => MissPrewarmState::Failed,
                 None if coverage_lost => MissPrewarmState::UnknownContention,
-                None if keys.cap_reached => MissPrewarmState::UnknownDueCap,
+                None if shard.cap_reached.load(Ordering::Acquire) => {
+                    MissPrewarmState::UnknownDueCap
+                }
                 None => MissPrewarmState::NeverObserved,
             }
         } else {
@@ -178,14 +215,16 @@ impl ReadinessDiagnostics {
     }
 
     fn emit(&self, parent: &Span, checkout_reason: u64) {
-        let (keys_tracked, cap_reached) = self
-            .keys
-            .try_lock()
-            .map(|keys| (keys.entries.len() as u64, u64::from(keys.cap_reached)))
-            .unwrap_or_else(|| {
+        let mut keys_tracked = 0;
+        for shard in &self.shards {
+            if let Some(keys) = shard.keys.try_lock() {
+                keys_tracked += keys.entries.len() as u64;
+            } else {
                 self.lock_contention.fetch_add(1, Ordering::Relaxed);
-                (0, 1)
-            });
+            }
+        }
+        let cap_reached =
+            u64::from(self.shards.iter().any(|shard| shard.cap_reached.load(Ordering::Acquire)));
         info!(
             target: "lifecycle",
             parent: parent,
@@ -1768,6 +1807,18 @@ mod tests {
     use reth_revm::db::{AccountStatus, BundleAccount};
     use revm::state::AccountInfo;
 
+    fn storage_keys_for_shard(
+        diagnostics: &ReadinessDiagnostics,
+        shard: usize,
+        count: usize,
+    ) -> Vec<ReadinessKey> {
+        (0..u64::MAX)
+            .map(|slot| ReadinessKey::Storage(Address::ZERO, U256::from(slot).into()))
+            .filter(|key| diagnostics.shard_index(*key) == shard)
+            .take(count)
+            .collect()
+    }
+
     #[test]
     fn readiness_correlates_inflight_and_completed_prewarm_reads() {
         let diagnostics = ReadinessDiagnostics::new();
@@ -1781,12 +1832,12 @@ mod tests {
         first.finish_success();
         drop(first);
         diagnostics.record_miss(key);
-        assert_eq!(diagnostics.account_misses.inflight.load(Ordering::Relaxed), 2);
+        assert_eq!(diagnostics.account_misses.completed.load(Ordering::Relaxed), 1);
 
         second.finish_success();
         drop(second);
         diagnostics.record_miss(key);
-        assert_eq!(diagnostics.account_misses.completed.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.account_misses.completed.load(Ordering::Relaxed), 2);
 
         let failed = ReadinessKey::Account(Address::with_last_byte(2));
         drop(diagnostics.begin_prewarm(failed));
@@ -1800,50 +1851,59 @@ mod tests {
     #[test]
     fn readiness_key_capacity_reports_unknown_without_exporting_keys() {
         let diagnostics = ReadinessDiagnostics::new();
-        for slot in 0..READINESS_KEY_CAPACITY {
-            drop(
-                diagnostics
-                    .begin_prewarm(ReadinessKey::Storage(Address::ZERO, U256::from(slot).into())),
-            );
+        let private_address = Address::repeat_byte(0xaa);
+        let overflow = ReadinessKey::Account(private_address);
+        let full_shard = diagnostics.shard_index(overflow);
+        for key in storage_keys_for_shard(&diagnostics, full_shard, READINESS_KEYS_PER_SHARD) {
+            drop(diagnostics.begin_prewarm(key));
         }
 
-        let overflow = ReadinessKey::Storage(Address::with_last_byte(1), U256::MAX.into());
         drop(diagnostics.begin_prewarm(overflow));
         diagnostics.record_miss(overflow);
 
-        assert_eq!(diagnostics.keys.lock().entries.len(), READINESS_KEY_CAPACITY);
-        assert_eq!(diagnostics.storage_misses.unknown_due_cap.load(Ordering::Relaxed), 1);
-        let rendered = format!("{diagnostics:?}");
-        assert!(!rendered.contains(&format!("{:?}", U256::MAX)));
+        assert_eq!(READINESS_KEY_CAPACITY, 65_536);
+        assert_eq!(
+            diagnostics.shards[full_shard].keys.lock().entries.len(),
+            READINESS_KEYS_PER_SHARD
+        );
+        assert!(diagnostics.shards[full_shard].cap_reached.load(Ordering::Acquire));
+        assert_eq!(diagnostics.account_misses.unknown_due_cap.load(Ordering::Relaxed), 1);
+        assert!(!format!("{diagnostics:?}").contains(&format!("{private_address:?}")));
     }
 
     #[test]
-    fn readiness_contention_invalidates_correlation_conservatively() {
+    fn readiness_contention_invalidates_only_its_shard() {
         let diagnostics = ReadinessDiagnostics::new();
-        let keys = diagnostics.keys.lock();
-        drop(diagnostics.begin_prewarm(ReadinessKey::Account(Address::with_last_byte(3))));
+        let blocked_shard = 0;
+        let same_shard = storage_keys_for_shard(&diagnostics, blocked_shard, 2);
+        let other_shard = storage_keys_for_shard(&diagnostics, 1, 1)[0];
+        let keys = diagnostics.shards[blocked_shard].keys.lock();
+        drop(diagnostics.begin_prewarm(same_shard[0]));
         drop(keys);
 
-        diagnostics.record_miss(ReadinessKey::Account(Address::with_last_byte(4)));
-        assert_eq!(diagnostics.account_misses.unknown_contention.load(Ordering::Relaxed), 1);
+        diagnostics.record_miss(same_shard[1]);
+        diagnostics.record_miss(other_shard);
+        assert_eq!(diagnostics.storage_misses.unknown_contention.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.storage_misses.never_observed.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn readiness_lost_begin_preserves_known_completed_key() {
         let diagnostics = ReadinessDiagnostics::new();
-        let completed = ReadinessKey::Account(Address::with_last_byte(1));
+        let same_shard = storage_keys_for_shard(&diagnostics, 0, 3);
+        let completed = same_shard[0];
         let mut completed_guard = diagnostics.begin_prewarm(completed);
         completed_guard.finish_success();
         drop(completed_guard);
 
-        let keys = diagnostics.keys.lock();
-        drop(diagnostics.begin_prewarm(ReadinessKey::Account(Address::with_last_byte(2))));
+        let keys = diagnostics.shards[0].keys.lock();
+        drop(diagnostics.begin_prewarm(same_shard[1]));
         drop(keys);
 
         diagnostics.record_miss(completed);
-        diagnostics.record_miss(ReadinessKey::Account(Address::with_last_byte(3)));
-        assert_eq!(diagnostics.account_misses.completed.load(Ordering::Relaxed), 1);
-        assert_eq!(diagnostics.account_misses.unknown_contention.load(Ordering::Relaxed), 1);
+        diagnostics.record_miss(same_shard[2]);
+        assert_eq!(diagnostics.storage_misses.completed.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.storage_misses.unknown_contention.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1851,7 +1911,7 @@ mod tests {
         let diagnostics = ReadinessDiagnostics::new();
         let key = ReadinessKey::Account(Address::with_last_byte(1));
         let mut guard = diagnostics.begin_prewarm(key);
-        let keys = diagnostics.keys.lock();
+        let keys = diagnostics.shard(key).keys.lock();
         let state = Arc::clone(keys.entries.get(&key).expect("tracked key"));
 
         guard.finish_success();
@@ -1860,6 +1920,21 @@ mod tests {
         assert_eq!(state.inflight.load(Ordering::Acquire), 0);
         assert!(state.completed.load(Ordering::Acquire));
         drop(keys);
+    }
+
+    #[test]
+    fn readiness_tracks_exact_keys_within_a_shard() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let keys = storage_keys_for_shard(&diagnostics, 0, 2);
+        let mut guard = diagnostics.begin_prewarm(keys[0]);
+        guard.finish_success();
+        drop(guard);
+
+        diagnostics.record_miss(keys[0]);
+        diagnostics.record_miss(keys[1]);
+
+        assert_eq!(diagnostics.storage_misses.completed.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.storage_misses.never_observed.load(Ordering::Relaxed), 1);
     }
 
     #[test]

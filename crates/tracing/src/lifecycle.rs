@@ -83,6 +83,8 @@ impl CaptureDetail {
                     meta.name(),
                     "validate_block_with_state" | "execute_block" | "execute_block_bal"
                 )) ||
+            (meta.target() == "engine::tree::payload_processor" &&
+                matches!(meta.name(), "payload_resources" | "sparse_trie_task")) ||
             (meta.target() == "trie::proof_task" &&
                 matches!(meta.name(), "storage_worker" | "account_worker")) ||
             (meta.target() == "lifecycle" && meta.name() == "prewarm.context")
@@ -846,6 +848,13 @@ fn numeric_field(name: &str) -> bool {
             "storage_queue_depth_9_32" |
             "storage_queue_depth_33_plus" |
             "split_when_queue_nonempty" |
+            "split_when_storage_queue_nonempty" |
+            "split_force_account_queue_nonempty" |
+            "split_account_idle_account_queue_nonempty" |
+            "split_storage_idle_account_queue_nonempty" |
+            "split_force_storage_queue_nonempty" |
+            "split_account_idle_storage_queue_nonempty" |
+            "split_storage_idle_storage_queue_nonempty" |
             "outstanding_max" |
             "account_miss_prewarm_inflight" |
             "account_miss_prewarm_failed" |
@@ -1466,8 +1475,16 @@ mod tests {
                     read_thread=2u64, filename="must-not-escape", key="must-not-escape");
                 tracing::info!(target: "lifecycle", parent: &parent, stage="read_samples",
                     read_samples_retained=1u64, read_samples_omitted=99u64, read_sample_cap=8u64);
-                tracing::info!(target: "lifecycle", parent: &parent, stage="proof_dispatch_totals",
-                    dispatches=2u64, reason_force=1u64, split_when_queue_nonempty=1u64);
+                let dispatch_parent = tracing::debug_span!(
+                    target: "engine::tree::payload_processor",
+                    parent: &parent,
+                    "sparse_trie_task"
+                );
+                tracing::info!(target: "lifecycle", parent: &dispatch_parent, stage="proof_dispatch_totals",
+                    dispatches=2u64, reason_force=1u64, split_when_queue_nonempty=1u64,
+                    split_when_storage_queue_nonempty=1u64,
+                    split_force_account_queue_nonempty=1u64,
+                    split_force_storage_queue_nonempty=1u64);
                 tracing::info!(target: "lifecycle", parent: &parent, stage="execution_cache_readiness",
                     cache_checkout_reason=2u64, storage_miss_prewarm_never_observed=0u64);
                 // A string cannot pass through a numeric field.
@@ -1481,14 +1498,22 @@ mod tests {
             assert!(!text.contains("native_tid"));
             let rows: Vec<Value> =
                 text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-            let owner = rows.iter().find(|row| row["type"] == "start").unwrap()["id"].clone();
+            let owner =
+                rows.iter().find(|row| row["name"] == "storage_worker").unwrap()["id"].clone();
+            let dispatch_owner =
+                rows.iter().find(|row| row["name"] == "sparse_trie_task").unwrap()["id"].clone();
             let events: Vec<_> = rows.iter().filter(|row| row["type"] == "event").collect();
             assert_eq!(events.len(), 6);
-            assert!(events.iter().all(|row| row["id"] == owner));
+            assert!(events.iter().enumerate().all(
+                |(index, row)| &row["id"] == if index == 3 { &dispatch_owner } else { &owner }
+            ));
             assert_eq!(events[0]["fields"]["read_calls"], 0);
             assert_eq!(events[1]["fields"]["read_thread"], 2);
             assert_eq!(events[2]["fields"]["read_samples_omitted"], 99);
             assert_eq!(events[3]["fields"]["split_when_queue_nonempty"], 1);
+            assert_eq!(events[3]["fields"]["split_when_storage_queue_nonempty"], 1);
+            assert_eq!(events[3]["fields"]["split_force_account_queue_nonempty"], 1);
+            assert_eq!(events[3]["fields"]["split_force_storage_queue_nonempty"], 1);
             assert_eq!(events[4]["fields"]["cache_checkout_reason"], 2);
             assert!(events[5]["fields"].get("read_ns").is_none());
         }
@@ -2202,6 +2227,83 @@ mod tests {
                     assert!(!rows.iter().any(|r| r["name"] == "state_setup"));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn builder_proof_roots_retain_payload_identity_before_build_span() {
+        let _serial = CAPTURE_TEST.lock().unwrap();
+        for detail in [CaptureDetail::Full, CaptureDetail::Milestones] {
+            let path =
+                std::env::temp_dir().join(format!("builder-proof-parent-{}.jsonl", monotonic_ns()));
+            let (layer, guard) = LifecycleLayer::start(
+                File::create(&path).unwrap(),
+                [7; 32],
+                monotonic_ns(),
+                detail,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry().with(layer.with_filter(
+                tracing_subscriber::filter::filter_fn(move |meta| detail.capture_metadata(meta)),
+            ));
+            tracing::subscriber::with_default(subscriber, || {
+                let resources = tracing::debug_span!(
+                    target: "engine::tree::payload_processor",
+                    "payload_resources",
+                    payload_id = "0011223344556677"
+                );
+                let (worker, sparse) = resources.in_scope(|| {
+                    (
+                        tracing::debug_span!(target: "trie::proof_task", "storage_worker"),
+                        tracing::debug_span!(
+                            target: "engine::tree::payload_processor",
+                            "sparse_trie_task"
+                        ),
+                    )
+                });
+                drop(resources);
+                tracing::info!(target: "lifecycle", parent: &worker, stage="read_totals",
+                    read_role=4u64, read_class=7u64, read_calls=0u64, read_ns=0u64);
+                tracing::info!(target: "lifecycle", parent: &sparse, stage="proof_dispatch_totals",
+                    dispatches=0u64);
+                drop(worker);
+                drop(sparse);
+
+                let build = tracing::info_span!(
+                    target: "payload_builder",
+                    "build_payload",
+                    payload_id = "0011223344556677",
+                    block_hash = tracing::field::Empty
+                );
+                build.record(
+                    "block_hash",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                );
+            });
+            drop(guard);
+
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(!text.contains("0011223344556677") && !text.contains("aaaaaaaaaaaaaaaa"));
+            let rows: Vec<Value> =
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let resources = rows.iter().find(|row| row["name"] == "payload_resources").unwrap();
+            let worker = rows.iter().find(|row| row["name"] == "storage_worker").unwrap();
+            let sparse = rows.iter().find(|row| row["name"] == "sparse_trie_task").unwrap();
+            let build = rows.iter().find(|row| row["name"] == "build_payload").unwrap();
+            assert_eq!(worker["parent"], resources["id"]);
+            assert_eq!(sparse["parent"], resources["id"]);
+            assert_eq!(resources["fields"]["payload_id"], build["fields"]["payload_id"]);
+            assert!(rows.iter().any(|row| {
+                row["type"] == "fields" &&
+                    row["id"] == build["id"] &&
+                    row["fields"]["block_hash"].as_str().is_some()
+            }));
+            let events: Vec<_> = rows.iter().filter(|row| row["type"] == "event").collect();
+            assert_eq!(events.len(), 2);
+            assert!(events.iter().any(|event| event["id"] == worker["id"]));
+            assert!(events.iter().any(|event| event["id"] == sparse["id"]));
+            assert_eq!(rows.last().unwrap()["dropped"], 0);
         }
     }
 

@@ -41,6 +41,8 @@ pub enum Role {
     AccountProof = 3,
     /// Storage proof worker.
     StorageProof = 4,
+    /// Serial payload-builder state reads, including setup and finalization.
+    PayloadBuilder = 5,
 }
 
 /// Closed read classes. Database classes time MDBX access including encoding/decoding,

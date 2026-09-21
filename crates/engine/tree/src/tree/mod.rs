@@ -3500,15 +3500,23 @@ where
         // workers that need the current in-memory overlay.
         let payload_build = self.payload_builds.acquire();
 
-        let resources = self
-            .payload_validator
-            .payload_builder_resources(
-                state.head_block_hash,
-                head,
-                attributes.timestamp(),
-                &mut self.state,
+        let payload_id = attributes.payload_id(&state.head_block_hash);
+        let resources = {
+            let _span = debug_span!(
+                target: "engine::tree::payload_processor",
+                "payload_resources",
+                payload_id = %payload_id
             )
-            .with_lease(PayloadBuilderLease::new(payload_build));
+            .entered();
+            self.payload_validator
+                .payload_builder_resources(
+                    state.head_block_hash,
+                    head,
+                    attributes.timestamp(),
+                    &mut self.state,
+                )
+                .with_lease(PayloadBuilderLease::new(payload_build))
+        };
 
         // send the payload to the builder and return the receiver for the pending payload
         // id, initiating payload job is handled asynchronously

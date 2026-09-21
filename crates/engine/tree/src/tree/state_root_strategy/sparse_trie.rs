@@ -1141,7 +1141,10 @@ struct ProofDispatchDiagnostics {
     storage_queue_high_water: u64,
     account_queue_depth_bins: [u64; 4],
     storage_queue_depth_bins: [u64; 4],
+    split_reason_account_queue_nonempty: [u64; 3],
+    split_reason_storage_queue_nonempty: [u64; 3],
     split_when_queue_nonempty: u64,
+    split_when_storage_queue_nonempty: u64,
     outstanding_max: u64,
 }
 
@@ -1158,7 +1161,10 @@ impl ProofDispatchDiagnostics {
             storage_queue_high_water: 0,
             account_queue_depth_bins: [0; 4],
             storage_queue_depth_bins: [0; 4],
+            split_reason_account_queue_nonempty: [0; 3],
+            split_reason_storage_queue_nonempty: [0; 3],
             split_when_queue_nonempty: 0,
+            split_when_storage_queue_nonempty: 0,
             outstanding_max: 0,
         })
     }
@@ -1190,8 +1196,18 @@ impl ProofDispatchDiagnostics {
             self.account_queue_depth_bins[queue_depth_bin(account_queue_depth)].saturating_add(1);
         self.storage_queue_depth_bins[queue_depth_bin(storage_queue_depth)] =
             self.storage_queue_depth_bins[queue_depth_bin(storage_queue_depth)].saturating_add(1);
-        if reason != ProofDispatchReason::Unsplit && account_queue_depth > 0 {
-            self.split_when_queue_nonempty = self.split_when_queue_nonempty.saturating_add(1);
+        if let Some(split_reason) = split_reason_index(reason) {
+            if account_queue_depth > 0 {
+                self.split_when_queue_nonempty = self.split_when_queue_nonempty.saturating_add(1);
+                self.split_reason_account_queue_nonempty[split_reason] =
+                    self.split_reason_account_queue_nonempty[split_reason].saturating_add(1);
+            }
+            if storage_queue_depth > 0 {
+                self.split_when_storage_queue_nonempty =
+                    self.split_when_storage_queue_nonempty.saturating_add(1);
+                self.split_reason_storage_queue_nonempty[split_reason] =
+                    self.split_reason_storage_queue_nonempty[split_reason].saturating_add(1);
+            }
         }
         self.outstanding_max = self.outstanding_max.max(outstanding as u64);
     }
@@ -1220,8 +1236,24 @@ impl ProofDispatchDiagnostics {
             storage_queue_depth_9_32 = self.storage_queue_depth_bins[2],
             storage_queue_depth_33_plus = self.storage_queue_depth_bins[3],
             split_when_queue_nonempty = self.split_when_queue_nonempty,
+            split_when_storage_queue_nonempty = self.split_when_storage_queue_nonempty,
+            split_force_account_queue_nonempty = self.split_reason_account_queue_nonempty[0],
+            split_account_idle_account_queue_nonempty = self.split_reason_account_queue_nonempty[1],
+            split_storage_idle_account_queue_nonempty = self.split_reason_account_queue_nonempty[2],
+            split_force_storage_queue_nonempty = self.split_reason_storage_queue_nonempty[0],
+            split_account_idle_storage_queue_nonempty = self.split_reason_storage_queue_nonempty[1],
+            split_storage_idle_storage_queue_nonempty = self.split_reason_storage_queue_nonempty[2],
             outstanding_max = self.outstanding_max,
         );
+    }
+}
+
+const fn split_reason_index(reason: ProofDispatchReason) -> Option<usize> {
+    match reason {
+        ProofDispatchReason::Force => Some(0),
+        ProofDispatchReason::AccountIdle => Some(1),
+        ProofDispatchReason::StorageIdle => Some(2),
+        ProofDispatchReason::Unsplit => None,
     }
 }
 
@@ -1379,22 +1411,30 @@ mod tests {
             storage_queue_high_water: 0,
             account_queue_depth_bins: [0; 4],
             storage_queue_depth_bins: [0; 4],
+            split_reason_account_queue_nonempty: [0; 3],
+            split_reason_storage_queue_nonempty: [0; 3],
             split_when_queue_nonempty: 0,
+            split_when_storage_queue_nonempty: 0,
             outstanding_max: 0,
         };
 
         diagnostics.record_dispatch(ProofDispatchReason::Unsplit, 3, 1, 0, 8, 1, 8, 1);
         diagnostics.record_dispatch(ProofDispatchReason::Force, 301, 61, 33, 9, 92, 10, 62);
+        diagnostics.record_dispatch(ProofDispatchReason::AccountIdle, 10, 2, 2, 0, 92, 10, 3);
+        diagnostics.record_dispatch(ProofDispatchReason::StorageIdle, 10, 2, 0, 4, 92, 10, 3);
 
-        assert_eq!(diagnostics.dispatches, 2);
-        assert_eq!(diagnostics.targets, 304);
-        assert_eq!(diagnostics.chunks, 62);
-        assert_eq!(diagnostics.reason_counts, [1, 1, 0, 0]);
-        assert_eq!(diagnostics.account_queue_depth_bins, [1, 0, 0, 1]);
-        assert_eq!(diagnostics.storage_queue_depth_bins, [0, 1, 1, 0]);
+        assert_eq!(diagnostics.dispatches, 4);
+        assert_eq!(diagnostics.targets, 324);
+        assert_eq!(diagnostics.chunks, 66);
+        assert_eq!(diagnostics.reason_counts, [1, 1, 1, 1]);
+        assert_eq!(diagnostics.account_queue_depth_bins, [2, 1, 0, 1]);
+        assert_eq!(diagnostics.storage_queue_depth_bins, [1, 2, 1, 0]);
         assert_eq!(diagnostics.account_queue_high_water, 92);
         assert_eq!(diagnostics.storage_queue_high_water, 10);
-        assert_eq!(diagnostics.split_when_queue_nonempty, 1);
+        assert_eq!(diagnostics.split_when_queue_nonempty, 2);
+        assert_eq!(diagnostics.split_when_storage_queue_nonempty, 2);
+        assert_eq!(diagnostics.split_reason_account_queue_nonempty, [1, 1, 0]);
+        assert_eq!(diagnostics.split_reason_storage_queue_nonempty, [1, 0, 1]);
         assert_eq!(diagnostics.outstanding_max, 62);
     }
 
@@ -1442,7 +1482,10 @@ mod tests {
                 storage_queue_high_water: 0,
                 account_queue_depth_bins: [0; 4],
                 storage_queue_depth_bins: [0; 4],
+                split_reason_account_queue_nonempty: [0; 3],
+                split_reason_storage_queue_nonempty: [0; 3],
                 split_when_queue_nonempty: 0,
+                split_when_storage_queue_nonempty: 0,
                 outstanding_max: 0,
             };
             drop(diagnostics);
