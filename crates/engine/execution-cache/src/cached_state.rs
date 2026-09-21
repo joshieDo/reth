@@ -112,6 +112,9 @@ struct ReadinessDiagnostics {
     code_misses: MissCounters,
     lock_contention: AtomicU64,
     prewarm_totals: Arc<ReadTotals>,
+    emitted: AtomicBool,
+    #[cfg(test)]
+    emission_count: AtomicUsize,
 }
 
 impl fmt::Debug for ReadinessDiagnostics {
@@ -139,6 +142,9 @@ impl ReadinessDiagnostics {
             code_misses: MissCounters::default(),
             lock_contention: AtomicU64::new(0),
             prewarm_totals: ReadTotals::new(),
+            emitted: AtomicBool::new(false),
+            #[cfg(test)]
+            emission_count: AtomicUsize::new(0),
         })
     }
 
@@ -214,7 +220,12 @@ impl ReadinessDiagnostics {
         }
     }
 
-    fn emit(&self, parent: &Span, checkout_reason: u64) {
+    fn emit_once(&self, parent: &Span, checkout_reason: u64) {
+        if self.emitted.swap(true, Ordering::AcqRel) {
+            return
+        }
+        #[cfg(test)]
+        self.emission_count.fetch_add(1, Ordering::Relaxed);
         let mut keys_tracked = 0;
         for shard in &self.shards {
             if let Some(keys) = shard.keys.try_lock() {
@@ -1513,8 +1524,17 @@ impl ExecutionCache {
     /// Emits the bounded per-checkout cache diagnostics and prewarm read totals.
     pub fn emit_readiness(&self, parent: &Span, checkout_reason: u64) {
         if let Some(diagnostics) = self.readiness() {
-            diagnostics.emit(parent, checkout_reason);
+            diagnostics.emit_once(parent, checkout_reason);
         }
+    }
+
+    fn readiness_reporter(
+        &self,
+        parent: Span,
+        checkout_reason: u64,
+    ) -> Option<Arc<ReadinessReporter>> {
+        let diagnostics = self.0.readiness.try_lock()?.clone()?;
+        Some(Arc::new(ReadinessReporter { diagnostics, checkout_reason, parent }))
     }
 
     /// Returns the number of active handles to the shared cache.
@@ -1720,6 +1740,30 @@ impl ExecutionCache {
     }
 }
 
+/// Diagnostics-only checkout lifetime guard.
+///
+/// Clones retain only block-local diagnostic counters and the reporting span. The execution cache
+/// itself is deliberately not retained, so late diagnostic reporting cannot delay cache handoff.
+pub struct ReadinessReporter {
+    diagnostics: Arc<ReadinessDiagnostics>,
+    checkout_reason: u64,
+    parent: Span,
+}
+
+impl fmt::Debug for ReadinessReporter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadinessReporter")
+            .field("checkout_reason", &self.checkout_reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ReadinessReporter {
+    fn drop(&mut self) {
+        self.diagnostics.emit_once(&self.parent, self.checkout_reason);
+    }
+}
+
 /// A saved cache that has been used for executing a specific block, which has been updated for its
 /// execution.
 #[derive(Debug, Clone)]
@@ -1754,6 +1798,14 @@ impl SavedCache {
     /// Emits this checkout's bounded readiness summary.
     pub fn emit_readiness(&self, parent: &Span) {
         self.caches.emit_readiness(parent, self.checkout_reason.as_u64());
+    }
+
+    /// Returns a diagnostics-only finalizer for this checkout.
+    ///
+    /// The summary is emitted once when the last reporter clone is dropped. The reporter does not
+    /// retain the execution cache, so it does not affect cache availability or handoff.
+    pub fn readiness_reporter(&self, parent: Span) -> Option<Arc<ReadinessReporter>> {
+        self.caches.readiness_reporter(parent, self.checkout_reason.as_u64())
     }
 
     /// Returns the hash for this cache
@@ -1935,6 +1987,30 @@ mod tests {
 
         assert_eq!(diagnostics.storage_misses.completed.load(Ordering::Relaxed), 1);
         assert_eq!(diagnostics.storage_misses.never_observed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn readiness_reporter_emits_once_after_late_worker_without_retaining_cache() {
+        let cache = ExecutionCache::new(1_000_000);
+        let diagnostics = ReadinessDiagnostics::new();
+        *cache.0.readiness.lock() = Some(Arc::clone(&diagnostics));
+        let saved = SavedCache::new(B256::ZERO, cache);
+        assert_eq!(saved.usage_count(), 1);
+
+        let reporter = saved.readiness_reporter(Span::none()).expect("reporter");
+        assert_eq!(saved.usage_count(), 1, "reporter must not retain the execution cache");
+        let late_worker = Arc::clone(&reporter);
+        drop(reporter);
+        assert_eq!(diagnostics.emission_count.load(Ordering::Relaxed), 0);
+
+        diagnostics.record_miss(ReadinessKey::Account(Address::with_last_byte(1)));
+        drop(late_worker);
+        assert_eq!(diagnostics.emission_count.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.account_misses.never_observed.load(Ordering::Relaxed), 1);
+
+        // A second finalizer for the same diagnostic generation remains idempotent.
+        drop(saved.readiness_reporter(Span::none()));
+        assert_eq!(diagnostics.emission_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

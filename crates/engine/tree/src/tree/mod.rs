@@ -88,7 +88,7 @@ pub use persistence_state::PersistenceState;
 pub use reth_engine_primitives::TreeConfig;
 pub use reth_execution_cache::{
     CacheCheckoutReason, CachedStateCacheMetrics, CachedStateMetrics, CachedStateMetricsSource,
-    CachedStateProvider, ExecutionCache, PayloadExecutionCache, SavedCache,
+    CachedStateProvider, ExecutionCache, PayloadExecutionCache, ReadinessReporter, SavedCache,
     TxPoolPrewarmCacheSnapshot,
 };
 pub use txpool_prewarm::{
