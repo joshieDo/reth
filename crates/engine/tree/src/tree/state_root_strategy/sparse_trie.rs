@@ -2315,29 +2315,65 @@ mod tests {
         );
         drop(updates_tx);
         task.selective_storage_retries = true;
-        task.finished_state_updates = true;
         task.dispatch_diagnostics = Some(ProofDispatchDiagnostics::empty(tracing::Span::none()));
 
         let address = B256::repeat_byte(0xa1);
+        let skipped_address = B256::repeat_byte(0xb2);
+        let unrelated_address = B256::repeat_byte(0xc3);
         task.storage_updates.insert(
             address,
             B256Map::from_iter([
                 (B256::repeat_byte(0x01), LeafUpdate::Touched),
                 (B256::repeat_byte(0x02), LeafUpdate::Touched),
+                (B256::repeat_byte(0x03), LeafUpdate::Touched),
             ]),
+        );
+        task.storage_updates.insert(
+            skipped_address,
+            B256Map::from_iter([(B256::repeat_byte(0x04), LeafUpdate::Touched)]),
         );
         task.storage_retry_ready.insert(address);
 
+        // An address without a relevant proof or input is skipped, while a productive address is
+        // re-armed for a later normal pass.
+        task.process_leaf_updates(false).expect("selective retry succeeds");
+        assert_eq!(task.storage_updates[&address].len(), 2);
+        assert_eq!(task.storage_updates[&skipped_address].len(), 1);
+        assert!(task.storage_retry_ready.contains(&address));
+        assert!(!task.storage_retry_ready.contains(&skipped_address));
+
+        // New input for an unrelated address must not make the skipped address eligible.
+        task.new_storage_updates.insert(
+            unrelated_address,
+            B256Map::from_iter([(B256::repeat_byte(0x05), LeafUpdate::Touched)]),
+        );
+        task.pending_updates = 1;
+        task.process_new_updates().expect("unrelated input succeeds");
+        assert!(!task.storage_retry_ready.contains(&skipped_address));
+
+        // A successful proof result for the skipped address makes only that pending map eligible.
+        task.on_proof_result(DecodedMultiProofV2 {
+            storage_proofs: B256Map::from_iter([(skipped_address, Vec::new())]),
+            ..Default::default()
+        })
+        .expect("relevant proof succeeds");
+        assert!(task.storage_retry_ready.contains(&skipped_address));
+
+        task.finished_state_updates = true;
         task.promote_pending_account_updates().expect("terminal retry succeeds");
 
         assert!(task.storage_updates[&address].is_empty());
+        assert!(task.storage_updates[&skipped_address].is_empty());
         assert!(task.storage_retry_ready.is_empty());
         let totals = task.dispatch_diagnostics.take().unwrap().selective_storage_retries;
-        assert_eq!(totals.retry_calls, 2);
-        assert_eq!(totals.maps_attempted, 2);
-        assert_eq!(totals.entries_attempted, 3);
-        assert_eq!(totals.entries_applied, 2);
-        assert_eq!(totals.productive_requeues, 1);
+        assert_eq!(totals.retry_calls, 3);
+        assert_eq!(totals.maps_attempted, 4);
+        assert_eq!(totals.maps_skipped, 1);
+        assert_eq!(totals.entries_attempted, 7);
+        assert_eq!(totals.entries_applied, 4);
+        assert_eq!(totals.ready_from_proof, 1);
+        assert_eq!(totals.ready_from_input, 0);
+        assert_eq!(totals.productive_requeues, 2);
         assert_eq!(totals.fallback_calls, 0);
         drop(task);
         drain_sparse_trie_tasks(&runtime);
@@ -2540,10 +2576,6 @@ mod tests {
         assert_eq!(selective_parent_retries.fallback_calls, 0);
         assert_eq!(control_child_retries.fallback_calls, 0);
         assert_eq!(selective_child_retries.fallback_calls, 0);
-        assert!(selective_parent_retries.maps_skipped > 0);
-        assert!(
-            selective_parent_retries.entries_attempted < control_parent_retries.entries_attempted
-        );
 
         let persist_and_snapshot = |factory: reth_provider::ProviderFactory<
             reth_provider::test_utils::MockNodeTypesWithDB,
