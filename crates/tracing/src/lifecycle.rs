@@ -131,6 +131,7 @@ impl Visit for MilestoneStage {
                 "proof_dispatch_totals" |
                 "proof_state_at_updates_finished" |
                 "proof_progress_totals" |
+                "selective_storage_retry_totals" |
                 "proof_root_tail_totals" |
                 "state_root_result_ready" |
                 "execution_totals" |
@@ -784,6 +785,7 @@ const STAGES: &[&str] = &[
     "proof_dispatch_totals",
     "proof_state_at_updates_finished",
     "proof_progress_totals",
+    "selective_storage_retry_totals",
     "proof_root_tail_totals",
     "state_root_result_ready",
     "execution_totals",
@@ -873,6 +875,21 @@ fn numeric_field(name: &str) -> bool {
             "major_faults" |
             "voluntary_context_switches" |
             "involuntary_context_switches" |
+            "enabled" |
+            "retry_calls" |
+            "maps_considered" |
+            "maps_attempted" |
+            "maps_skipped" |
+            "entries_attempted" |
+            "entries_applied" |
+            "ready_from_proof" |
+            "ready_from_input" |
+            "productive_requeues" |
+            "fallback_calls" |
+            "fallback_maps_attempted" |
+            "fallback_entries_attempted" |
+            "fallback_entries_applied" |
+            "fallback_failures" |
             "read_execution_mode" |
             "read_role" |
             "read_class" |
@@ -1598,6 +1615,15 @@ mod tests {
                     voluntary_context_switches=1u64, involuntary_context_switches=1u64,
                     address="must-not-escape", target_hash="must-not-escape",
                     private_progress=999u64);
+                tracing::info!(target: "lifecycle", parent: &dispatch_parent, stage="selective_storage_retry_totals",
+                    enabled=1u64, retry_calls=1u64, maps_considered=1u64,
+                    maps_attempted=1u64, maps_skipped=1u64, entries_attempted=1u64,
+                    entries_applied=1u64, ready_from_proof=1u64, ready_from_input=1u64,
+                    productive_requeues=1u64, fallback_calls=1u64,
+                    fallback_maps_attempted=1u64, fallback_entries_attempted=1u64,
+                    fallback_entries_applied=1u64, fallback_failures=1u64,
+                    address="must-not-escape", target_hash="must-not-escape",
+                    private_retry=999u64);
                 tracing::info!(target: "lifecycle", parent: &parent, stage="execution_cache_readiness",
                     cache_checkout_reason=2u64, storage_miss_prewarm_never_observed=0u64,
                     prewarm_queue_delay_count=1u64, prewarm_queue_delay_ns=1u64,
@@ -1680,7 +1706,7 @@ mod tests {
             let dispatch_owner =
                 rows.iter().find(|row| row["name"] == "sparse_trie_task").unwrap()["id"].clone();
             let events: Vec<_> = rows.iter().filter(|row| row["type"] == "event").collect();
-            assert_eq!(events.len(), 11);
+            assert_eq!(events.len(), 12);
             assert!(events.iter().all(|row| {
                 let dispatch_event = matches!(
                     row["fields"]["stage"].as_str(),
@@ -1688,6 +1714,7 @@ mod tests {
                         "proof_dispatch_totals" |
                             "proof_state_at_updates_finished" |
                             "proof_progress_totals" |
+                            "selective_storage_retry_totals" |
                             "proof_root_tail_totals"
                     )
                 );
@@ -1821,6 +1848,32 @@ mod tests {
                 assert_eq!(progress["fields"][field], expected, "missing progress field {field}");
             }
             assert!(progress["fields"].get("private_progress").is_none());
+
+            let retry = events
+                .iter()
+                .find(|row| row["fields"]["stage"] == "selective_storage_retry_totals")
+                .unwrap();
+            assert_eq!(retry["id"], dispatch_owner);
+            for field in [
+                "enabled",
+                "retry_calls",
+                "maps_considered",
+                "maps_attempted",
+                "maps_skipped",
+                "entries_attempted",
+                "entries_applied",
+                "ready_from_proof",
+                "ready_from_input",
+                "productive_requeues",
+                "fallback_calls",
+                "fallback_maps_attempted",
+                "fallback_entries_attempted",
+                "fallback_entries_applied",
+                "fallback_failures",
+            ] {
+                assert_eq!(retry["fields"][field], 1, "missing retry field {field}");
+            }
+            assert!(retry["fields"].get("private_retry").is_none());
 
             let builder = events
                 .iter()

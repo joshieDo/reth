@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use super::{evm_state_to_hashed_post_state, StateRootComputeOutcome, StateRootMessage};
 use alloy_primitives::{
-    map::{hash_map::Entry, B256Map},
+    map::{hash_map::Entry, B256Map, B256Set},
     B256,
 };
 use alloy_rlp::{Decodable, Encodable};
@@ -71,6 +71,10 @@ pub(super) struct SparseTrieCacheTask<A = ArenaParallelSparseTrie, S = ArenaPara
     account_updates: B256Map<LeafUpdate>,
     /// Storage trie updates. hashed address -> slot -> update.
     storage_updates: B256Map<B256Map<LeafUpdate>>,
+    /// Enables retrying only storage tries whose reveal state or inputs changed.
+    selective_storage_retries: bool,
+    /// Storage tries eligible for another retry under the selective policy.
+    storage_retry_ready: B256Set,
 
     /// Account updates that are buffered but were not yet applied to the trie.
     new_account_updates: B256Map<LeafUpdate>,
@@ -153,6 +157,7 @@ where
         chunk_size: usize,
     ) -> Self {
         let (hashed_state_tx, hashed_state_rx) = crossbeam_channel::unbounded();
+        let selective_storage_retries = selective_storage_retries_enabled();
 
         let parent_span = tracing::Span::current();
         let hashing_metrics = metrics.clone();
@@ -175,6 +180,8 @@ where
             max_targets_for_chunking: DEFAULT_MAX_TARGETS_FOR_CHUNKING,
             account_updates: Default::default(),
             storage_updates: Default::default(),
+            selective_storage_retries,
+            storage_retry_ready: Default::default(),
             new_account_updates: Default::default(),
             new_storage_updates: Default::default(),
             pending_account_updates: Default::default(),
@@ -188,7 +195,7 @@ where
             storage_cache_misses: 0,
             pending_targets: Default::default(),
             in_flight_proof_batches: 0,
-            dispatch_diagnostics: ProofDispatchDiagnostics::new(),
+            dispatch_diagnostics: ProofDispatchDiagnostics::new(selective_storage_retries),
             pending_updates: Default::default(),
             initial_updates_applied: false,
             final_hashed_state: Default::default(),
@@ -666,9 +673,28 @@ where
     }
 
     fn on_proof_result(&mut self, result: DecodedMultiProofV2) -> Result<(), StateRootTaskError> {
-        self.trie
-            .reveal_decoded_multiproof_v2(result)
-            .map_err(|e| StateRootTaskError::Other(format!("could not reveal multiproof: {e:?}")))
+        let storage_addresses = self
+            .selective_storage_retries
+            .then(|| result.storage_proofs.keys().copied().collect::<Vec<_>>());
+        self.trie.reveal_decoded_multiproof_v2(result).map_err(|e| {
+            StateRootTaskError::Other(format!("could not reveal multiproof: {e:?}"))
+        })?;
+
+        if let Some(storage_addresses) = storage_addresses {
+            let newly_ready = mark_storage_retries_ready(
+                &mut self.storage_retry_ready,
+                &self.storage_updates,
+                storage_addresses,
+            );
+            if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                diagnostics.selective_storage_retries.ready_from_proof = diagnostics
+                    .selective_storage_retries
+                    .ready_from_proof
+                    .saturating_add(newly_ready as u64);
+            }
+        }
+
+        Ok(())
     }
 
     fn on_proof_result_message(
@@ -697,6 +723,13 @@ where
         let _span = debug_span!("process_new_updates").entered();
         self.pending_updates = 0;
         self.initial_updates_applied = true;
+
+        let storage_input_addresses = self.selective_storage_retries.then(|| {
+            self.new_storage_updates
+                .iter()
+                .filter_map(|(address, updates)| (!updates.is_empty()).then_some(*address))
+                .collect::<Vec<_>>()
+        });
 
         // Firstly apply all new storage and account updates to the tries.
         if let Err(error) = self.process_leaf_updates(true) {
@@ -748,6 +781,20 @@ where
             }
         }
 
+        if let Some(storage_input_addresses) = storage_input_addresses {
+            let newly_ready = mark_storage_retries_ready(
+                &mut self.storage_retry_ready,
+                &self.storage_updates,
+                storage_input_addresses,
+            );
+            if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                diagnostics.selective_storage_retries.ready_from_input = diagnostics
+                    .selective_storage_retries
+                    .ready_from_input
+                    .saturating_add(newly_ready as u64);
+            }
+        }
+
         if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
             diagnostics.record_progress(
                 RootProgressPhase::NewUpdates,
@@ -769,22 +816,49 @@ where
         skip_all
     )]
     fn process_leaf_updates(&mut self, new: bool) -> SparseTrieResult<()> {
+        self.process_leaf_updates_inner(new, false)
+    }
+
+    fn process_leaf_updates_inner(&mut self, new: bool, fallback: bool) -> SparseTrieResult<()> {
+        debug_assert!(!fallback || !new, "fallback only applies to old storage updates");
+        let selective = !new && self.selective_storage_retries;
+        let retry_counting_enabled = !new && self.dispatch_diagnostics.is_some();
         let retry_enabled = !new &&
             self.dispatch_diagnostics
                 .as_ref()
                 .is_some_and(|diagnostics| diagnostics.root_tail_start.is_some()) &&
             !self.storage_updates.is_empty();
+        let ready_addresses = if selective && !fallback {
+            core::mem::take(&mut self.storage_retry_ready)
+        } else {
+            B256Set::default()
+        };
         let storage_updates =
             if new { &mut self.new_storage_updates } else { &mut self.storage_updates };
         let retry_timer = RootProgressTimer::start(retry_enabled);
         let mut retry_work_items = 0usize;
         let mut retry_work_outputs = 0usize;
         let mut retry_error = None;
+        let maps_considered = if retry_counting_enabled {
+            storage_updates.values().filter(|updates| !updates.is_empty()).count()
+        } else {
+            0
+        };
+        let mut maps_attempted = 0usize;
+        let mut maps_skipped = 0usize;
+        let mut productive_requeues = 0usize;
+        let mut productive_ready = Vec::new();
 
         // Process all storage updates, skipping tries with no pending updates.
         let span = trace_span!("process_storage_leaf_updates").entered();
-        for (address, updates) in storage_updates {
+        'storage: for (address, updates) in storage_updates {
             if updates.is_empty() {
+                continue;
+            }
+            if selective && !fallback && !ready_addresses.contains(address) {
+                if retry_counting_enabled {
+                    maps_skipped += 1;
+                }
                 continue;
             }
             let _enter = trace_span!(target: "engine::tree::payload_processor::sparse_trie", parent: &span, "storage_trie_leaf_updates", a=%address).entered();
@@ -792,10 +866,12 @@ where
             let trie = self.trie.get_or_create_storage_trie_mut(*address);
             let fetched = self.fetched_storage_targets.entry(*address).or_default();
             let mut targets = Vec::new();
-
             let updates_len_before = updates.len();
-            if retry_enabled {
+            if retry_enabled || retry_counting_enabled {
                 retry_work_items = retry_work_items.saturating_add(updates_len_before);
+            }
+            if retry_counting_enabled {
+                maps_attempted += 1;
             }
             let result = trie.update_leaves(updates, |path, parent| match fetched.entry(path) {
                 Entry::Occupied(mut entry) => {
@@ -810,23 +886,29 @@ where
                 }
             });
             let updates_len_after = updates.len();
-            if retry_enabled {
-                retry_work_outputs = retry_work_outputs
-                    .saturating_add(updates_len_before.saturating_sub(updates_len_after));
+            let applied = updates_len_before.saturating_sub(updates_len_after);
+            if retry_enabled || retry_counting_enabled {
+                retry_work_outputs = retry_work_outputs.saturating_add(applied);
             }
             if let Err(error) = result {
                 retry_error = Some(error);
-                break
+                break 'storage
             }
-            self.storage_cache_hits += (updates_len_before - updates_len_after) as u64;
+            self.storage_cache_hits += applied as u64;
             self.storage_cache_misses += updates_len_after as u64;
 
             if !targets.is_empty() {
                 self.pending_targets.extend_storage_targets(address, targets);
             }
+
+            if selective && !fallback && should_rearm_productive_retry(applied, updates_len_after) {
+                productive_requeues += 1;
+                productive_ready.push(*address);
+            }
         }
 
         drop(span);
+        self.storage_retry_ready.extend(productive_ready);
         if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
             diagnostics.record_progress(
                 RootProgressPhase::LeafRetry,
@@ -835,6 +917,35 @@ where
                 retry_work_items,
                 retry_work_outputs,
             );
+        }
+        if retry_counting_enabled {
+            if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                let totals = &mut diagnostics.selective_storage_retries;
+                if fallback {
+                    totals.fallback_calls = totals.fallback_calls.saturating_add(1);
+                    totals.fallback_maps_attempted =
+                        totals.fallback_maps_attempted.saturating_add(maps_attempted as u64);
+                    totals.fallback_entries_attempted =
+                        totals.fallback_entries_attempted.saturating_add(retry_work_items as u64);
+                    totals.fallback_entries_applied =
+                        totals.fallback_entries_applied.saturating_add(retry_work_outputs as u64);
+                    totals.fallback_failures =
+                        totals.fallback_failures.saturating_add(u64::from(retry_error.is_some()));
+                } else {
+                    totals.retry_calls = totals.retry_calls.saturating_add(1);
+                    totals.maps_considered =
+                        totals.maps_considered.saturating_add(maps_considered as u64);
+                    totals.maps_attempted =
+                        totals.maps_attempted.saturating_add(maps_attempted as u64);
+                    totals.maps_skipped = totals.maps_skipped.saturating_add(maps_skipped as u64);
+                    totals.entries_attempted =
+                        totals.entries_attempted.saturating_add(retry_work_items as u64);
+                    totals.entries_applied =
+                        totals.entries_applied.saturating_add(retry_work_outputs as u64);
+                    totals.productive_requeues =
+                        totals.productive_requeues.saturating_add(productive_requeues as u64);
+                }
+            }
         }
         if let Some(error) = retry_error {
             return Err(error)
@@ -1002,6 +1113,28 @@ where
     )]
     fn promote_pending_account_updates(&mut self) -> SparseTrieResult<()> {
         self.process_leaf_updates(false)?;
+
+        while self.selective_storage_retries &&
+            self.finished_state_updates &&
+            self.pending_targets.is_empty() &&
+            self.in_flight_proof_batches == 0 &&
+            self.proof_result_rx.is_empty() &&
+            !self.storage_retry_ready.is_empty()
+        {
+            // No external event can drive the deferred productive retry. Give only the
+            // addresses that made progress another normal selective turn before falling back.
+            self.process_leaf_updates(false)?;
+        }
+
+        if self.selective_storage_retries &&
+            self.finished_state_updates &&
+            self.pending_targets.is_empty() &&
+            self.in_flight_proof_batches == 0 &&
+            self.proof_result_rx.is_empty() &&
+            self.storage_updates.values().any(|updates| !updates.is_empty())
+        {
+            self.process_leaf_updates_inner(false, true)?;
+        }
 
         if self.pending_account_updates.is_empty() {
             return Ok(());
@@ -1302,9 +1435,38 @@ pub(super) struct SparseTrieTaskMetrics {
 /// The default max targets, for limiting the number of account and storage proof targets to be
 /// fetched by a single worker. If exceeded, chunking is forced regardless of worker availability.
 const DEFAULT_MAX_TARGETS_FOR_CHUNKING: usize = 300;
+const SELECTIVE_STORAGE_RETRIES_ENV: &str = "RETH_EXPERIMENTAL_SELECTIVE_STORAGE_RETRIES";
 
 /// Start proof fetching while the first state-update batch is still arriving.
 const INITIAL_UPDATE_BATCH_SIZE: usize = 64;
+
+fn selective_storage_retries_enabled() -> bool {
+    selective_storage_retries_enabled_value(
+        std::env::var_os(SELECTIVE_STORAGE_RETRIES_ENV).as_deref(),
+    )
+}
+
+fn selective_storage_retries_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn mark_storage_retries_ready(
+    ready: &mut B256Set,
+    storage_updates: &B256Map<B256Map<LeafUpdate>>,
+    addresses: impl IntoIterator<Item = B256>,
+) -> usize {
+    addresses
+        .into_iter()
+        .filter(|address| {
+            storage_updates.get(address).is_some_and(|updates| !updates.is_empty()) &&
+                ready.insert(*address)
+        })
+        .count()
+}
+
+const fn should_rearm_productive_retry(applied: usize, remaining: usize) -> bool {
+    applied > 0 && remaining > 0
+}
 
 /// Why a pending target set was split, or why it remained a single batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1386,6 +1548,25 @@ struct RootProgressTotals {
     major_faults: u64,
     voluntary_context_switches: u64,
     involuntary_context_switches: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectiveStorageRetryTotals {
+    enabled: u64,
+    retry_calls: u64,
+    maps_considered: u64,
+    maps_attempted: u64,
+    maps_skipped: u64,
+    entries_attempted: u64,
+    entries_applied: u64,
+    ready_from_proof: u64,
+    ready_from_input: u64,
+    productive_requeues: u64,
+    fallback_calls: u64,
+    fallback_maps_attempted: u64,
+    fallback_entries_attempted: u64,
+    fallback_entries_applied: u64,
+    fallback_failures: u64,
 }
 
 impl RootProgressTotals {
@@ -1483,11 +1664,16 @@ struct ProofDispatchDiagnostics {
     final_root_ns: u64,
     progress_totals: [RootProgressTotals; RootProgressPhase::COUNT],
     progress_emitted: bool,
+    selective_storage_retries: SelectiveStorageRetryTotals,
 }
 
 impl ProofDispatchDiagnostics {
-    fn new() -> Option<Self> {
-        reth_tracing::readiness::enabled().then(|| Self::empty(tracing::Span::current()))
+    fn new(selective_storage_retries: bool) -> Option<Self> {
+        reth_tracing::readiness::enabled().then(|| {
+            let mut diagnostics = Self::empty(tracing::Span::current());
+            diagnostics.selective_storage_retries.enabled = u64::from(selective_storage_retries);
+            diagnostics
+        })
     }
 
     fn empty(parent: tracing::Span) -> Self {
@@ -1525,6 +1711,7 @@ impl ProofDispatchDiagnostics {
             final_root_ns: 0,
             progress_totals: [RootProgressTotals::default(); RootProgressPhase::COUNT],
             progress_emitted: false,
+            selective_storage_retries: SelectiveStorageRetryTotals::default(),
         }
     }
 
@@ -1751,6 +1938,27 @@ impl ProofDispatchDiagnostics {
             split_storage_idle_storage_queue_nonempty = self.split_reason_storage_queue_nonempty[2],
             outstanding_max = self.outstanding_max,
         );
+        let retries = &self.selective_storage_retries;
+        tracing::info!(
+            target: "lifecycle",
+            parent: &self.parent,
+            stage = "selective_storage_retry_totals",
+            enabled = retries.enabled,
+            retry_calls = retries.retry_calls,
+            maps_considered = retries.maps_considered,
+            maps_attempted = retries.maps_attempted,
+            maps_skipped = retries.maps_skipped,
+            entries_attempted = retries.entries_attempted,
+            entries_applied = retries.entries_applied,
+            ready_from_proof = retries.ready_from_proof,
+            ready_from_input = retries.ready_from_input,
+            productive_requeues = retries.productive_requeues,
+            fallback_calls = retries.fallback_calls,
+            fallback_maps_attempted = retries.fallback_maps_attempted,
+            fallback_entries_attempted = retries.fallback_entries_attempted,
+            fallback_entries_applied = retries.fallback_entries_applied,
+            fallback_failures = retries.fallback_failures,
+        );
     }
 
     fn emit_updates_finished_snapshot(
@@ -1920,12 +2128,90 @@ enum SparseTrieTaskMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
+
     use alloy_primitives::{keccak256, Address, B256, U256};
+    use reth_db::{cursor::DbCursorRO, tables, transaction::DbTx};
     use reth_db_common::init::init_genesis;
-    use reth_provider::test_utils::create_test_provider_factory;
+    use reth_provider::{test_utils::create_test_provider_factory, TrieWriter};
     use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
+    use reth_trie_common::{BranchNodeMasks, Nibbles, ProofTrieNodeV2, TrieNodeV2};
     use reth_trie_parallel::proof_task::ProofTaskCtx;
-    use reth_trie_sparse::ArenaParallelSparseTrie;
+    use reth_trie_sparse::{
+        ArenaParallelSparseTrie, LeafLookup, LeafLookupError, SparseTrieUpdates,
+    };
+
+    /// Test trie that makes one update productive per call without requesting another proof.
+    #[derive(Clone, Debug, Default)]
+    struct OneLeafPerRetryTrie;
+
+    impl SparseTrie for OneLeafPerRetryTrie {
+        fn set_root(
+            &mut self,
+            _root: TrieNodeV2,
+            _masks: Option<BranchNodeMasks>,
+            _retain_updates: bool,
+        ) -> SparseTrieResult<()> {
+            Ok(())
+        }
+
+        fn set_updates(&mut self, _retain_updates: bool) {}
+
+        fn reveal_nodes(&mut self, _nodes: &mut [ProofTrieNodeV2]) -> SparseTrieResult<()> {
+            Ok(())
+        }
+
+        fn root(&mut self, _new_epoch: TrieNodeEpoch) -> B256 {
+            EMPTY_ROOT_HASH
+        }
+
+        fn is_root_cached(&self) -> bool {
+            true
+        }
+
+        fn root_epoch(&self) -> Option<TrieNodeEpoch> {
+            Some(TrieNodeEpoch::UNMODIFIED)
+        }
+
+        fn update_subtrie_hashes(&mut self, _new_epoch: TrieNodeEpoch) {}
+
+        fn get_leaf_value(&self, _full_path: &Nibbles) -> Option<&Vec<u8>> {
+            None
+        }
+
+        fn find_leaf(
+            &self,
+            _full_path: &Nibbles,
+            _expected_value: Option<&Vec<u8>>,
+        ) -> Result<LeafLookup, LeafLookupError> {
+            Ok(LeafLookup::NonExistent)
+        }
+
+        fn updates_ref(&self) -> Cow<'_, SparseTrieUpdates> {
+            Cow::Owned(SparseTrieUpdates::default())
+        }
+
+        fn take_updates(&mut self) -> SparseTrieUpdates {
+            SparseTrieUpdates::default()
+        }
+
+        fn clear(&mut self) {}
+
+        fn prune(&mut self, _prune_before: TrieNodeEpoch) -> usize {
+            0
+        }
+
+        fn update_leaves(
+            &mut self,
+            updates: &mut B256Map<LeafUpdate>,
+            _proof_required_fn: impl FnMut(B256, ProofV2TargetParent),
+        ) -> SparseTrieResult<()> {
+            if let Some(key) = updates.keys().next().copied() {
+                updates.remove(&key);
+            }
+            Ok(())
+        }
+    }
 
     fn drain_sparse_trie_tasks(runtime: &Runtime) {
         for task_name in ["trie-hashing", "storage-workers", "account-workers"] {
@@ -1940,6 +2226,368 @@ mod tests {
         assert_eq!(classify_dispatch(10, 5, 300, true, true), ProofDispatchReason::AccountIdle);
         assert_eq!(classify_dispatch(10, 5, 300, false, true), ProofDispatchReason::StorageIdle);
         assert_eq!(classify_dispatch(9, 5, 300, true, true), ProofDispatchReason::Unsplit);
+    }
+
+    #[test]
+    fn selective_storage_retries_require_exact_opt_in() {
+        use std::ffi::OsStr;
+
+        assert!(!selective_storage_retries_enabled_value(None));
+        assert!(selective_storage_retries_enabled_value(Some(OsStr::new("1"))));
+        for disabled in ["", "0", "true", "yes", "2"] {
+            assert!(!selective_storage_retries_enabled_value(Some(OsStr::new(disabled))));
+        }
+    }
+
+    #[test]
+    fn selective_storage_retry_readiness_is_order_independent_and_productive() {
+        let address_a = B256::repeat_byte(0x0a);
+        let address_b = B256::repeat_byte(0x0b);
+        let empty_address = B256::repeat_byte(0x0c);
+        let slot = B256::repeat_byte(0x01);
+        let mut updates = B256Map::default();
+        updates.insert(address_a, B256Map::from_iter([(slot, LeafUpdate::Touched)]));
+        updates.insert(address_b, B256Map::from_iter([(slot, LeafUpdate::Touched)]));
+        updates.insert(empty_address, B256Map::default());
+
+        let mut forward = B256Set::default();
+        assert_eq!(
+            mark_storage_retries_ready(
+                &mut forward,
+                &updates,
+                [address_a, empty_address, address_b, address_a],
+            ),
+            2
+        );
+        let mut reverse = B256Set::default();
+        assert_eq!(
+            mark_storage_retries_ready(
+                &mut reverse,
+                &updates,
+                [address_b, address_a, empty_address],
+            ),
+            2
+        );
+        assert_eq!(forward, reverse);
+        assert!(should_rearm_productive_retry(1, 1));
+        assert!(!should_rearm_productive_retry(0, 1));
+        assert!(!should_rearm_productive_retry(1, 0));
+    }
+
+    #[test]
+    fn terminal_productive_retry_reaches_fixed_point_before_fallback() {
+        let runtime = reth_tasks::Runtime::test();
+        let provider_factory = create_test_provider_factory();
+        let anchor_hash = init_genesis(&provider_factory).expect("initialize genesis");
+        let state_provider_factory = OverlayStateProviderFactory::new(
+            provider_factory,
+            OverlayManager::<reth_chain_state::EthPrimitives>::default()
+                .overlay_builder(anchor_hash),
+        );
+        let (proof_result_tx, proof_result_rx) = crossbeam_channel::unbounded();
+        let proof_worker_handle = ProofWorkerHandle::new(
+            &runtime,
+            ProofTaskCtx::new(state_provider_factory),
+            false,
+            proof_result_tx.clone(),
+        );
+        let trie = SparseStateTrie::default()
+            .with_accounts_trie(RevealableSparseTrie::<ArenaParallelSparseTrie>::revealed_empty())
+            .with_default_storage_trie(
+                RevealableSparseTrie::<OneLeafPerRetryTrie>::revealed_empty(),
+            );
+        let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+        let (_cancel_guard, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+        let (hashed_state_tx, _hashed_state_rx) = std::sync::mpsc::channel();
+        let mut task = SparseTrieCacheTask::new_with_trie(
+            &runtime,
+            updates_rx,
+            cancel_rx,
+            hashed_state_tx,
+            proof_worker_handle,
+            proof_result_tx,
+            proof_result_rx,
+            SparseTrieTaskMetrics::default(),
+            trie,
+            EMPTY_ROOT_HASH,
+            TrieNodeEpoch::new(1),
+            5,
+        );
+        drop(updates_tx);
+        task.selective_storage_retries = true;
+        task.finished_state_updates = true;
+        task.dispatch_diagnostics = Some(ProofDispatchDiagnostics::empty(tracing::Span::none()));
+
+        let address = B256::repeat_byte(0xa1);
+        task.storage_updates.insert(
+            address,
+            B256Map::from_iter([
+                (B256::repeat_byte(0x01), LeafUpdate::Touched),
+                (B256::repeat_byte(0x02), LeafUpdate::Touched),
+            ]),
+        );
+        task.storage_retry_ready.insert(address);
+
+        task.promote_pending_account_updates().expect("terminal retry succeeds");
+
+        assert!(task.storage_updates[&address].is_empty());
+        assert!(task.storage_retry_ready.is_empty());
+        let totals = task.dispatch_diagnostics.take().unwrap().selective_storage_retries;
+        assert_eq!(totals.retry_calls, 2);
+        assert_eq!(totals.maps_attempted, 2);
+        assert_eq!(totals.entries_attempted, 3);
+        assert_eq!(totals.entries_applied, 2);
+        assert_eq!(totals.productive_requeues, 1);
+        assert_eq!(totals.fallback_calls, 0);
+        drop(task);
+        drain_sparse_trie_tasks(&runtime);
+    }
+
+    #[test]
+    fn db_backed_selective_retries_match_control_root_updates_and_persisted_tries() {
+        let shared_address = keccak256(b"shared-storage-account");
+        let mut update = HashedPostState::default();
+        update.accounts.insert(
+            shared_address,
+            Some(Account { nonce: 1, balance: U256::from(1_000), bytecode_hash: None }),
+        );
+        let mut shared_storage = reth_trie::HashedStorage::default();
+        for index in 0..320u64 {
+            shared_storage
+                .storage
+                .insert(keccak256(U256::from(index).to_be_bytes::<32>()), U256::from(index + 1));
+        }
+        update.storages.insert(shared_address, shared_storage);
+
+        for index in 0..12u64 {
+            let address = keccak256(U256::from(index + 10_000).to_be_bytes::<32>());
+            update.accounts.insert(
+                address,
+                Some(Account {
+                    nonce: index + 2,
+                    balance: U256::from(index + 10),
+                    bytecode_hash: None,
+                }),
+            );
+            let mut storage = reth_trie::HashedStorage::default();
+            storage.storage.insert(
+                keccak256(U256::from(index + 20_000).to_be_bytes::<32>()),
+                U256::from(index + 1),
+            );
+            update.storages.insert(address, storage);
+        }
+        assert!(
+            update.accounts.len() +
+                update.storages.values().map(|s| s.storage.len()).sum::<usize>() >
+                300
+        );
+
+        let run = |selective_storage_retries| {
+            let runtime = reth_tasks::Runtime::test();
+            let provider_factory = create_test_provider_factory();
+            let anchor_hash = init_genesis(&provider_factory).expect("initialize genesis");
+            let state_provider_factory = OverlayStateProviderFactory::new(
+                provider_factory.clone(),
+                OverlayManager::<reth_chain_state::EthPrimitives>::default()
+                    .overlay_builder(anchor_hash),
+            );
+            let (proof_result_tx, proof_result_rx) = crossbeam_channel::unbounded();
+            let proof_worker_handle = ProofWorkerHandle::new(
+                &runtime,
+                ProofTaskCtx::new(state_provider_factory),
+                false,
+                proof_result_tx.clone(),
+            );
+            let default_trie = RevealableSparseTrie::blind_from(ArenaParallelSparseTrie::default());
+            let trie = SparseStateTrie::default()
+                .with_accounts_trie(default_trie.clone())
+                .with_default_storage_trie(default_trie)
+                .with_updates(true);
+            let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+            let (_cancel_guard, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+            let (hashed_state_tx, _hashed_state_rx) = std::sync::mpsc::channel();
+            let mut task = SparseTrieCacheTask::new_with_trie(
+                &runtime,
+                updates_rx,
+                cancel_rx,
+                hashed_state_tx,
+                proof_worker_handle,
+                proof_result_tx,
+                proof_result_rx,
+                SparseTrieTaskMetrics::default(),
+                trie,
+                EMPTY_ROOT_HASH,
+                TrieNodeEpoch::new(1),
+                5,
+            );
+            task.selective_storage_retries = selective_storage_retries;
+            task.dispatch_diagnostics =
+                Some(ProofDispatchDiagnostics::empty(tracing::Span::none()));
+            task.dispatch_diagnostics.as_mut().unwrap().selective_storage_retries.enabled =
+                u64::from(selective_storage_retries);
+
+            updates_tx.send(StateRootMessage::HashedStateUpdate(update.clone())).unwrap();
+            updates_tx.send(StateRootMessage::FinishedStateUpdates).unwrap();
+            drop(updates_tx);
+            let outcome = task.run().expect("sparse trie task");
+            let retry_totals =
+                task.dispatch_diagnostics.as_ref().unwrap().selective_storage_retries;
+            let (trie, deferred) = task.into_trie_for_reuse();
+            drop(deferred);
+            drain_sparse_trie_tasks(&runtime);
+            (provider_factory, anchor_hash, outcome, trie, retry_totals)
+        };
+
+        let (control_factory, control_anchor, control, control_trie, control_parent_retries) =
+            run(false);
+        let (
+            selective_factory,
+            selective_anchor,
+            selective,
+            selective_trie,
+            selective_parent_retries,
+        ) = run(true);
+        assert_eq!(control.state_root, selective.state_root);
+        assert_eq!(control.trie_updates, selective.trie_updates);
+
+        let deleted_address = keccak256(U256::from(10_000).to_be_bytes::<32>());
+        let mut child_update = HashedPostState::default();
+        child_update.accounts.insert(
+            shared_address,
+            Some(Account { nonce: 2, balance: U256::from(2_000), bytecode_hash: None }),
+        );
+        child_update.accounts.insert(deleted_address, None);
+        let mut child_storage = reth_trie::HashedStorage::default();
+        child_storage.storage.insert(keccak256(U256::ZERO.to_be_bytes::<32>()), U256::from(9_999));
+        child_storage.storage.insert(keccak256(U256::from(1).to_be_bytes::<32>()), U256::ZERO);
+        child_storage
+            .storage
+            .insert(keccak256(U256::from(321).to_be_bytes::<32>()), U256::from(12_345));
+        child_update.storages.insert(shared_address, child_storage);
+        let second_storage_address = keccak256(U256::from(10_001).to_be_bytes::<32>());
+        let mut second_storage = reth_trie::HashedStorage::default();
+        second_storage
+            .storage
+            .insert(keccak256(U256::from(20_001).to_be_bytes::<32>()), U256::ZERO);
+        child_update.storages.insert(second_storage_address, second_storage);
+
+        let run_child =
+            |provider_factory: reth_provider::ProviderFactory<
+                reth_provider::test_utils::MockNodeTypesWithDB,
+            >,
+             anchor_hash,
+             parent_root,
+             trie: SparseStateTrie<ArenaParallelSparseTrie, ArenaParallelSparseTrie>,
+             selective_storage_retries| {
+                let runtime = reth_tasks::Runtime::test();
+                let state_provider_factory = OverlayStateProviderFactory::new(
+                    provider_factory.clone(),
+                    OverlayManager::<reth_chain_state::EthPrimitives>::default()
+                        .overlay_builder(anchor_hash),
+                );
+                let (proof_result_tx, proof_result_rx) = crossbeam_channel::unbounded();
+                let proof_worker_handle = ProofWorkerHandle::new(
+                    &runtime,
+                    ProofTaskCtx::new(state_provider_factory),
+                    false,
+                    proof_result_tx.clone(),
+                );
+                let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+                let (_cancel_guard, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+                let (hashed_state_tx, _hashed_state_rx) = std::sync::mpsc::channel();
+                let mut task = SparseTrieCacheTask::new_with_trie(
+                    &runtime,
+                    updates_rx,
+                    cancel_rx,
+                    hashed_state_tx,
+                    proof_worker_handle,
+                    proof_result_tx,
+                    proof_result_rx,
+                    SparseTrieTaskMetrics::default(),
+                    trie,
+                    parent_root,
+                    TrieNodeEpoch::new(2),
+                    5,
+                );
+                task.selective_storage_retries = selective_storage_retries;
+                task.dispatch_diagnostics =
+                    Some(ProofDispatchDiagnostics::empty(tracing::Span::none()));
+                task.dispatch_diagnostics.as_mut().unwrap().selective_storage_retries.enabled =
+                    u64::from(selective_storage_retries);
+                updates_tx.send(StateRootMessage::HashedStateUpdate(child_update.clone())).unwrap();
+                updates_tx.send(StateRootMessage::FinishedStateUpdates).unwrap();
+                drop(updates_tx);
+                let outcome = task.run().expect("child sparse trie task");
+                let retry_totals =
+                    task.dispatch_diagnostics.as_ref().unwrap().selective_storage_retries;
+                drop(task);
+                drain_sparse_trie_tasks(&runtime);
+                (provider_factory, outcome, retry_totals)
+            };
+
+        let (control_factory, control_child, control_child_retries) =
+            run_child(control_factory, control_anchor, control.state_root, control_trie, false);
+        let (selective_factory, selective_child, selective_child_retries) = run_child(
+            selective_factory,
+            selective_anchor,
+            selective.state_root,
+            selective_trie,
+            true,
+        );
+        assert_eq!(control_child.state_root, selective_child.state_root);
+        assert_eq!(control_child.trie_updates, selective_child.trie_updates);
+        assert_eq!(control_parent_retries.fallback_calls, 0);
+        assert_eq!(selective_parent_retries.fallback_calls, 0);
+        assert_eq!(control_child_retries.fallback_calls, 0);
+        assert_eq!(selective_child_retries.fallback_calls, 0);
+        assert!(selective_parent_retries.maps_skipped > 0);
+        assert!(
+            selective_parent_retries.entries_attempted < control_parent_retries.entries_attempted
+        );
+
+        let persist_and_snapshot = |factory: reth_provider::ProviderFactory<
+            reth_provider::test_utils::MockNodeTypesWithDB,
+        >,
+                                    updates: [&TrieUpdates; 2]| {
+            let provider = factory.provider_rw().expect("write provider");
+            for update in updates {
+                provider.write_trie_updates(update.clone()).expect("persist trie updates");
+            }
+            provider.commit().expect("commit trie updates");
+
+            let provider = factory.provider_rw().expect("read provider");
+            let mut account_cursor = provider
+                .tx_ref()
+                .cursor_read::<tables::PackedAccountsTrie>()
+                .expect("account cursor");
+            let accounts = account_cursor
+                .walk(None)
+                .expect("walk account trie")
+                .map(|entry| entry.expect("account trie entry"))
+                .collect::<Vec<_>>();
+            let mut storage_cursor = provider
+                .tx_ref()
+                .cursor_dup_read::<tables::PackedStoragesTrie>()
+                .expect("storage cursor");
+            let storages = storage_cursor
+                .walk(None)
+                .expect("walk storage trie")
+                .map(|entry| entry.expect("storage trie entry"))
+                .collect::<Vec<_>>();
+            (accounts, storages)
+        };
+
+        let control_tables = persist_and_snapshot(
+            control_factory,
+            [control.trie_updates.as_ref(), control_child.trie_updates.as_ref()],
+        );
+        let selective_tables = persist_and_snapshot(
+            selective_factory,
+            [selective.trie_updates.as_ref(), selective_child.trie_updates.as_ref()],
+        );
+        assert_eq!(control_tables, selective_tables);
+        assert!(!control_tables.0.is_empty());
+        assert!(!control_tables.1.is_empty());
     }
 
     #[test]
