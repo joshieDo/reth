@@ -130,6 +130,7 @@ impl Visit for MilestoneStage {
                 "execution_cache_readiness" |
                 "proof_dispatch_totals" |
                 "proof_state_at_updates_finished" |
+                "proof_progress_totals" |
                 "proof_root_tail_totals" |
                 "state_root_result_ready" |
                 "execution_totals" |
@@ -782,6 +783,7 @@ const STAGES: &[&str] = &[
     "execution_cache_readiness",
     "proof_dispatch_totals",
     "proof_state_at_updates_finished",
+    "proof_progress_totals",
     "proof_root_tail_totals",
     "state_root_result_ready",
     "execution_totals",
@@ -856,6 +858,21 @@ fn numeric_field(name: &str) -> bool {
             "grouped_chunks" |
             "grouped_targets" |
             "effective_group_size_max" |
+            "phase" |
+            "wall_ns" |
+            "cpu_measured_wall_ns" |
+            "caller_cpu_ns" |
+            "cpu_measured_calls" |
+            "cpu_missing_calls" |
+            "calls" |
+            "failures" |
+            "work_items" |
+            "work_outputs" |
+            "work_items_max" |
+            "minor_faults" |
+            "major_faults" |
+            "voluntary_context_switches" |
+            "involuntary_context_switches" |
             "read_execution_mode" |
             "read_role" |
             "read_class" |
@@ -1573,6 +1590,14 @@ mod tests {
                     split_force_account_queue_nonempty=1u64,
                     split_force_storage_queue_nonempty=1u64,
                     grouping_enabled=1u64, grouped_dispatches=1u64, grouped_chunks=1u64, grouped_targets=1u64, effective_group_size_max=1u64);
+                tracing::info!(target: "lifecycle", parent: &dispatch_parent, stage="proof_progress_totals",
+                    phase=1u64, wall_ns=1u64, cpu_measured_wall_ns=1u64,
+                    caller_cpu_ns=1u64, cpu_measured_calls=1u64, cpu_missing_calls=0u64,
+                    calls=1u64, failures=1u64, work_items=1u64, work_outputs=1u64,
+                    work_items_max=1u64, minor_faults=1u64, major_faults=1u64,
+                    voluntary_context_switches=1u64, involuntary_context_switches=1u64,
+                    address="must-not-escape", target_hash="must-not-escape",
+                    private_progress=999u64);
                 tracing::info!(target: "lifecycle", parent: &parent, stage="execution_cache_readiness",
                     cache_checkout_reason=2u64, storage_miss_prewarm_never_observed=0u64,
                     prewarm_queue_delay_count=1u64, prewarm_queue_delay_ns=1u64,
@@ -1655,13 +1680,14 @@ mod tests {
             let dispatch_owner =
                 rows.iter().find(|row| row["name"] == "sparse_trie_task").unwrap()["id"].clone();
             let events: Vec<_> = rows.iter().filter(|row| row["type"] == "event").collect();
-            assert_eq!(events.len(), 10);
+            assert_eq!(events.len(), 11);
             assert!(events.iter().all(|row| {
                 let dispatch_event = matches!(
                     row["fields"]["stage"].as_str(),
                     Some(
                         "proof_dispatch_totals" |
                             "proof_state_at_updates_finished" |
+                            "proof_progress_totals" |
                             "proof_root_tail_totals"
                     )
                 );
@@ -1769,6 +1795,32 @@ mod tests {
             ] {
                 assert_eq!(events[3]["fields"][field], 1);
             }
+            let progress = events
+                .iter()
+                .find(|row| row["fields"]["stage"] == "proof_progress_totals")
+                .unwrap();
+            assert_eq!(progress["id"], dispatch_owner);
+            for field in [
+                "phase",
+                "wall_ns",
+                "cpu_measured_wall_ns",
+                "caller_cpu_ns",
+                "cpu_measured_calls",
+                "cpu_missing_calls",
+                "calls",
+                "failures",
+                "work_items",
+                "work_outputs",
+                "work_items_max",
+                "minor_faults",
+                "major_faults",
+                "voluntary_context_switches",
+                "involuntary_context_switches",
+            ] {
+                let expected = u64::from(field != "cpu_missing_calls");
+                assert_eq!(progress["fields"][field], expected, "missing progress field {field}");
+            }
+            assert!(progress["fields"].get("private_progress").is_none());
 
             let builder = events
                 .iter()

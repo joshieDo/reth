@@ -11,7 +11,10 @@ use alloy_rlp::{Decodable, Encodable};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use metrics::{Gauge, Histogram};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use reth_metrics::Metrics;
+use reth_metrics::{
+    thread::{ThreadResourceUsage, ThreadResourceUsageDelta},
+    Metrics,
+};
 use reth_primitives_traits::{Account, FastInstant as Instant};
 use reth_tasks::Runtime;
 use reth_trie::{
@@ -508,8 +511,21 @@ where
             // If there's still no pending updates spend some time pre-computing the account
             // trie upper hashes
             if self.proof_result_rx.is_empty() {
+                let timer = self
+                    .dispatch_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.progress_timer(true));
                 debug_span!(target: "lifecycle", "proof.trie.calculate_subtries")
                     .in_scope(|| self.trie.calculate_subtries(self.new_epoch));
+                if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                    diagnostics.record_progress(
+                        RootProgressPhase::SpeculativeHash,
+                        timer,
+                        false,
+                        1,
+                        0,
+                    );
+                }
             }
         } else if !updates_queued {
             // If we don't have any pending updates, apply them to the trie,
@@ -673,12 +689,28 @@ where
             return Ok(());
         }
 
+        let work_items = self.pending_updates;
+        let timer = self
+            .dispatch_diagnostics
+            .as_ref()
+            .and_then(|diagnostics| diagnostics.progress_timer(true));
         let _span = debug_span!("process_new_updates").entered();
         self.pending_updates = 0;
         self.initial_updates_applied = true;
 
         // Firstly apply all new storage and account updates to the tries.
-        self.process_leaf_updates(true)?;
+        if let Err(error) = self.process_leaf_updates(true) {
+            if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                diagnostics.record_progress(
+                    RootProgressPhase::NewUpdates,
+                    timer,
+                    true,
+                    work_items,
+                    0,
+                );
+            }
+            return Err(error)
+        }
 
         for (address, mut new) in self.new_storage_updates.drain() {
             match self.storage_updates.entry(address) {
@@ -716,6 +748,16 @@ where
             }
         }
 
+        if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+            diagnostics.record_progress(
+                RootProgressPhase::NewUpdates,
+                timer,
+                false,
+                work_items,
+                work_items,
+            );
+        }
+
         Ok(())
     }
 
@@ -727,8 +769,17 @@ where
         skip_all
     )]
     fn process_leaf_updates(&mut self, new: bool) -> SparseTrieResult<()> {
+        let retry_enabled = !new &&
+            self.dispatch_diagnostics
+                .as_ref()
+                .is_some_and(|diagnostics| diagnostics.root_tail_start.is_some()) &&
+            !self.storage_updates.is_empty();
         let storage_updates =
             if new { &mut self.new_storage_updates } else { &mut self.storage_updates };
+        let retry_timer = RootProgressTimer::start(retry_enabled);
+        let mut retry_work_items = 0usize;
+        let mut retry_work_outputs = 0usize;
+        let mut retry_error = None;
 
         // Process all storage updates, skipping tries with no pending updates.
         let span = trace_span!("process_storage_leaf_updates").entered();
@@ -743,7 +794,10 @@ where
             let mut targets = Vec::new();
 
             let updates_len_before = updates.len();
-            trie.update_leaves(updates, |path, parent| match fetched.entry(path) {
+            if retry_enabled {
+                retry_work_items = retry_work_items.saturating_add(updates_len_before);
+            }
+            let result = trie.update_leaves(updates, |path, parent| match fetched.entry(path) {
                 Entry::Occupied(mut entry) => {
                     if parent < *entry.get() {
                         entry.insert(parent);
@@ -754,8 +808,16 @@ where
                     entry.insert(parent);
                     targets.push(ProofV2Target::new(path).with_parent(parent));
                 }
-            })?;
+            });
             let updates_len_after = updates.len();
+            if retry_enabled {
+                retry_work_outputs = retry_work_outputs
+                    .saturating_add(updates_len_before.saturating_sub(updates_len_after));
+            }
+            if let Err(error) = result {
+                retry_error = Some(error);
+                break
+            }
             self.storage_cache_hits += (updates_len_before - updates_len_after) as u64;
             self.storage_cache_misses += updates_len_after as u64;
 
@@ -765,6 +827,18 @@ where
         }
 
         drop(span);
+        if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+            diagnostics.record_progress(
+                RootProgressPhase::LeafRetry,
+                retry_timer,
+                retry_error.is_some(),
+                retry_work_items,
+                retry_work_outputs,
+            );
+        }
+        if let Some(error) = retry_error {
+            return Err(error)
+        }
 
         // Process account trie updates and fill the account targets.
         self.process_account_leaf_updates(new)?;
@@ -785,25 +859,41 @@ where
             if new { &mut self.new_account_updates } else { &mut self.account_updates };
 
         let updates_len_before = account_updates.len();
+        let retry_timer = self
+            .dispatch_diagnostics
+            .as_ref()
+            .and_then(|diagnostics| diagnostics.progress_timer(!new && updates_len_before > 0));
 
-        self.trie.trie_mut().update_leaves(account_updates, |target, parent| {
-            match self.fetched_account_targets.entry(target) {
-                Entry::Occupied(mut entry) => {
-                    if parent < *entry.get() {
+        let result =
+            self.trie.trie_mut().update_leaves(account_updates, |target, parent| {
+                match self.fetched_account_targets.entry(target) {
+                    Entry::Occupied(mut entry) => {
+                        if parent < *entry.get() {
+                            entry.insert(parent);
+                            self.pending_targets.push_account_target(
+                                ProofV2Target::new(target).with_parent(parent),
+                            );
+                        }
+                    }
+                    Entry::Vacant(entry) => {
                         entry.insert(parent);
                         self.pending_targets
                             .push_account_target(ProofV2Target::new(target).with_parent(parent));
                     }
                 }
-                Entry::Vacant(entry) => {
-                    entry.insert(parent);
-                    self.pending_targets
-                        .push_account_target(ProofV2Target::new(target).with_parent(parent));
-                }
-            }
-        })?;
+            });
 
         let updates_len_after = account_updates.len();
+        if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+            diagnostics.record_progress(
+                RootProgressPhase::AccountRetry,
+                retry_timer,
+                result.is_err(),
+                updates_len_before,
+                updates_len_before.saturating_sub(updates_len_after),
+            );
+        }
+        result?;
         self.account_cache_hits += (updates_len_before - updates_len_after) as u64;
         self.account_cache_misses += updates_len_after as u64;
 
@@ -824,14 +914,32 @@ where
         // documented at the use site below.
         unsafe impl<S: Send> Send for SendStorageTriePtr<S> {}
 
+        let scan_enabled = self.dispatch_diagnostics.as_ref().is_some_and(|diagnostics| {
+            diagnostics.root_tail_start.is_some() && !self.storage_updates.is_empty()
+        });
+        let scan_timer = RootProgressTimer::start(scan_enabled);
+        let mut tries_scanned = 0usize;
         let mut tries_to_compute_roots: Vec<(B256, SendStorageTriePtr<S>)> = Vec::new();
         for (address, updates) in &self.storage_updates {
+            if scan_enabled {
+                tries_scanned = tries_scanned.saturating_add(1);
+            }
             if updates.is_empty() &&
                 let Some(trie) = self.trie.storage_tries_mut().get_mut(address) &&
                 !trie.is_root_cached()
             {
                 tries_to_compute_roots.push((*address, SendStorageTriePtr(trie)));
             }
+        }
+        let tries_to_compute = tries_to_compute_roots.len();
+        if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+            diagnostics.record_progress(
+                RootProgressPhase::StorageRootScan,
+                scan_timer,
+                false,
+                tries_scanned,
+                tries_to_compute,
+            );
         }
 
         if tries_to_compute_roots.is_empty() {
@@ -841,6 +949,10 @@ where
         let parent_span =
             debug_span!("compute_drained_storage_roots", n = tries_to_compute_roots.len());
         let new_epoch = self.new_epoch;
+        let compute_timer = self
+            .dispatch_diagnostics
+            .as_ref()
+            .and_then(|diagnostics| diagnostics.progress_timer(true));
         tries_to_compute_roots.into_par_iter().for_each(|(address, SendStorageTriePtr(trie))| {
             let span = if tracing::enabled!(tracing::Level::TRACE) {
                 debug_span!(
@@ -869,6 +981,15 @@ where
                     .expect("updates are drained, trie should be revealed by now")
             };
         });
+        if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+            diagnostics.record_progress(
+                RootProgressPhase::StorageRootCompute,
+                compute_timer,
+                false,
+                tries_to_compute,
+                tries_to_compute,
+            );
+        }
     }
 
     /// Iterates through all storage tries for which all updates were processed, computes their
@@ -889,6 +1010,11 @@ where
         self.compute_drained_storage_roots();
 
         loop {
+            let pending_accounts = self.pending_account_updates.len();
+            let promote_timer = self
+                .dispatch_diagnostics
+                .as_ref()
+                .and_then(|diagnostics| diagnostics.progress_timer(pending_accounts > 0));
             let span = trace_span!("promote_updates", promoted = tracing::field::Empty).entered();
             // Now handle pending account updates that can be upgraded to a proper update.
             let account_rlp_buf = &mut self.account_rlp_buf;
@@ -939,6 +1065,15 @@ where
             });
             span.record("promoted", num_promoted);
             drop(span);
+            if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                diagnostics.record_progress(
+                    RootProgressPhase::AccountPromote,
+                    promote_timer,
+                    false,
+                    pending_accounts,
+                    num_promoted,
+                );
+            }
 
             // Only exit when no new updates are processed.
             //
@@ -957,6 +1092,11 @@ where
             return Ok(())
         }
 
+        let dispatch_work_items = self.pending_targets.len();
+        let dispatch_timer = self
+            .dispatch_diagnostics
+            .as_ref()
+            .and_then(|diagnostics| diagnostics.progress_timer(true));
         let _span = trace_span!("dispatch_pending_targets").entered();
         let (targets, chunking_length) = self.pending_targets.take();
         let has_multiple_idle_account_workers =
@@ -1033,6 +1173,15 @@ where
             );
         }
 
+        if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+            diagnostics.record_progress(
+                RootProgressPhase::Dispatch,
+                dispatch_timer,
+                dispatch_error.is_some(),
+                dispatch_work_items,
+                chunks_dispatched,
+            );
+        }
         if let Some(error) = dispatch_error {
             return Err(error)
         }
@@ -1167,6 +1316,114 @@ enum ProofDispatchReason {
     StorageIdle = 3,
 }
 
+/// Disjoint `make_progress` call intervals after the final update marker. Phase wall time can
+/// include Rayon work and join waits; caller CPU only measures the sparse-trie thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum RootProgressPhase {
+    /// Buffered channel messages consumed / consumed (includes finish and prefetch messages).
+    NewUpdates = 1,
+    /// Pending storage leaf entries attempted / applied.
+    LeafRetry = 2,
+    /// Storage tries inspected / selected for root calculation.
+    StorageRootScan = 3,
+    /// Selected storage tries / roots calculated; caller CPU excludes Rayon workers.
+    StorageRootCompute = 4,
+    /// Pending accounts inspected / promoted.
+    AccountPromote = 5,
+    /// Pending account leaf entries attempted / applied.
+    AccountRetry = 6,
+    /// Speculative account-hash invocations / no enumerable output.
+    SpeculativeHash = 7,
+    /// Proof targets offered / chunks dispatched.
+    Dispatch = 8,
+}
+
+impl RootProgressPhase {
+    const COUNT: usize = 8;
+
+    const fn index(self) -> usize {
+        self as usize - 1
+    }
+}
+
+struct RootProgressTimer {
+    wall: Instant,
+    resources: ThreadResourceUsage,
+}
+
+impl RootProgressTimer {
+    fn start(enabled: bool) -> Option<Self> {
+        enabled.then(|| Self { wall: Instant::now(), resources: ThreadResourceUsage::now() })
+    }
+
+    fn finish(self) -> RootProgressMeasurement {
+        RootProgressMeasurement {
+            wall_ns: duration_ns(self.wall.elapsed()),
+            resources: self.resources.elapsed(),
+        }
+    }
+}
+
+struct RootProgressMeasurement {
+    wall_ns: u64,
+    resources: Option<ThreadResourceUsageDelta>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RootProgressTotals {
+    wall_ns: u64,
+    cpu_measured_wall_ns: u64,
+    caller_cpu_ns: u64,
+    cpu_measured_calls: u64,
+    cpu_missing_calls: u64,
+    calls: u64,
+    failures: u64,
+    work_items: u64,
+    work_outputs: u64,
+    work_items_max: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    voluntary_context_switches: u64,
+    involuntary_context_switches: u64,
+}
+
+impl RootProgressTotals {
+    fn record(
+        &mut self,
+        measurement: RootProgressMeasurement,
+        failed: bool,
+        work_items: usize,
+        work_outputs: usize,
+    ) {
+        self.wall_ns = self.wall_ns.saturating_add(measurement.wall_ns);
+        self.calls = self.calls.saturating_add(1);
+        self.failures = self.failures.saturating_add(u64::from(failed));
+        let work_items = work_items as u64;
+        self.work_items = self.work_items.saturating_add(work_items);
+        self.work_outputs = self.work_outputs.saturating_add(work_outputs as u64);
+        self.work_items_max = self.work_items_max.max(work_items);
+        if let Some(resources) = measurement.resources {
+            self.cpu_measured_wall_ns =
+                self.cpu_measured_wall_ns.saturating_add(measurement.wall_ns);
+            self.caller_cpu_ns = self.caller_cpu_ns.saturating_add(duration_ns(
+                resources.user_cpu_time.saturating_add(resources.system_cpu_time),
+            ));
+            self.cpu_measured_calls = self.cpu_measured_calls.saturating_add(1);
+            self.minor_faults = self.minor_faults.saturating_add(resources.minor_page_faults);
+            self.major_faults = self.major_faults.saturating_add(resources.major_page_faults);
+            self.voluntary_context_switches = self
+                .voluntary_context_switches
+                .saturating_add(resources.voluntary_context_switches);
+            self.involuntary_context_switches = self
+                .involuntary_context_switches
+                .saturating_add(resources.involuntary_context_switches);
+        } else {
+            self.cpu_missing_calls = self.cpu_missing_calls.saturating_add(1);
+        }
+    }
+}
+
 fn classify_dispatch(
     chunking_len: usize,
     chunk_size: usize,
@@ -1224,6 +1481,8 @@ struct ProofDispatchDiagnostics {
     reveal_ns: u64,
     progress_ns: u64,
     final_root_ns: u64,
+    progress_totals: [RootProgressTotals; RootProgressPhase::COUNT],
+    progress_emitted: bool,
 }
 
 impl ProofDispatchDiagnostics {
@@ -1264,11 +1523,67 @@ impl ProofDispatchDiagnostics {
             reveal_ns: 0,
             progress_ns: 0,
             final_root_ns: 0,
+            progress_totals: [RootProgressTotals::default(); RootProgressPhase::COUNT],
+            progress_emitted: false,
         }
     }
 
     fn start_root_tail(&mut self) {
         self.root_tail_start.get_or_insert_with(Instant::now);
+    }
+
+    fn progress_timer(&self, has_work: bool) -> Option<RootProgressTimer> {
+        RootProgressTimer::start(has_work && self.root_tail_start.is_some())
+    }
+
+    fn record_progress(
+        &mut self,
+        phase: RootProgressPhase,
+        timer: Option<RootProgressTimer>,
+        failed: bool,
+        work_items: usize,
+        work_outputs: usize,
+    ) {
+        if let Some(timer) = timer {
+            self.progress_totals[phase.index()].record(
+                timer.finish(),
+                failed,
+                work_items,
+                work_outputs,
+            );
+        }
+    }
+
+    fn emit_progress(&mut self) {
+        if self.progress_emitted {
+            return
+        }
+        self.progress_emitted = true;
+        for (index, totals) in self.progress_totals.iter().enumerate() {
+            if totals.calls == 0 {
+                continue
+            }
+            tracing::info!(
+                target: "lifecycle",
+                parent: &self.parent,
+                stage = "proof_progress_totals",
+                phase = (index + 1) as u64,
+                wall_ns = totals.wall_ns,
+                cpu_measured_wall_ns = totals.cpu_measured_wall_ns,
+                caller_cpu_ns = totals.caller_cpu_ns,
+                cpu_measured_calls = totals.cpu_measured_calls,
+                cpu_missing_calls = totals.cpu_missing_calls,
+                calls = totals.calls,
+                failures = totals.failures,
+                work_items = totals.work_items,
+                work_outputs = totals.work_outputs,
+                work_items_max = totals.work_items_max,
+                minor_faults = totals.minor_faults,
+                major_faults = totals.major_faults,
+                voluntary_context_switches = totals.voluntary_context_switches,
+                involuntary_context_switches = totals.involuntary_context_switches,
+            );
+        }
     }
 
     fn record_proof_wait(&mut self, elapsed: Duration) {
@@ -1309,6 +1624,7 @@ impl ProofDispatchDiagnostics {
     }
 
     fn emit_root_tail(&mut self, result_ready: bool, success: bool) {
+        self.emit_progress();
         if self.root_tail_emitted {
             return
         }
@@ -1653,7 +1969,9 @@ mod tests {
     #[test]
     fn proof_root_tail_diagnostics_track_post_finish_phases() {
         let mut diagnostics = ProofDispatchDiagnostics::empty(tracing::Span::none());
+        assert!(diagnostics.progress_timer(true).is_none());
         diagnostics.start_root_tail();
+        assert!(diagnostics.progress_timer(false).is_none());
         diagnostics.record_proof_wait(Duration::from_nanos(11));
         diagnostics.record_proof_wait(Duration::from_nanos(17));
         diagnostics.record_result_drain(Duration::from_nanos(7), 3, 2, 5, Instant::now());
@@ -1677,10 +1995,45 @@ mod tests {
         assert_eq!(diagnostics.final_root_ns, 19);
         assert!(diagnostics.last_result_consumed_at.is_some());
 
+        let totals = &mut diagnostics.progress_totals[RootProgressPhase::LeafRetry.index()];
+        totals.record(
+            RootProgressMeasurement {
+                wall_ns: 23,
+                resources: Some(ThreadResourceUsageDelta {
+                    user_cpu_time: Duration::from_nanos(5),
+                    system_cpu_time: Duration::from_nanos(7),
+                    minor_page_faults: 2,
+                    major_page_faults: 3,
+                    voluntary_context_switches: 4,
+                    involuntary_context_switches: 5,
+                    ..Default::default()
+                }),
+            },
+            false,
+            11,
+            7,
+        );
+        totals.record(RootProgressMeasurement { wall_ns: 29, resources: None }, true, 13, 3);
+        assert_eq!(totals.wall_ns, 52);
+        assert_eq!(totals.cpu_measured_wall_ns, 23);
+        assert_eq!(totals.caller_cpu_ns, 12);
+        assert_eq!(totals.cpu_measured_calls, 1);
+        assert_eq!(totals.cpu_missing_calls, 1);
+        assert_eq!(totals.calls, 2);
+        assert_eq!(totals.failures, 1);
+        assert_eq!(totals.work_items, 24);
+        assert_eq!(totals.work_outputs, 10);
+        assert_eq!(totals.work_items_max, 13);
+        assert_eq!(totals.minor_faults, 2);
+        assert_eq!(totals.major_faults, 3);
+        assert_eq!(totals.voluntary_context_switches, 4);
+        assert_eq!(totals.involuntary_context_switches, 5);
+
         // The explicit-parent test below exercises emission. Avoid emitting this shared callsite
         // outside a subscriber because Rust tests run concurrently and tracing caches callsite
         // interest across dispatchers.
         diagnostics.root_tail_emitted = true;
+        diagnostics.progress_emitted = true;
     }
 
     #[test]
@@ -1940,6 +2293,7 @@ mod tests {
             TrieNodeEpoch::UNMODIFIED,
             1,
         );
+        task.dispatch_diagnostics = Some(ProofDispatchDiagnostics::empty(tracing::Span::none()));
 
         // Keep an input queued so progress cannot use its normal queue-empty flush.
         updates_tx.send(StateRootMessage::PrefetchProofs(Default::default())).unwrap();
@@ -1978,6 +2332,15 @@ mod tests {
         }
         assert_eq!(task.pending_updates, INITIAL_UPDATE_BATCH_SIZE);
         assert_eq!(task.new_account_updates.len(), INITIAL_UPDATE_BATCH_SIZE);
+        assert!(
+            task.dispatch_diagnostics
+                .as_ref()
+                .unwrap()
+                .progress_totals
+                .iter()
+                .all(|totals| totals.calls == 0),
+            "streaming-phase work must not enter root-tail phase totals"
+        );
         drop(updates_tx);
         drop(task);
         drain_sparse_trie_tasks(&runtime);
@@ -2117,6 +2480,19 @@ mod tests {
         assert_eq!(diagnostics.result_queue_after_last_drain, 0);
         assert_eq!(diagnostics.in_flight_after_last_drain, 0);
         assert!(diagnostics.last_result_consumed_at.is_some());
+        let progress_phase_wall_ns = diagnostics
+            .progress_totals
+            .iter()
+            .fold(0u64, |sum, totals| sum.saturating_add(totals.wall_ns));
+        assert!(
+            diagnostics.progress_totals[RootProgressPhase::NewUpdates.index()].calls > 0,
+            "the buffered update must be processed after the finish marker"
+        );
+        assert!(
+            diagnostics.progress_totals[RootProgressPhase::Dispatch.index()].calls > 0,
+            "the final account proof must be dispatched during root-tail progress"
+        );
+        assert!(progress_phase_wall_ns <= diagnostics.progress_ns);
         assert!(phase_accounted_ns <= root_tail_ns);
 
         drop(task);
