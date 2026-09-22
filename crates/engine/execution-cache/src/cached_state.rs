@@ -40,6 +40,13 @@ const READINESS_KEY_SHARDS: usize = 64;
 const READINESS_KEYS_PER_SHARD: usize = 1_024;
 /// Maximum number of exact state keys retained for prewarm-read correlation per block.
 const READINESS_KEY_CAPACITY: usize = READINESS_KEY_SHARDS * READINESS_KEYS_PER_SHARD;
+/// Maximum concurrent provider reads retained for unfinished-read timing for one exact key.
+const READINESS_ACTIVE_READS_PER_KEY_CAP: usize = 64;
+
+const PREWARM_READ_ACTIVE: u8 = 0;
+const PREWARM_READ_FINISHING: u8 = 1;
+const PREWARM_READ_SUCCESS: u8 = 2;
+const PREWARM_READ_FAILED: u8 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ReadinessKey {
@@ -48,10 +55,30 @@ enum ReadinessKey {
     Code(B256),
 }
 
-#[derive(Default)]
 struct PrewarmKeyState {
     inflight: AtomicUsize,
     completed: AtomicBool,
+    active_reads: parking_lot::Mutex<Vec<Arc<PrewarmReadInstance>>>,
+    timing_coverage_lost: AtomicBool,
+}
+
+impl Default for PrewarmKeyState {
+    fn default() -> Self {
+        Self {
+            inflight: AtomicUsize::new(0),
+            completed: AtomicBool::new(false),
+            active_reads: parking_lot::Mutex::new(Vec::new()),
+            timing_coverage_lost: AtomicBool::new(false),
+        }
+    }
+}
+
+struct PrewarmReadInstance {
+    started: Instant,
+    /// Published after `finished_elapsed_ns`; Acquire loads of this value observe the duration.
+    outcome: std::sync::atomic::AtomicU8,
+    /// Nanoseconds since `started`, saturated to `u64`, when this provider read finished.
+    finished_elapsed_ns: AtomicU64,
 }
 
 #[derive(Default)]
@@ -119,6 +146,10 @@ impl LatencyCounters {
     }
 }
 
+fn duration_ns(elapsed: Duration) -> u64 {
+    elapsed.as_nanos().min(u64::MAX as u128) as u64
+}
+
 #[derive(Debug, Default)]
 struct StorageBackingLatency {
     // Every actual authoritative backing call is counted, including calls that return an error.
@@ -127,6 +158,33 @@ struct StorageBackingLatency {
     failed: LatencyCounters,
     never_observed: LatencyCounters,
     unknown: LatencyCounters,
+}
+
+#[derive(Debug, Default)]
+struct StorageUnfinishedCounters {
+    /// Age of the oldest captured exact-key prewarm provider read at the miss snapshot.
+    age: LatencyCounters,
+    /// Time after the miss snapshot until the first captured prewarm or canonical read finished.
+    overlap: LatencyCounters,
+    single: AtomicU64,
+    multiple: AtomicU64,
+    unknown: AtomicU64,
+    prewarm_success_first: AtomicU64,
+    prewarm_failed_first: AtomicU64,
+    canonical_success_first: AtomicU64,
+    canonical_failed_first: AtomicU64,
+    winner_unknown: AtomicU64,
+}
+
+enum UnfinishedSnapshot {
+    None,
+    Unknown,
+    Known(Vec<CapturedPrewarmRead>),
+}
+
+struct CapturedPrewarmRead {
+    instance: Arc<PrewarmReadInstance>,
+    age_ns: u64,
 }
 
 impl StorageBackingLatency {
@@ -214,6 +272,7 @@ struct ReadinessDiagnostics {
     storage_misses: MissCounters,
     code_misses: MissCounters,
     storage_backing_latency: StorageBackingLatency,
+    storage_unfinished: StorageUnfinishedCounters,
     prewarm_queue: PrewarmQueueCounters,
     lock_contention: AtomicU64,
     prewarm_totals: Arc<ReadTotals>,
@@ -246,6 +305,7 @@ impl ReadinessDiagnostics {
             storage_misses: MissCounters::default(),
             code_misses: MissCounters::default(),
             storage_backing_latency: StorageBackingLatency::default(),
+            storage_unfinished: StorageUnfinishedCounters::default(),
             prewarm_queue: PrewarmQueueCounters::default(),
             lock_contention: AtomicU64::new(0),
             prewarm_totals: ReadTotals::new(),
@@ -268,7 +328,7 @@ impl ReadinessDiagnostics {
         let Some(mut keys) = shard.keys.try_lock() else {
             self.lock_contention.fetch_add(1, Ordering::Relaxed);
             shard.coverage_lost.store(true, Ordering::Release);
-            return PrewarmReadGuard { state: None, successful: false }
+            return PrewarmReadGuard { state: None, instance: None, successful: false }
         };
         let state = if let Some(state) = keys.entries.get(&key) {
             let state = Arc::clone(state);
@@ -285,12 +345,47 @@ impl ReadinessDiagnostics {
             shard.cap_reached.store(true, Ordering::Release);
             None
         };
-        PrewarmReadGuard { state, successful: false }
+        let instance = matches!(key, ReadinessKey::Storage(..))
+            .then(|| {
+                state.as_ref().and_then(|state| {
+                    let Some(mut active_reads) = state.active_reads.try_lock() else {
+                        state.timing_coverage_lost.store(true, Ordering::Release);
+                        return None
+                    };
+                    active_reads.retain(|read| {
+                        matches!(
+                            read.outcome.load(Ordering::Acquire),
+                            PREWARM_READ_ACTIVE | PREWARM_READ_FINISHING
+                        )
+                    });
+                    if active_reads.len() >= READINESS_ACTIVE_READS_PER_KEY_CAP {
+                        state.timing_coverage_lost.store(true, Ordering::Release);
+                        return None
+                    }
+                    let instance = Arc::new(PrewarmReadInstance {
+                        started: Instant::now(),
+                        outcome: std::sync::atomic::AtomicU8::new(PREWARM_READ_ACTIVE),
+                        finished_elapsed_ns: AtomicU64::new(0),
+                    });
+                    active_reads.push(Arc::clone(&instance));
+                    Some(instance)
+                })
+            })
+            .flatten();
+        PrewarmReadGuard { state, instance, successful: false }
     }
 
     fn record_miss(&self, key: ReadinessKey) -> MissPrewarmState {
+        self.observe_miss(key, false).0
+    }
+
+    fn observe_miss(
+        &self,
+        key: ReadinessKey,
+        capture_unfinished: bool,
+    ) -> (MissPrewarmState, UnfinishedSnapshot, Instant) {
         let shard = self.shard(key);
-        let state = if let Some(keys) = shard.keys.try_lock() {
+        let (state, unfinished, observed_at) = if let Some(keys) = shard.keys.try_lock() {
             let coverage_lost = shard.coverage_lost.load(Ordering::Acquire);
             match keys.entries.get(&key) {
                 Some(key_state) => {
@@ -300,7 +395,7 @@ impl ReadinessDiagnostics {
                     // over a later overlapping retry.
                     let inflight = key_state.inflight.load(Ordering::Acquire);
                     let completed = key_state.completed.load(Ordering::Acquire);
-                    if completed {
+                    let state = if completed {
                         MissPrewarmState::Completed
                     } else if inflight != 0 {
                         MissPrewarmState::Inflight
@@ -308,24 +403,67 @@ impl ReadinessDiagnostics {
                         MissPrewarmState::UnknownContention
                     } else {
                         MissPrewarmState::Failed
-                    }
+                    };
+                    let (unfinished, observed_at) = if !capture_unfinished {
+                        (UnfinishedSnapshot::None, Instant::now())
+                    } else if coverage_lost ||
+                        key_state.timing_coverage_lost.load(Ordering::Acquire)
+                    {
+                        (UnfinishedSnapshot::Unknown, Instant::now())
+                    } else if let Some(active_reads) = key_state.active_reads.try_lock() {
+                        // Registration also holds this lock. Taking the timestamp here ensures
+                        // every captured read started no later than the exact cohort boundary.
+                        let observed_at = Instant::now();
+                        let mut finishing = false;
+                        let captured = active_reads
+                            .iter()
+                            .filter_map(|instance| match instance.outcome.load(Ordering::Acquire) {
+                                PREWARM_READ_ACTIVE => Some(CapturedPrewarmRead {
+                                    instance: Arc::clone(instance),
+                                    age_ns: duration_ns(
+                                        observed_at.duration_since(instance.started),
+                                    ),
+                                }),
+                                PREWARM_READ_FINISHING => {
+                                    finishing = true;
+                                    None
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let unfinished = if finishing {
+                            UnfinishedSnapshot::Unknown
+                        } else if captured.is_empty() {
+                            UnfinishedSnapshot::None
+                        } else {
+                            UnfinishedSnapshot::Known(captured)
+                        };
+                        (unfinished, observed_at)
+                    } else {
+                        (UnfinishedSnapshot::Unknown, Instant::now())
+                    };
+                    (state, unfinished, observed_at)
                 }
-                None if coverage_lost => MissPrewarmState::UnknownContention,
+                None if coverage_lost => (
+                    MissPrewarmState::UnknownContention,
+                    UnfinishedSnapshot::Unknown,
+                    Instant::now(),
+                ),
                 None if shard.cap_reached.load(Ordering::Acquire) => {
-                    MissPrewarmState::UnknownDueCap
+                    (MissPrewarmState::UnknownDueCap, UnfinishedSnapshot::Unknown, Instant::now())
                 }
-                None => MissPrewarmState::NeverObserved,
+                None => (MissPrewarmState::NeverObserved, UnfinishedSnapshot::None, Instant::now()),
             }
         } else {
             self.lock_contention.fetch_add(1, Ordering::Relaxed);
-            MissPrewarmState::UnknownContention
+            (MissPrewarmState::UnknownContention, UnfinishedSnapshot::Unknown, Instant::now())
         };
         match key {
             ReadinessKey::Account(_) => self.account_misses.record(state),
             ReadinessKey::Storage(..) => self.storage_misses.record(state),
             ReadinessKey::Code(_) => self.code_misses.record(state),
         }
-        state
+        (state, unfinished, observed_at)
     }
 
     fn begin_storage_backing_read(
@@ -333,8 +471,33 @@ impl ReadinessDiagnostics {
         account: Address,
         storage_key: StorageKey,
     ) -> StorageBackingReadGuard {
-        let state = self.record_miss(ReadinessKey::Storage(account, storage_key));
-        StorageBackingReadGuard { diagnostics: Arc::clone(self), state, start: Instant::now() }
+        let (state, unfinished, start) =
+            self.observe_miss(ReadinessKey::Storage(account, storage_key), true);
+        match &unfinished {
+            UnfinishedSnapshot::None => {}
+            UnfinishedSnapshot::Unknown => {
+                self.storage_unfinished.unknown.fetch_add(1, Ordering::Relaxed);
+            }
+            UnfinishedSnapshot::Known(reads) => {
+                let multiplicity = if reads.len() == 1 {
+                    &self.storage_unfinished.single
+                } else {
+                    &self.storage_unfinished.multiple
+                };
+                multiplicity.fetch_add(1, Ordering::Relaxed);
+                let oldest_age = reads.iter().map(|read| read.age_ns).max().unwrap_or_default();
+                self.storage_unfinished.age.record(Duration::from_nanos(oldest_age));
+            }
+        }
+        StorageBackingReadGuard {
+            diagnostics: Arc::clone(self),
+            state,
+            unfinished,
+            overlap_start: start,
+            backing_start: Instant::now(),
+            successful: false,
+            finished_elapsed: None,
+        }
     }
 
     fn prewarm_dispatch(self: &Arc<Self>) -> PrewarmDispatchGuard {
@@ -404,6 +567,20 @@ impl ReadinessDiagnostics {
             storage_backing_failed_count = self.storage_backing_latency.failed.count.load(Ordering::Relaxed),
             storage_backing_failed_ns = self.storage_backing_latency.failed.ns.load(Ordering::Relaxed),
             storage_backing_failed_max_ns = self.storage_backing_latency.failed.max_ns.load(Ordering::Relaxed),
+            storage_unfinished_at_miss_count = self.storage_unfinished.age.count.load(Ordering::Relaxed),
+            storage_unfinished_at_miss_single = self.storage_unfinished.single.load(Ordering::Relaxed),
+            storage_unfinished_at_miss_multiple = self.storage_unfinished.multiple.load(Ordering::Relaxed),
+            storage_unfinished_at_miss_unknown = self.storage_unfinished.unknown.load(Ordering::Relaxed),
+            storage_unfinished_age_ns = self.storage_unfinished.age.ns.load(Ordering::Relaxed),
+            storage_unfinished_age_max_ns = self.storage_unfinished.age.max_ns.load(Ordering::Relaxed),
+            storage_unfinished_overlap_count = self.storage_unfinished.overlap.count.load(Ordering::Relaxed),
+            storage_unfinished_overlap_ns = self.storage_unfinished.overlap.ns.load(Ordering::Relaxed),
+            storage_unfinished_overlap_max_ns = self.storage_unfinished.overlap.max_ns.load(Ordering::Relaxed),
+            storage_unfinished_prewarm_success_first = self.storage_unfinished.prewarm_success_first.load(Ordering::Relaxed),
+            storage_unfinished_prewarm_failed_first = self.storage_unfinished.prewarm_failed_first.load(Ordering::Relaxed),
+            storage_unfinished_canonical_success_first = self.storage_unfinished.canonical_success_first.load(Ordering::Relaxed),
+            storage_unfinished_canonical_failed_first = self.storage_unfinished.canonical_failed_first.load(Ordering::Relaxed),
+            storage_unfinished_winner_unknown = self.storage_unfinished.winner_unknown.load(Ordering::Relaxed),
             prewarm_queue_delay_count = self.prewarm_queue.delay.count.load(Ordering::Relaxed),
             prewarm_queue_delay_ns = self.prewarm_queue.delay.ns.load(Ordering::Relaxed),
             prewarm_queue_delay_max_ns = self.prewarm_queue.delay.max_ns.load(Ordering::Relaxed),
@@ -427,6 +604,7 @@ impl ReadinessDiagnostics {
 
 struct PrewarmReadGuard {
     state: Option<Arc<PrewarmKeyState>>,
+    instance: Option<Arc<PrewarmReadInstance>>,
     successful: bool,
 }
 
@@ -440,6 +618,18 @@ impl PrewarmReadGuard {
 impl Drop for PrewarmReadGuard {
     fn drop(&mut self) {
         let Some(state) = &self.state else { return };
+        if let Some(instance) = &self.instance {
+            // `FINISHING` makes the small publication interval explicit. A concurrent observer
+            // reports unknown rather than inferring an ordering from an unpublished timestamp.
+            instance.outcome.store(PREWARM_READ_FINISHING, Ordering::Release);
+            instance
+                .finished_elapsed_ns
+                .store(duration_ns(instance.started.elapsed()), Ordering::Relaxed);
+            instance.outcome.store(
+                if self.successful { PREWARM_READ_SUCCESS } else { PREWARM_READ_FAILED },
+                Ordering::Release,
+            );
+        }
         if self.successful {
             state.completed.store(true, Ordering::Release);
         }
@@ -452,12 +642,79 @@ impl Drop for PrewarmReadGuard {
 struct StorageBackingReadGuard {
     diagnostics: Arc<ReadinessDiagnostics>,
     state: MissPrewarmState,
-    start: Instant,
+    unfinished: UnfinishedSnapshot,
+    overlap_start: Instant,
+    backing_start: Instant,
+    successful: bool,
+    finished_elapsed: Option<(Duration, Duration)>,
+}
+
+impl StorageBackingReadGuard {
+    /// Captures the provider-return boundary and whether the call succeeded.
+    fn finish(&mut self, successful: bool) {
+        self.successful = successful;
+        self.finished_elapsed = Some((self.overlap_start.elapsed(), self.backing_start.elapsed()));
+    }
 }
 
 impl Drop for StorageBackingReadGuard {
     fn drop(&mut self) {
-        self.diagnostics.storage_backing_latency.counters(self.state).record(self.start.elapsed());
+        let (canonical_elapsed, backing_elapsed) = self
+            .finished_elapsed
+            .unwrap_or_else(|| (self.overlap_start.elapsed(), self.backing_start.elapsed()));
+        self.diagnostics.storage_backing_latency.counters(self.state).record(backing_elapsed);
+        let UnfinishedSnapshot::Known(reads) = &self.unfinished else { return };
+
+        let canonical_ns = duration_ns(canonical_elapsed);
+        let mut earliest_prewarm: Option<(u64, u8)> = None;
+        let mut ambiguous = false;
+        for read in reads {
+            let outcome = read.instance.outcome.load(Ordering::Acquire);
+            if outcome == PREWARM_READ_ACTIVE {
+                continue
+            }
+            if outcome == PREWARM_READ_FINISHING {
+                ambiguous = true;
+                break
+            }
+            let finished_elapsed_ns = read.instance.finished_elapsed_ns.load(Ordering::Relaxed);
+            let Some(after_miss_ns) = finished_elapsed_ns.checked_sub(read.age_ns) else {
+                ambiguous = true;
+                break
+            };
+            if earliest_prewarm.is_none_or(|(earliest, _)| after_miss_ns < earliest) {
+                earliest_prewarm = Some((after_miss_ns, outcome));
+            }
+        }
+
+        let counters = &self.diagnostics.storage_unfinished;
+        if ambiguous || earliest_prewarm.is_some_and(|(elapsed, _)| elapsed == canonical_ns) {
+            counters.winner_unknown.fetch_add(1, Ordering::Relaxed);
+            return
+        }
+
+        if let Some((elapsed, outcome)) =
+            earliest_prewarm.filter(|(elapsed, _)| *elapsed < canonical_ns)
+        {
+            counters.overlap.record(Duration::from_nanos(elapsed));
+            let winner = if outcome == PREWARM_READ_SUCCESS {
+                &counters.prewarm_success_first
+            } else if outcome == PREWARM_READ_FAILED {
+                &counters.prewarm_failed_first
+            } else {
+                counters.winner_unknown.fetch_add(1, Ordering::Relaxed);
+                return
+            };
+            winner.fetch_add(1, Ordering::Relaxed);
+        } else {
+            counters.overlap.record(canonical_elapsed);
+            let winner = if self.successful {
+                &counters.canonical_success_first
+            } else {
+                &counters.canonical_failed_first
+            };
+            winner.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1420,7 +1677,7 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
                         diagnostics.begin_prewarm(ReadinessKey::Storage(account, storage_key))
                     })
                 });
-                let backing_read = (self.readiness_access == ReadinessAccess::Authoritative)
+                let mut backing_read = (self.readiness_access == ReadinessAccess::Authoritative)
                     .then(|| {
                         readiness.as_ref().map(|diagnostics| {
                             diagnostics.begin_storage_backing_read(account, storage_key)
@@ -1431,6 +1688,9 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
                     .state_provider
                     .storage(account, storage_key)
                     .map(Option::unwrap_or_default);
+                if let Some(backing_read) = backing_read.as_mut() {
+                    backing_read.finish(result.is_ok());
+                }
                 drop(backing_read);
                 if result.is_ok() {
                     if let Some(prewarm) = prewarm.as_mut() {
@@ -1453,11 +1713,14 @@ impl<S: StateProvider> StateProvider for CachedStateProvider<S> {
             Ok(nonzero_storage_value(value))
         } else {
             self.record_storage_miss();
-            let backing_read = self
+            let mut backing_read = self
                 .readiness
                 .as_ref()
                 .map(|diagnostics| diagnostics.begin_storage_backing_read(account, storage_key));
             let result = self.state_provider.storage(account, storage_key);
+            if let Some(backing_read) = backing_read.as_mut() {
+                backing_read.finish(result.is_ok());
+            }
             drop(backing_read);
             result
         }
@@ -2274,6 +2537,173 @@ mod tests {
             diagnostics.storage_misses.unknown_due_cap.load(Ordering::Relaxed) +
             diagnostics.storage_misses.unknown_contention.load(Ordering::Relaxed);
         assert_eq!(latency_count, classified_count);
+    }
+
+    #[test]
+    fn readiness_unfinished_storage_read_records_age_overlap_and_first_finisher() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let key = storage_keys_for_shard(&diagnostics, 0, 1)[0];
+        let ReadinessKey::Storage(account, storage_key) = key else { unreachable!() };
+        let mut prewarm = diagnostics.begin_prewarm(key);
+        let mut canonical = diagnostics.begin_storage_backing_read(account, storage_key);
+
+        prewarm.finish_success();
+        drop(prewarm);
+        canonical.finish(true);
+        drop(canonical);
+
+        let unfinished = &diagnostics.storage_unfinished;
+        assert_eq!(unfinished.age.count.load(Ordering::Relaxed), 1);
+        assert_eq!(unfinished.single.load(Ordering::Relaxed), 1);
+        assert_eq!(unfinished.multiple.load(Ordering::Relaxed), 0);
+        assert_eq!(unfinished.overlap.count.load(Ordering::Relaxed), 1);
+        assert_eq!(unfinished.prewarm_success_first.load(Ordering::Relaxed), 1);
+        assert_eq!(unfinished.canonical_success_first.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn readiness_unfinished_storage_read_records_canonical_success_and_failure_first() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let keys = storage_keys_for_shard(&diagnostics, 0, 2);
+
+        let ReadinessKey::Storage(account, storage_key) = keys[0] else { unreachable!() };
+        let prewarm = diagnostics.begin_prewarm(keys[0]);
+        let mut canonical = diagnostics.begin_storage_backing_read(account, storage_key);
+        canonical.finish(true);
+        drop(canonical);
+        drop(prewarm);
+
+        let ReadinessKey::Storage(account, storage_key) = keys[1] else { unreachable!() };
+        let prewarm = diagnostics.begin_prewarm(keys[1]);
+        drop(diagnostics.begin_storage_backing_read(account, storage_key));
+        drop(prewarm);
+
+        let unfinished = &diagnostics.storage_unfinished;
+        assert_eq!(unfinished.age.count.load(Ordering::Relaxed), 2);
+        assert_eq!(unfinished.overlap.count.load(Ordering::Relaxed), 2);
+        assert_eq!(unfinished.canonical_success_first.load(Ordering::Relaxed), 1);
+        assert_eq!(unfinished.canonical_failed_first.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn readiness_unfinished_storage_read_captures_exact_cohort_and_earliest_failure() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let key = storage_keys_for_shard(&diagnostics, 0, 1)[0];
+        let ReadinessKey::Storage(account, storage_key) = key else { unreachable!() };
+        let first = diagnostics.begin_prewarm(key);
+        let mut second = diagnostics.begin_prewarm(key);
+        let mut canonical = diagnostics.begin_storage_backing_read(account, storage_key);
+
+        drop(first);
+        second.finish_success();
+        drop(second);
+        canonical.finish(true);
+        drop(canonical);
+
+        let unfinished = &diagnostics.storage_unfinished;
+        assert_eq!(unfinished.multiple.load(Ordering::Relaxed), 1);
+        assert_eq!(unfinished.prewarm_failed_first.load(Ordering::Relaxed), 1);
+        assert_eq!(unfinished.prewarm_success_first.load(Ordering::Relaxed), 0);
+
+        // A retry started after the miss snapshot is outside its fixed cohort and cannot win it.
+        let original = diagnostics.begin_prewarm(key);
+        let mut canonical = diagnostics.begin_storage_backing_read(account, storage_key);
+        let mut later_retry = diagnostics.begin_prewarm(key);
+        later_retry.finish_success();
+        drop(later_retry);
+        canonical.finish(true);
+        drop(canonical);
+        drop(original);
+        assert_eq!(unfinished.canonical_success_first.load(Ordering::Relaxed), 1);
+
+        let winners = unfinished.prewarm_success_first.load(Ordering::Relaxed) +
+            unfinished.prewarm_failed_first.load(Ordering::Relaxed) +
+            unfinished.canonical_success_first.load(Ordering::Relaxed) +
+            unfinished.canonical_failed_first.load(Ordering::Relaxed) +
+            unfinished.winner_unknown.load(Ordering::Relaxed);
+        assert_eq!(unfinished.age.count.load(Ordering::Relaxed), 2);
+        assert_eq!(unfinished.overlap.count.load(Ordering::Relaxed), winners);
+    }
+
+    #[test]
+    fn readiness_unfinished_storage_timing_contention_is_unknown() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let key = storage_keys_for_shard(&diagnostics, 0, 1)[0];
+        let ReadinessKey::Storage(account, storage_key) = key else { unreachable!() };
+        let prewarm = diagnostics.begin_prewarm(key);
+        let keys = diagnostics.shard(key).keys.lock();
+        let state = Arc::clone(keys.entries.get(&key).expect("tracked key"));
+        let active_reads = state.active_reads.lock();
+        drop(keys);
+
+        drop(diagnostics.begin_storage_backing_read(account, storage_key));
+
+        let unfinished = &diagnostics.storage_unfinished;
+        assert_eq!(unfinished.unknown.load(Ordering::Relaxed), 1);
+        assert_eq!(unfinished.age.count.load(Ordering::Relaxed), 0);
+        assert_eq!(unfinished.overlap.count.load(Ordering::Relaxed), 0);
+        assert_eq!(unfinished.winner_unknown.load(Ordering::Relaxed), 0);
+        drop(active_reads);
+        drop(prewarm);
+    }
+
+    #[test]
+    fn readiness_lost_timing_registration_stays_conservatively_unknown() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let key = storage_keys_for_shard(&diagnostics, 0, 1)[0];
+        let ReadinessKey::Storage(account, storage_key) = key else { unreachable!() };
+        let first = diagnostics.begin_prewarm(key);
+        let keys = diagnostics.shard(key).keys.lock();
+        let state = Arc::clone(keys.entries.get(&key).expect("tracked key"));
+        let active_reads = state.active_reads.lock();
+        drop(keys);
+
+        let untracked = diagnostics.begin_prewarm(key);
+        drop(active_reads);
+        drop(diagnostics.begin_storage_backing_read(account, storage_key));
+
+        assert!(state.timing_coverage_lost.load(Ordering::Acquire));
+        assert_eq!(diagnostics.storage_unfinished.unknown.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.storage_unfinished.age.count.load(Ordering::Relaxed), 0);
+        drop(untracked);
+        drop(first);
+    }
+
+    #[test]
+    fn readiness_finishing_publication_races_are_unknown() {
+        let diagnostics = ReadinessDiagnostics::new();
+        let keys = storage_keys_for_shard(&diagnostics, 0, 2);
+
+        // A read already publishing its finish timestamp at the miss boundary cannot be placed
+        // precisely on either side of that boundary.
+        let prewarm = diagnostics.begin_prewarm(keys[0]);
+        prewarm
+            .instance
+            .as_ref()
+            .expect("timed prewarm read")
+            .outcome
+            .store(PREWARM_READ_FINISHING, Ordering::Release);
+        let ReadinessKey::Storage(account, storage_key) = keys[0] else { unreachable!() };
+        drop(diagnostics.begin_storage_backing_read(account, storage_key));
+        assert_eq!(diagnostics.storage_unfinished.unknown.load(Ordering::Relaxed), 1);
+        drop(prewarm);
+
+        // The same publication interval after a known-active snapshot makes only the winner
+        // unknown; the age and multiplicity at the snapshot remain valid.
+        let prewarm = diagnostics.begin_prewarm(keys[1]);
+        let ReadinessKey::Storage(account, storage_key) = keys[1] else { unreachable!() };
+        let canonical = diagnostics.begin_storage_backing_read(account, storage_key);
+        prewarm
+            .instance
+            .as_ref()
+            .expect("timed prewarm read")
+            .outcome
+            .store(PREWARM_READ_FINISHING, Ordering::Release);
+        drop(canonical);
+        assert_eq!(diagnostics.storage_unfinished.age.count.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.storage_unfinished.winner_unknown.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.storage_unfinished.overlap.count.load(Ordering::Relaxed), 0);
+        drop(prewarm);
     }
 
     #[test]

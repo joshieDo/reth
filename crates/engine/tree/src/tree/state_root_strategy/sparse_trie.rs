@@ -1,6 +1,6 @@
 //! Sparse Trie task related functionality.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use super::{evm_state_to_hashed_post_state, StateRootComputeOutcome, StateRootMessage};
 use alloy_primitives::{
@@ -319,7 +319,16 @@ where
                 },
             }
 
-            done = self.make_progress()?;
+            let progress_start = (self.finished_state_updates &&
+                self.dispatch_diagnostics.is_some())
+            .then(Instant::now);
+            let progress = self.make_progress();
+            if let (Some(start), Some(diagnostics)) =
+                (progress_start, self.dispatch_diagnostics.as_mut())
+            {
+                diagnostics.record_root_progress(start.elapsed());
+            }
+            done = progress?;
             idle_start = Instant::now();
         }
 
@@ -340,6 +349,9 @@ where
                     self.metrics
                         .sparse_trie_channel_wait_duration_histogram
                         .record(wake.duration_since(t));
+                    if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                        diagnostics.record_proof_wait(wake.duration_since(t));
+                    }
                     t = wake;
 
                     let Ok(result) = message else {
@@ -353,7 +365,14 @@ where
                 },
             }
 
-            done = self.make_progress()?;
+            let progress_start = self.dispatch_diagnostics.as_ref().map(|_| Instant::now());
+            let progress = self.make_progress();
+            if let (Some(start), Some(diagnostics)) =
+                (progress_start, self.dispatch_diagnostics.as_mut())
+            {
+                diagnostics.record_root_progress(start.elapsed());
+            }
+            done = progress?;
             idle_start = Instant::now();
         }
 
@@ -362,28 +381,30 @@ where
         debug!(target: "engine::root", "All proofs processed, ending calculation");
 
         let start = Instant::now();
-        let (state_root, trie_updates) =
-            match debug_span!(target: "lifecycle", "proof.trie.final_root")
-                .in_scope(|| self.trie.root_with_updates(self.new_epoch))
+        let final_root = debug_span!(target: "lifecycle", "proof.trie.final_root")
+            .in_scope(|| self.trie.root_with_updates(self.new_epoch));
+        if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+            diagnostics.record_final_root(start.elapsed());
+        }
+        let (state_root, trie_updates) = match final_root {
+            Ok(result) => result,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    SparseStateTrieErrorKind::Sparse(SparseTrieErrorKind::Blind)
+                ) =>
             {
-                Ok(result) => result,
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        SparseStateTrieErrorKind::Sparse(SparseTrieErrorKind::Blind)
-                    ) =>
-                {
-                    // A still-blind account trie means this block never changed state, so preserve
-                    // the cached parent root instead of fetching and revealing
-                    // the unchanged root node.
-                    (self.parent_state_root, TrieUpdates::default())
-                }
-                Err(err) => {
-                    return Err(StateRootTaskError::Other(format!(
-                        "could not calculate state root: {err:?}"
-                    )))
-                }
-            };
+                // A still-blind account trie means this block never changed state, so preserve
+                // the cached parent root instead of fetching and revealing
+                // the unchanged root node.
+                (self.parent_state_root, TrieUpdates::default())
+            }
+            Err(err) => {
+                return Err(StateRootTaskError::Other(format!(
+                    "could not calculate state root: {err:?}"
+                )))
+            }
+        };
 
         let end = Instant::now();
         self.metrics.sparse_trie_final_update_duration_histogram.record(end.duration_since(start));
@@ -413,6 +434,8 @@ where
         message: ProofResultMessage,
         t: &mut Instant,
     ) -> Result<(), StateRootTaskError> {
+        let coalesce_start =
+            (self.finished_state_updates && self.dispatch_diagnostics.is_some()).then(Instant::now);
         let coalesce = debug_span!(target: "lifecycle", "proof.trie.coalesce_results",
             result_count = tracing::field::Empty)
         .entered();
@@ -423,17 +446,38 @@ where
             result.extend(res);
             result_count += 1;
         }
+        let coalesce_end = coalesce_start.map(|_| Instant::now());
 
         coalesce.record("result_count", result_count);
         drop(coalesce);
+        if let (Some(coalesce_start), Some(coalesce_end)) = (coalesce_start, coalesce_end) {
+            let queue_after_drain = self.proof_result_rx.len();
+            let in_flight_after_drain = self.in_flight_proof_batches;
+            if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                diagnostics.record_result_drain(
+                    coalesce_end.duration_since(coalesce_start),
+                    result_count,
+                    queue_after_drain,
+                    in_flight_after_drain,
+                    coalesce_end,
+                );
+            }
+        }
         let phase_end = Instant::now();
         self.metrics
             .sparse_trie_proof_coalesce_duration_histogram
             .record(phase_end.duration_since(*t));
         *t = phase_end;
 
-        debug_span!(target: "lifecycle", "proof.trie.reveal_results")
-            .in_scope(|| self.on_proof_result(result))?;
+        let reveal_start =
+            (self.finished_state_updates && self.dispatch_diagnostics.is_some()).then(Instant::now);
+        let reveal = debug_span!(target: "lifecycle", "proof.trie.reveal_results")
+            .in_scope(|| self.on_proof_result(result));
+        if let (Some(start), Some(diagnostics)) = (reveal_start, self.dispatch_diagnostics.as_mut())
+        {
+            diagnostics.record_reveal(start.elapsed());
+        }
+        reveal?;
         self.metrics.sparse_trie_reveal_multiproof_duration_histogram.record(t.elapsed());
         Ok(())
     }
@@ -500,7 +544,8 @@ where
                 None
             }
             SparseTrieTaskMessage::FinishedStateUpdates => {
-                if let Some(diagnostics) = &self.dispatch_diagnostics {
+                if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+                    diagnostics.start_root_tail();
                     diagnostics.emit_updates_finished_snapshot(
                         self.in_flight_proof_batches,
                         self.pending_targets.account_len(),
@@ -515,6 +560,13 @@ where
                 self.finished_state_updates = true;
                 Some(hashed_state)
             }
+        }
+    }
+
+    /// Emits the post-execution root-tail breakdown immediately before publishing the result.
+    pub(super) fn emit_root_tail(&mut self, success: bool) {
+        if let Some(diagnostics) = self.dispatch_diagnostics.as_mut() {
+            diagnostics.emit_root_tail(true, success);
         }
     }
 
@@ -1156,12 +1208,32 @@ struct ProofDispatchDiagnostics {
     split_when_queue_nonempty: u64,
     split_when_storage_queue_nonempty: u64,
     outstanding_max: u64,
+    root_tail_start: Option<Instant>,
+    root_tail_emitted: bool,
+    proof_wait_ns: u64,
+    proof_wait_count: u64,
+    proof_wait_max_ns: u64,
+    proof_wait_last_ns: u64,
+    result_drain_ns: u64,
+    result_drain_count: u64,
+    result_messages_consumed: u64,
+    result_last_drain_count: u64,
+    result_queue_after_last_drain: u64,
+    in_flight_after_last_drain: u64,
+    last_result_consumed_at: Option<Instant>,
+    reveal_ns: u64,
+    progress_ns: u64,
+    final_root_ns: u64,
 }
 
 impl ProofDispatchDiagnostics {
     fn new() -> Option<Self> {
-        reth_tracing::readiness::enabled().then(|| Self {
-            parent: tracing::Span::current(),
+        reth_tracing::readiness::enabled().then(|| Self::empty(tracing::Span::current()))
+    }
+
+    fn empty(parent: tracing::Span) -> Self {
+        Self {
+            parent,
             dispatches: 0,
             targets: 0,
             chunks: 0,
@@ -1176,7 +1248,115 @@ impl ProofDispatchDiagnostics {
             split_when_queue_nonempty: 0,
             split_when_storage_queue_nonempty: 0,
             outstanding_max: 0,
-        })
+            root_tail_start: None,
+            root_tail_emitted: false,
+            proof_wait_ns: 0,
+            proof_wait_count: 0,
+            proof_wait_max_ns: 0,
+            proof_wait_last_ns: 0,
+            result_drain_ns: 0,
+            result_drain_count: 0,
+            result_messages_consumed: 0,
+            result_last_drain_count: 0,
+            result_queue_after_last_drain: 0,
+            in_flight_after_last_drain: 0,
+            last_result_consumed_at: None,
+            reveal_ns: 0,
+            progress_ns: 0,
+            final_root_ns: 0,
+        }
+    }
+
+    fn start_root_tail(&mut self) {
+        self.root_tail_start.get_or_insert_with(Instant::now);
+    }
+
+    fn record_proof_wait(&mut self, elapsed: Duration) {
+        let ns = duration_ns(elapsed);
+        self.proof_wait_ns = self.proof_wait_ns.saturating_add(ns);
+        self.proof_wait_count = self.proof_wait_count.saturating_add(1);
+        self.proof_wait_max_ns = self.proof_wait_max_ns.max(ns);
+        self.proof_wait_last_ns = ns;
+    }
+
+    fn record_result_drain(
+        &mut self,
+        elapsed: Duration,
+        result_count: u64,
+        result_queue_after_drain: usize,
+        in_flight_after_drain: usize,
+        last_result_consumed_at: Instant,
+    ) {
+        self.result_drain_ns = self.result_drain_ns.saturating_add(duration_ns(elapsed));
+        self.result_drain_count = self.result_drain_count.saturating_add(1);
+        self.result_messages_consumed = self.result_messages_consumed.saturating_add(result_count);
+        self.result_last_drain_count = result_count;
+        self.result_queue_after_last_drain = result_queue_after_drain as u64;
+        self.in_flight_after_last_drain = in_flight_after_drain as u64;
+        self.last_result_consumed_at = Some(last_result_consumed_at);
+    }
+
+    fn record_reveal(&mut self, elapsed: Duration) {
+        self.reveal_ns = self.reveal_ns.saturating_add(duration_ns(elapsed));
+    }
+
+    fn record_root_progress(&mut self, elapsed: Duration) {
+        self.progress_ns = self.progress_ns.saturating_add(duration_ns(elapsed));
+    }
+
+    fn record_final_root(&mut self, elapsed: Duration) {
+        self.final_root_ns = self.final_root_ns.saturating_add(duration_ns(elapsed));
+    }
+
+    fn emit_root_tail(&mut self, result_ready: bool, success: bool) {
+        if self.root_tail_emitted {
+            return
+        }
+        self.root_tail_emitted = true;
+        let now = Instant::now();
+        let root_tail_ns =
+            self.root_tail_start.map_or(0, |start| duration_ns(now.duration_since(start)));
+        let phase_accounted_ns = self
+            .proof_wait_ns
+            .saturating_add(self.result_drain_ns)
+            .saturating_add(self.reveal_ns)
+            .saturating_add(self.progress_ns)
+            .saturating_add(self.final_root_ns);
+        let phase_residual_ns = root_tail_ns.saturating_sub(phase_accounted_ns);
+        let phase_coverage_ppm = if root_tail_ns == 0 {
+            0
+        } else {
+            phase_accounted_ns.saturating_mul(1_000_000).checked_div(root_tail_ns).unwrap_or(0)
+        };
+        let last_result_consumed_to_root_ready_ns =
+            self.last_result_consumed_at.map_or(0, |last| duration_ns(now.duration_since(last)));
+        tracing::info!(
+            target: "lifecycle",
+            parent: &self.parent,
+            stage = "proof_root_tail_totals",
+            root_tail_started = u64::from(self.root_tail_start.is_some()),
+            root_result_ready = u64::from(result_ready),
+            root_success = u64::from(success),
+            root_tail_ns,
+            proof_wait_ns = self.proof_wait_ns,
+            proof_wait_count = self.proof_wait_count,
+            proof_wait_max_ns = self.proof_wait_max_ns,
+            proof_wait_last_ns = self.proof_wait_last_ns,
+            result_drain_ns = self.result_drain_ns,
+            result_drain_count = self.result_drain_count,
+            result_messages_consumed = self.result_messages_consumed,
+            result_last_drain_count = self.result_last_drain_count,
+            result_queue_after_last_drain = self.result_queue_after_last_drain,
+            in_flight_after_last_drain = self.in_flight_after_last_drain,
+            reveal_ns = self.reveal_ns,
+            progress_ns = self.progress_ns,
+            final_root_ns = self.final_root_ns,
+            phase_accounted_ns,
+            phase_residual_ns,
+            phase_coverage_ppm,
+            had_result_after_finish = u64::from(self.last_result_consumed_at.is_some()),
+            last_result_consumed_to_root_ready_ns,
+        );
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1292,8 +1472,13 @@ const fn split_reason_index(reason: ProofDispatchReason) -> Option<usize> {
 
 impl Drop for ProofDispatchDiagnostics {
     fn drop(&mut self) {
+        self.emit_root_tail(false, false);
         self.emit();
     }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
 const fn queue_depth_bin(depth: usize) -> usize {
@@ -1443,23 +1628,7 @@ mod tests {
 
     #[test]
     fn proof_dispatch_diagnostics_aggregate_queue_depths() {
-        let mut diagnostics = ProofDispatchDiagnostics {
-            parent: tracing::Span::none(),
-            dispatches: 0,
-            targets: 0,
-            chunks: 0,
-            reason_counts: [0; 4],
-            queue_samples: 0,
-            account_queue_high_water: 0,
-            storage_queue_high_water: 0,
-            account_queue_depth_bins: [0; 4],
-            storage_queue_depth_bins: [0; 4],
-            split_reason_account_queue_nonempty: [0; 3],
-            split_reason_storage_queue_nonempty: [0; 3],
-            split_when_queue_nonempty: 0,
-            split_when_storage_queue_nonempty: 0,
-            outstanding_max: 0,
-        };
+        let mut diagnostics = ProofDispatchDiagnostics::empty(tracing::Span::none());
 
         diagnostics.record_dispatch(ProofDispatchReason::Unsplit, 3, 1, 0, 8, 1, 8, 1);
         diagnostics.record_dispatch(ProofDispatchReason::Force, 301, 61, 33, 9, 92, 10, 62);
@@ -1482,15 +1651,59 @@ mod tests {
     }
 
     #[test]
+    fn proof_root_tail_diagnostics_track_post_finish_phases() {
+        let mut diagnostics = ProofDispatchDiagnostics::empty(tracing::Span::none());
+        diagnostics.start_root_tail();
+        diagnostics.record_proof_wait(Duration::from_nanos(11));
+        diagnostics.record_proof_wait(Duration::from_nanos(17));
+        diagnostics.record_result_drain(Duration::from_nanos(7), 3, 2, 5, Instant::now());
+        diagnostics.record_result_drain(Duration::from_nanos(9), 4, 0, 1, Instant::now());
+        diagnostics.record_reveal(Duration::from_nanos(5));
+        diagnostics.record_root_progress(Duration::from_nanos(13));
+        diagnostics.record_final_root(Duration::from_nanos(19));
+
+        assert_eq!(diagnostics.proof_wait_ns, 28);
+        assert_eq!(diagnostics.proof_wait_count, 2);
+        assert_eq!(diagnostics.proof_wait_max_ns, 17);
+        assert_eq!(diagnostics.proof_wait_last_ns, 17);
+        assert_eq!(diagnostics.result_drain_ns, 16);
+        assert_eq!(diagnostics.result_drain_count, 2);
+        assert_eq!(diagnostics.result_messages_consumed, 7);
+        assert_eq!(diagnostics.result_last_drain_count, 4);
+        assert_eq!(diagnostics.result_queue_after_last_drain, 0);
+        assert_eq!(diagnostics.in_flight_after_last_drain, 1);
+        assert_eq!(diagnostics.reveal_ns, 5);
+        assert_eq!(diagnostics.progress_ns, 13);
+        assert_eq!(diagnostics.final_root_ns, 19);
+        assert!(diagnostics.last_result_consumed_at.is_some());
+
+        // The explicit-parent test below exercises emission. Avoid emitting this shared callsite
+        // outside a subscriber because Rust tests run concurrently and tracing caches callsite
+        // interest across dispatchers.
+        diagnostics.root_tail_emitted = true;
+    }
+
+    #[test]
     fn proof_dispatch_summary_has_explicit_root_parent() {
-        use std::sync::Mutex;
+        use std::{collections::BTreeMap, sync::Mutex};
         use tracing::{
+            field::{Field, Visit},
             span::{Attributes, Id, Record},
             Event, Metadata, Subscriber,
         };
 
         #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<Option<(u64, u64)>>>);
+        struct Capture(Arc<Mutex<Vec<(u64, BTreeMap<String, u64>)>>>);
+
+        struct FieldVisitor<'a>(&'a mut BTreeMap<String, u64>);
+
+        impl Visit for FieldVisitor<'_> {
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.insert(field.name().to_string(), value);
+            }
+        }
 
         impl Subscriber for Capture {
             fn enabled(&self, _: &Metadata<'_>) -> bool {
@@ -1504,7 +1717,9 @@ mod tests {
             fn event(&self, event: &Event<'_>) {
                 if event.metadata().target() == "lifecycle" {
                     let parent = event.parent().expect("summary must have an explicit parent");
-                    *self.0.lock().unwrap() = Some((7, parent.into_u64()));
+                    let mut fields = BTreeMap::new();
+                    event.record(&mut FieldVisitor(&mut fields));
+                    self.0.lock().unwrap().push((parent.into_u64(), fields));
                 }
             }
             fn enter(&self, _: &Id) {}
@@ -1514,26 +1729,17 @@ mod tests {
         let capture = Capture::default();
         tracing::subscriber::with_default(capture.clone(), || {
             let root = tracing::info_span!("root_task");
-            let diagnostics = ProofDispatchDiagnostics {
-                parent: root,
-                dispatches: 0,
-                targets: 0,
-                chunks: 0,
-                reason_counts: [0; 4],
-                queue_samples: 0,
-                account_queue_high_water: 0,
-                storage_queue_high_water: 0,
-                account_queue_depth_bins: [0; 4],
-                storage_queue_depth_bins: [0; 4],
-                split_reason_account_queue_nonempty: [0; 3],
-                split_reason_storage_queue_nonempty: [0; 3],
-                split_when_queue_nonempty: 0,
-                split_when_storage_queue_nonempty: 0,
-                outstanding_max: 0,
-            };
+            let diagnostics = ProofDispatchDiagnostics::empty(root);
             drop(diagnostics);
         });
-        assert_eq!(*capture.0.lock().unwrap(), Some((7, 7)));
+        let captured = capture.0.lock().unwrap();
+        let (parent, fields) = captured
+            .iter()
+            .find(|(_, fields)| fields.contains_key("root_result_ready"))
+            .expect("root-tail summary event");
+        assert_eq!(*parent, 7);
+        assert_eq!(fields["root_result_ready"], 0);
+        assert_eq!(fields["root_success"], 0);
     }
 
     #[test]
@@ -1584,23 +1790,7 @@ mod tests {
 
         let capture = Capture::default();
         tracing::subscriber::with_default(capture.clone(), || {
-            let diagnostics = ProofDispatchDiagnostics {
-                parent: tracing::info_span!("root_task"),
-                dispatches: 0,
-                targets: 0,
-                chunks: 0,
-                reason_counts: [0; 4],
-                queue_samples: 0,
-                account_queue_high_water: 0,
-                storage_queue_high_water: 0,
-                account_queue_depth_bins: [0; 4],
-                storage_queue_depth_bins: [0; 4],
-                split_reason_account_queue_nonempty: [0; 3],
-                split_reason_storage_queue_nonempty: [0; 3],
-                split_when_queue_nonempty: 0,
-                split_when_storage_queue_nonempty: 0,
-                outstanding_max: 0,
-            };
+            let diagnostics = ProofDispatchDiagnostics::empty(tracing::info_span!("root_task"));
             diagnostics.emit_updates_finished_snapshot(13, 3, 5, 7, 11, 2);
         });
 
@@ -1843,6 +2033,91 @@ mod tests {
         assert_eq!(outcome.state_root, parent_state_root);
         assert!(outcome.trie_updates.is_empty());
         assert!(task.trie.state_trie_ref().is_none(), "blind trie should not be revealed");
+
+        drop(task);
+        drain_sparse_trie_tasks(&runtime);
+    }
+
+    #[test]
+    fn root_tail_diagnostics_measure_delayed_final_proof_in_run_loop() {
+        let runtime = reth_tasks::Runtime::test();
+        let provider_factory = create_test_provider_factory();
+        let anchor_hash = init_genesis(&provider_factory).expect("failed to initialize genesis");
+        let state_provider_factory = OverlayStateProviderFactory::new(
+            provider_factory,
+            OverlayManager::<reth_chain_state::EthPrimitives>::default()
+                .overlay_builder(anchor_hash),
+        );
+
+        // Route worker results through a test relay so the run loop has a controlled final
+        // dependency after it consumes FinishedStateUpdates.
+        let (worker_result_tx, worker_result_rx) = crossbeam_channel::unbounded();
+        let (task_result_tx, task_result_rx) = crossbeam_channel::unbounded();
+        let proof_worker_handle = ProofWorkerHandle::new(
+            &runtime,
+            ProofTaskCtx::new(state_provider_factory),
+            false,
+            worker_result_tx.clone(),
+        );
+
+        let default_trie = RevealableSparseTrie::blind_from(ArenaParallelSparseTrie::default());
+        let trie = SparseStateTrie::default()
+            .with_accounts_trie(default_trie.clone())
+            .with_default_storage_trie(default_trie)
+            .with_updates(true);
+        let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+        let (_cancel_guard, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+        let mut task = SparseTrieCacheTask::new_with_trie(
+            &runtime,
+            updates_rx,
+            cancel_rx,
+            std::sync::mpsc::channel().0,
+            proof_worker_handle,
+            worker_result_tx,
+            task_result_rx,
+            SparseTrieTaskMetrics::default(),
+            trie,
+            B256::from([0x55; 32]),
+            TrieNodeEpoch::UNMODIFIED,
+            1,
+        );
+        task.dispatch_diagnostics = Some(ProofDispatchDiagnostics::empty(tracing::Span::none()));
+
+        let relay = std::thread::spawn(move || {
+            let result =
+                worker_result_rx.recv_timeout(Duration::from_secs(2)).expect("proof worker result");
+            std::thread::sleep(Duration::from_millis(10));
+            task_result_tx.send(result).expect("sparse trie result receiver");
+        });
+
+        let mut hashed_state = HashedPostState::default();
+        hashed_state
+            .accounts
+            .insert(keccak256(Address::random()), Some(Account { nonce: 1, ..Default::default() }));
+        updates_tx.send(StateRootMessage::HashedStateUpdate(hashed_state)).unwrap();
+        updates_tx.send(StateRootMessage::FinishedStateUpdates).unwrap();
+        drop(updates_tx);
+
+        task.run().expect("state root computation should succeed");
+        relay.join().expect("proof result relay");
+
+        let diagnostics = task.dispatch_diagnostics.as_ref().expect("diagnostics enabled");
+        let root_tail_ns =
+            duration_ns(diagnostics.root_tail_start.expect("finish marker consumed").elapsed());
+        let phase_accounted_ns = diagnostics
+            .proof_wait_ns
+            .saturating_add(diagnostics.result_drain_ns)
+            .saturating_add(diagnostics.reveal_ns)
+            .saturating_add(diagnostics.progress_ns)
+            .saturating_add(diagnostics.final_root_ns);
+        assert_eq!(diagnostics.proof_wait_count, 1);
+        assert!(diagnostics.proof_wait_ns >= duration_ns(Duration::from_millis(1)));
+        assert_eq!(diagnostics.result_drain_count, 1);
+        assert_eq!(diagnostics.result_messages_consumed, 1);
+        assert_eq!(diagnostics.result_queue_after_last_drain, 0);
+        assert_eq!(diagnostics.in_flight_after_last_drain, 0);
+        assert!(diagnostics.last_result_consumed_at.is_some());
+        assert!(phase_accounted_ns <= root_tail_ns);
 
         drop(task);
         drain_sparse_trie_tasks(&runtime);

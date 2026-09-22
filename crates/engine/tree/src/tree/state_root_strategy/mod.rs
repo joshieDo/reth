@@ -672,6 +672,7 @@ impl DefaultStateRootStrategy {
                 None
             };
 
+            task.emit_root_tail(result.is_ok());
             emit_state_root_result_ready(&task_span, result.is_ok());
             if state_root_tx.send(result).is_err() {
                 // A continuation task can take the pending trie during the narrow window between

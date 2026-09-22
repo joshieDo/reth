@@ -130,6 +130,7 @@ impl Visit for MilestoneStage {
                 "execution_cache_readiness" |
                 "proof_dispatch_totals" |
                 "proof_state_at_updates_finished" |
+                "proof_root_tail_totals" |
                 "state_root_result_ready" |
                 "execution_totals" |
                 "proof_storage_worker_totals" |
@@ -781,6 +782,7 @@ const STAGES: &[&str] = &[
     "execution_cache_readiness",
     "proof_dispatch_totals",
     "proof_state_at_updates_finished",
+    "proof_root_tail_totals",
     "state_root_result_ready",
     "execution_totals",
     "proof_storage_worker_totals",
@@ -813,7 +815,48 @@ fn numeric_field(name: &str) -> bool {
     let name = canonical_field(name);
     matches!(
         name,
-        "read_execution_mode" |
+        "storage_unfinished_at_miss_count" |
+            "storage_unfinished_at_miss_single" |
+            "storage_unfinished_at_miss_multiple" |
+            "storage_unfinished_at_miss_unknown" |
+            "storage_unfinished_age_ns" |
+            "storage_unfinished_age_max_ns" |
+            "storage_unfinished_overlap_count" |
+            "storage_unfinished_overlap_ns" |
+            "storage_unfinished_overlap_max_ns" |
+            "storage_unfinished_prewarm_success_first" |
+            "storage_unfinished_prewarm_failed_first" |
+            "storage_unfinished_canonical_success_first" |
+            "storage_unfinished_canonical_failed_first" |
+            "storage_unfinished_winner_unknown" |
+            "root_tail_started" |
+            "root_result_ready" |
+            "root_success" |
+            "root_tail_ns" |
+            "proof_wait_ns" |
+            "proof_wait_count" |
+            "proof_wait_max_ns" |
+            "proof_wait_last_ns" |
+            "result_drain_ns" |
+            "result_drain_count" |
+            "result_messages_consumed" |
+            "result_last_drain_count" |
+            "result_queue_after_last_drain" |
+            "in_flight_after_last_drain" |
+            "reveal_ns" |
+            "progress_ns" |
+            "final_root_ns" |
+            "phase_accounted_ns" |
+            "phase_residual_ns" |
+            "phase_coverage_ppm" |
+            "had_result_after_finish" |
+            "last_result_consumed_to_root_ready_ns" |
+            "grouping_enabled" |
+            "grouped_dispatches" |
+            "grouped_chunks" |
+            "grouped_targets" |
+            "effective_group_size_max" |
+            "read_execution_mode" |
             "read_role" |
             "read_class" |
             "read_calls" |
@@ -1528,7 +1571,8 @@ mod tests {
                     dispatches=2u64, reason_force=1u64, split_when_queue_nonempty=1u64,
                     split_when_storage_queue_nonempty=1u64,
                     split_force_account_queue_nonempty=1u64,
-                    split_force_storage_queue_nonempty=1u64);
+                    split_force_storage_queue_nonempty=1u64,
+                    grouping_enabled=1u64, grouped_dispatches=1u64, grouped_chunks=1u64, grouped_targets=1u64, effective_group_size_max=1u64);
                 tracing::info!(target: "lifecycle", parent: &parent, stage="execution_cache_readiness",
                     cache_checkout_reason=2u64, storage_miss_prewarm_never_observed=0u64,
                     prewarm_queue_delay_count=1u64, prewarm_queue_delay_ns=1u64,
@@ -1546,7 +1590,21 @@ mod tests {
                     storage_backing_never_max_ns=1u64, storage_backing_unknown_count=1u64,
                     storage_backing_unknown_ns=1u64, storage_backing_unknown_max_ns=1u64,
                     storage_backing_failed_count=1u64, storage_backing_failed_ns=1u64,
-                    storage_backing_failed_max_ns=1u64, private_counter=999u64);
+                    storage_backing_failed_max_ns=1u64,
+                    storage_unfinished_at_miss_count=1u64,
+                    storage_unfinished_at_miss_single=1u64,
+                    storage_unfinished_at_miss_multiple=1u64,
+                    storage_unfinished_at_miss_unknown=1u64,
+                    storage_unfinished_age_ns=1u64,
+                    storage_unfinished_age_max_ns=1u64,
+                    storage_unfinished_overlap_count=1u64,
+                    storage_unfinished_overlap_ns=1u64,
+                    storage_unfinished_overlap_max_ns=1u64,
+                    storage_unfinished_prewarm_success_first=1u64,
+                    storage_unfinished_prewarm_failed_first=1u64,
+                    storage_unfinished_canonical_success_first=1u64,
+                    storage_unfinished_canonical_failed_first=1u64,
+                    storage_unfinished_winner_unknown=1u64, private_counter=999u64);
                 tracing::info!(target: "lifecycle", parent: &parent,
                     stage="builder_execution_done", private_builder="must-not-escape");
                 tracing::info!(target: "lifecycle", parent: &parent,
@@ -1558,6 +1616,29 @@ mod tests {
                     pending_storage_targets=2u64, account_queue_depth=4u64,
                     storage_queue_depth=5u64, result_queue_depth=6u64,
                     private_queue="must-not-escape");
+                tracing::info!(target: "lifecycle", parent: &dispatch_parent, stage="proof_root_tail_totals",
+                    root_tail_started=1u64,
+                    root_result_ready=1u64,
+                    root_success=1u64,
+                    root_tail_ns=1u64,
+                    proof_wait_ns=1u64,
+                    proof_wait_count=1u64,
+                    proof_wait_max_ns=1u64,
+                    proof_wait_last_ns=1u64,
+                    result_drain_ns=1u64,
+                    result_drain_count=1u64,
+                    result_messages_consumed=1u64,
+                    result_last_drain_count=1u64,
+                    result_queue_after_last_drain=1u64,
+                    in_flight_after_last_drain=1u64,
+                    reveal_ns=1u64,
+                    progress_ns=1u64,
+                    final_root_ns=1u64,
+                    phase_accounted_ns=1u64,
+                    phase_residual_ns=1u64,
+                    phase_coverage_ppm=1u64,
+                    had_result_after_finish=1u64,
+                    last_result_consumed_to_root_ready_ns=1u64, key="must-not-escape", private_root=999u64);
                 // A string cannot pass through a numeric field.
                 tracing::info!(target: "lifecycle", parent: &parent, stage="read_totals",
                     read_ns="must-not-escape");
@@ -1574,11 +1655,15 @@ mod tests {
             let dispatch_owner =
                 rows.iter().find(|row| row["name"] == "sparse_trie_task").unwrap()["id"].clone();
             let events: Vec<_> = rows.iter().filter(|row| row["type"] == "event").collect();
-            assert_eq!(events.len(), 9);
+            assert_eq!(events.len(), 10);
             assert!(events.iter().all(|row| {
                 let dispatch_event = matches!(
                     row["fields"]["stage"].as_str(),
-                    Some("proof_dispatch_totals" | "proof_state_at_updates_finished")
+                    Some(
+                        "proof_dispatch_totals" |
+                            "proof_state_at_updates_finished" |
+                            "proof_root_tail_totals"
+                    )
                 );
                 &row["id"] == if dispatch_event { &dispatch_owner } else { &owner }
             }));
@@ -1595,6 +1680,20 @@ mod tests {
                 .unwrap();
             assert_eq!(cache["fields"]["cache_checkout_reason"], 2);
             for field in [
+                "storage_unfinished_at_miss_count",
+                "storage_unfinished_at_miss_single",
+                "storage_unfinished_at_miss_multiple",
+                "storage_unfinished_at_miss_unknown",
+                "storage_unfinished_age_ns",
+                "storage_unfinished_age_max_ns",
+                "storage_unfinished_overlap_count",
+                "storage_unfinished_overlap_ns",
+                "storage_unfinished_overlap_max_ns",
+                "storage_unfinished_prewarm_success_first",
+                "storage_unfinished_prewarm_failed_first",
+                "storage_unfinished_canonical_success_first",
+                "storage_unfinished_canonical_failed_first",
+                "storage_unfinished_winner_unknown",
                 "prewarm_queue_delay_count",
                 "prewarm_queue_delay_ns",
                 "prewarm_queue_delay_max_ns",
@@ -1630,6 +1729,46 @@ mod tests {
                 assert_eq!(cache["fields"][field], 1, "missing numeric field {field}");
             }
             assert!(cache["fields"].get("private_counter").is_none());
+            let tail = events
+                .iter()
+                .find(|row| row["fields"]["stage"] == "proof_root_tail_totals")
+                .unwrap();
+            for field in [
+                "root_tail_started",
+                "root_result_ready",
+                "root_success",
+                "root_tail_ns",
+                "proof_wait_ns",
+                "proof_wait_count",
+                "proof_wait_max_ns",
+                "proof_wait_last_ns",
+                "result_drain_ns",
+                "result_drain_count",
+                "result_messages_consumed",
+                "result_last_drain_count",
+                "result_queue_after_last_drain",
+                "in_flight_after_last_drain",
+                "reveal_ns",
+                "progress_ns",
+                "final_root_ns",
+                "phase_accounted_ns",
+                "phase_residual_ns",
+                "phase_coverage_ppm",
+                "had_result_after_finish",
+                "last_result_consumed_to_root_ready_ns",
+            ] {
+                assert_eq!(tail["fields"][field], 1, "missing root-tail field {field}");
+            }
+            assert!(tail["fields"].get("private_root").is_none());
+            for field in [
+                "grouping_enabled",
+                "grouped_dispatches",
+                "grouped_chunks",
+                "grouped_targets",
+                "effective_group_size_max",
+            ] {
+                assert_eq!(events[3]["fields"][field], 1);
+            }
 
             let builder = events
                 .iter()
