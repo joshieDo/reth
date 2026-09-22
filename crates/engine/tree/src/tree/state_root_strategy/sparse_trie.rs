@@ -63,6 +63,9 @@ pub(super) struct SparseTrieCacheTask<A = ArenaParallelSparseTrie, S = ArenaPara
     /// there are any active workers and force chunking across workers. This is to prevent tasks
     /// which are very long from hitting a single worker.
     max_targets_for_chunking: usize,
+    /// Whether queued proof work should be grouped into larger multiproofs while worker pools are
+    /// backed up.
+    backlog_grouping_enabled: bool,
 
     /// Account trie updates.
     account_updates: B256Map<LeafUpdate>,
@@ -158,6 +161,8 @@ where
             Self::run_hashing_task(updates, hashed_state_tx, hashing_metrics)
         });
 
+        let backlog_grouping_enabled = proof_backlog_grouping_enabled();
+
         Self {
             proof_result_tx,
             proof_result_rx,
@@ -170,6 +175,7 @@ where
             new_epoch,
             chunk_size,
             max_targets_for_chunking: DEFAULT_MAX_TARGETS_FOR_CHUNKING,
+            backlog_grouping_enabled,
             account_updates: Default::default(),
             storage_updates: Default::default(),
             new_account_updates: Default::default(),
@@ -185,7 +191,7 @@ where
             storage_cache_misses: 0,
             pending_targets: Default::default(),
             in_flight_proof_batches: 0,
-            dispatch_diagnostics: ProofDispatchDiagnostics::new(),
+            dispatch_diagnostics: ProofDispatchDiagnostics::new(backlog_grouping_enabled),
             pending_updates: Default::default(),
             initial_updates_applied: false,
             final_hashed_state: Default::default(),
@@ -959,30 +965,47 @@ where
 
         let _span = trace_span!("dispatch_pending_targets").entered();
         let (targets, chunking_length) = self.pending_targets.take();
+        let account_queue_depth = self.proof_worker_handle.pending_account_tasks();
+        let storage_queue_depth = self.proof_worker_handle.pending_storage_tasks();
+        let effective_chunk_size = proof_dispatch_chunk_size(
+            self.backlog_grouping_enabled,
+            self.chunk_size,
+            account_queue_depth,
+            storage_queue_depth,
+            self.proof_worker_handle.total_account_workers(),
+            self.proof_worker_handle.total_storage_workers(),
+        );
         let has_multiple_idle_account_workers =
             self.proof_worker_handle.has_multiple_idle_account_workers();
         let has_multiple_idle_storage_workers =
             self.proof_worker_handle.has_multiple_idle_storage_workers();
-        let dispatch_sample = self.dispatch_diagnostics.as_ref().map(|_| {
-            (
-                classify_dispatch(
-                    chunking_length,
-                    self.chunk_size,
-                    self.max_targets_for_chunking,
-                    has_multiple_idle_account_workers,
-                    has_multiple_idle_storage_workers,
-                ),
-                self.proof_worker_handle.pending_account_tasks(),
-                self.proof_worker_handle.pending_storage_tasks(),
-            )
-        });
+        let control_decision = classify_dispatch(
+            chunking_length,
+            self.chunk_size,
+            self.max_targets_for_chunking,
+            has_multiple_idle_account_workers,
+            has_multiple_idle_storage_workers,
+        );
+        let decision = classify_dispatch(
+            chunking_length,
+            effective_chunk_size,
+            self.max_targets_for_chunking,
+            has_multiple_idle_account_workers,
+            has_multiple_idle_storage_workers,
+        );
+        let backlog_grouped = effective_chunk_size > self.chunk_size &&
+            control_decision != ProofDispatchReason::Unsplit;
+        let dispatch_sample = self
+            .dispatch_diagnostics
+            .as_ref()
+            .map(|_| (decision, account_queue_depth, storage_queue_depth));
         let diagnostics_enabled = dispatch_sample.is_some();
         let mut chunks_dispatched = 0usize;
         let mut dispatch_error = None;
         dispatch_with_chunking(
             targets,
             chunking_length,
-            self.chunk_size,
+            effective_chunk_size,
             self.max_targets_for_chunking,
             has_multiple_idle_account_workers,
             has_multiple_idle_storage_workers,
@@ -1030,6 +1053,8 @@ where
                 account_queue_high_water,
                 storage_queue_high_water,
                 self.in_flight_proof_batches,
+                backlog_grouped,
+                effective_chunk_size,
             );
         }
 
@@ -1154,8 +1179,43 @@ pub(super) struct SparseTrieTaskMetrics {
 /// fetched by a single worker. If exceeded, chunking is forced regardless of worker availability.
 const DEFAULT_MAX_TARGETS_FOR_CHUNKING: usize = 300;
 
+/// Private opt-in for grouping proof work while the worker queues are backed up.
+const PROOF_BACKLOG_GROUPING_ENV: &str = "RETH_EXPERIMENTAL_PROOF_BACKLOG_GROUPING";
+
+/// Maximum target count used by the initial backlog-grouping experiment.
+const PROOF_BACKLOG_GROUP_SIZE: usize = 32;
+
 /// Start proof fetching while the first state-update batch is still arriving.
 const INITIAL_UPDATE_BATCH_SIZE: usize = 64;
+
+fn proof_backlog_grouping_enabled() -> bool {
+    proof_backlog_grouping_enabled_value(std::env::var_os(PROOF_BACKLOG_GROUPING_ENV).as_deref())
+}
+
+fn proof_backlog_grouping_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+fn proof_dispatch_chunk_size(
+    grouping_enabled: bool,
+    chunk_size: usize,
+    account_queue_depth: usize,
+    storage_queue_depth: usize,
+    account_worker_count: usize,
+    storage_worker_count: usize,
+) -> usize {
+    if !grouping_enabled {
+        return chunk_size
+    }
+
+    let account_backed_up = account_worker_count > 0 && account_queue_depth >= account_worker_count;
+    let storage_backed_up = storage_worker_count > 0 && storage_queue_depth >= storage_worker_count;
+    if account_backed_up || storage_backed_up {
+        chunk_size.max(PROOF_BACKLOG_GROUP_SIZE)
+    } else {
+        chunk_size
+    }
+}
 
 /// Why a pending target set was split, or why it remained a single batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1194,6 +1254,7 @@ fn classify_dispatch(
 /// Per-root, identity-free proof admission diagnostics.
 struct ProofDispatchDiagnostics {
     parent: tracing::Span,
+    grouping_enabled: bool,
     dispatches: u64,
     targets: u64,
     chunks: u64,
@@ -1224,16 +1285,22 @@ struct ProofDispatchDiagnostics {
     reveal_ns: u64,
     progress_ns: u64,
     final_root_ns: u64,
+    grouped_dispatches: u64,
+    grouped_chunks: u64,
+    grouped_targets: u64,
+    effective_group_size_max: u64,
 }
 
 impl ProofDispatchDiagnostics {
-    fn new() -> Option<Self> {
-        reth_tracing::readiness::enabled().then(|| Self::empty(tracing::Span::current()))
+    fn new(grouping_enabled: bool) -> Option<Self> {
+        reth_tracing::readiness::enabled()
+            .then(|| Self::empty(tracing::Span::current(), grouping_enabled))
     }
 
-    fn empty(parent: tracing::Span) -> Self {
+    fn empty(parent: tracing::Span, grouping_enabled: bool) -> Self {
         Self {
             parent,
+            grouping_enabled,
             dispatches: 0,
             targets: 0,
             chunks: 0,
@@ -1248,6 +1315,10 @@ impl ProofDispatchDiagnostics {
             split_when_queue_nonempty: 0,
             split_when_storage_queue_nonempty: 0,
             outstanding_max: 0,
+            grouped_dispatches: 0,
+            grouped_chunks: 0,
+            grouped_targets: 0,
+            effective_group_size_max: 0,
             root_tail_start: None,
             root_tail_emitted: false,
             proof_wait_ns: 0,
@@ -1370,6 +1441,8 @@ impl ProofDispatchDiagnostics {
         account_queue_high_water: usize,
         storage_queue_high_water: usize,
         outstanding: usize,
+        backlog_grouped: bool,
+        effective_chunk_size: usize,
     ) {
         self.dispatches = self.dispatches.saturating_add(1);
         self.targets = self.targets.saturating_add(targets as u64);
@@ -1400,6 +1473,13 @@ impl ProofDispatchDiagnostics {
             }
         }
         self.outstanding_max = self.outstanding_max.max(outstanding as u64);
+        if backlog_grouped {
+            self.grouped_dispatches = self.grouped_dispatches.saturating_add(1);
+            self.grouped_chunks = self.grouped_chunks.saturating_add(chunks as u64);
+            self.grouped_targets = self.grouped_targets.saturating_add(targets as u64);
+            self.effective_group_size_max =
+                self.effective_group_size_max.max(effective_chunk_size as u64);
+        }
     }
 
     fn emit(&self) {
@@ -1407,6 +1487,7 @@ impl ProofDispatchDiagnostics {
             target: "lifecycle",
             parent: &self.parent,
             stage = "proof_dispatch_totals",
+            grouping_enabled = self.grouping_enabled as u64,
             dispatches = self.dispatches,
             targets = self.targets,
             chunks = self.chunks,
@@ -1434,6 +1515,10 @@ impl ProofDispatchDiagnostics {
             split_account_idle_storage_queue_nonempty = self.split_reason_storage_queue_nonempty[1],
             split_storage_idle_storage_queue_nonempty = self.split_reason_storage_queue_nonempty[2],
             outstanding_max = self.outstanding_max,
+            grouped_dispatches = self.grouped_dispatches,
+            grouped_chunks = self.grouped_chunks,
+            grouped_targets = self.grouped_targets,
+            effective_group_size_max = self.effective_group_size_max,
         );
     }
 
@@ -1605,8 +1690,13 @@ enum SparseTrieTaskMessage {
 mod tests {
     use super::*;
     use alloy_primitives::{keccak256, Address, B256, U256};
+    use reth_db::{
+        cursor::{DbCursorRO, DbDupCursorRO},
+        tables,
+        transaction::DbTx,
+    };
     use reth_db_common::init::init_genesis;
-    use reth_provider::test_utils::create_test_provider_factory;
+    use reth_provider::{test_utils::create_test_provider_factory, TrieWriter};
     use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
     use reth_trie_parallel::proof_task::ProofTaskCtx;
     use reth_trie_sparse::ArenaParallelSparseTrie;
@@ -1627,17 +1717,325 @@ mod tests {
     }
 
     #[test]
-    fn proof_dispatch_diagnostics_aggregate_queue_depths() {
-        let mut diagnostics = ProofDispatchDiagnostics::empty(tracing::Span::none());
+    fn proof_backlog_grouping_requires_exact_opt_in() {
+        use std::ffi::OsStr;
 
-        diagnostics.record_dispatch(ProofDispatchReason::Unsplit, 3, 1, 0, 8, 1, 8, 1);
-        diagnostics.record_dispatch(ProofDispatchReason::Force, 301, 61, 33, 9, 92, 10, 62);
-        diagnostics.record_dispatch(ProofDispatchReason::AccountIdle, 10, 2, 2, 0, 92, 10, 3);
-        diagnostics.record_dispatch(ProofDispatchReason::StorageIdle, 10, 2, 0, 4, 92, 10, 3);
+        assert!(!proof_backlog_grouping_enabled_value(None));
+        assert!(proof_backlog_grouping_enabled_value(Some(OsStr::new("1"))));
+        for disabled in ["", "0", "true", "yes", "2"] {
+            assert!(!proof_backlog_grouping_enabled_value(Some(OsStr::new(disabled))));
+        }
+    }
+
+    #[test]
+    fn proof_backlog_grouping_only_expands_chunks_for_a_backed_up_pool() {
+        assert_eq!(proof_dispatch_chunk_size(false, 5, 64, 64, 8, 8), 5);
+        assert_eq!(proof_dispatch_chunk_size(true, 5, 7, 7, 8, 8), 5);
+        assert_eq!(proof_dispatch_chunk_size(true, 5, 8, 0, 8, 8), 32);
+        assert_eq!(proof_dispatch_chunk_size(true, 5, 0, 8, 8, 8), 32);
+        assert_eq!(proof_dispatch_chunk_size(true, 64, 64, 64, 8, 8), 64);
+        assert_eq!(proof_dispatch_chunk_size(true, 5, 1, 1, 0, 0), 5);
+    }
+
+    #[test]
+    fn larger_group_reduces_account_and_same_address_storage_jobs() {
+        let address = B256::repeat_byte(0x11);
+        let mut targets = MultiProofTargetsV2 {
+            account_targets: vec![ProofV2Target::new(address)],
+            storage_targets: Default::default(),
+        };
+        targets.storage_targets.insert(
+            address,
+            (0..65)
+                .map(|index| ProofV2Target::new(B256::new(U256::from(index).to_be_bytes())))
+                .collect(),
+        );
+
+        let small_chunks = targets.chunks(5).collect::<Vec<_>>();
+        let small_storage_jobs =
+            small_chunks.iter().map(|chunk| chunk.storage_targets.len()).sum::<usize>();
+
+        let mut grouped_targets = MultiProofTargetsV2 {
+            account_targets: vec![ProofV2Target::new(address)],
+            storage_targets: Default::default(),
+        };
+        grouped_targets.storage_targets.insert(
+            address,
+            (0..65)
+                .map(|index| ProofV2Target::new(B256::new(U256::from(index).to_be_bytes())))
+                .collect(),
+        );
+        let grouped_chunks = grouped_targets.chunks(32).collect::<Vec<_>>();
+        let grouped_storage_jobs =
+            grouped_chunks.iter().map(|chunk| chunk.storage_targets.len()).sum::<usize>();
+
+        assert_eq!(small_chunks.len(), 14);
+        assert_eq!(small_storage_jobs, 14);
+        assert_eq!(grouped_chunks.len(), 3);
+        assert_eq!(grouped_storage_jobs, 3);
+    }
+
+    #[test]
+    fn db_backed_grouped_proofs_match_control_root_updates_and_persisted_tries() {
+        let shared_address = keccak256(b"shared-storage-account");
+        let mut update = HashedPostState::default();
+        update.accounts.insert(
+            shared_address,
+            Some(Account { nonce: 1, balance: U256::from(1_000), bytecode_hash: None }),
+        );
+        let mut shared_storage = reth_trie::HashedStorage::default();
+        for index in 0..320u64 {
+            shared_storage
+                .storage
+                .insert(keccak256(U256::from(index).to_be_bytes::<32>()), U256::from(index + 1));
+        }
+        update.storages.insert(shared_address, shared_storage);
+
+        for index in 0..12u64 {
+            let address = keccak256(U256::from(index + 10_000).to_be_bytes::<32>());
+            update.accounts.insert(
+                address,
+                Some(Account {
+                    nonce: index + 2,
+                    balance: U256::from(index + 10),
+                    bytecode_hash: None,
+                }),
+            );
+            let mut storage = reth_trie::HashedStorage::default();
+            storage.storage.insert(
+                keccak256(U256::from(index + 20_000).to_be_bytes::<32>()),
+                U256::from(index + 1),
+            );
+            update.storages.insert(address, storage);
+        }
+        assert!(
+            update.accounts.len() +
+                update.storages.values().map(|s| s.storage.len()).sum::<usize>() >
+                300
+        );
+
+        let run = |chunk_size| {
+            let runtime = reth_tasks::Runtime::test();
+            let provider_factory = create_test_provider_factory();
+            let anchor_hash = init_genesis(&provider_factory).expect("initialize genesis");
+            let state_provider_factory = OverlayStateProviderFactory::new(
+                provider_factory.clone(),
+                OverlayManager::<reth_chain_state::EthPrimitives>::default()
+                    .overlay_builder(anchor_hash),
+            );
+            let (proof_result_tx, proof_result_rx) = crossbeam_channel::unbounded();
+            let proof_worker_handle = ProofWorkerHandle::new(
+                &runtime,
+                ProofTaskCtx::new(state_provider_factory),
+                false,
+                proof_result_tx.clone(),
+            );
+            let default_trie = RevealableSparseTrie::blind_from(ArenaParallelSparseTrie::default());
+            let trie = SparseStateTrie::default()
+                .with_accounts_trie(default_trie.clone())
+                .with_default_storage_trie(default_trie)
+                .with_updates(true);
+            let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+            let (_cancel_guard, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+            let (hashed_state_tx, _hashed_state_rx) = std::sync::mpsc::channel();
+            let mut task = SparseTrieCacheTask::new_with_trie(
+                &runtime,
+                updates_rx,
+                cancel_rx,
+                hashed_state_tx,
+                proof_worker_handle,
+                proof_result_tx,
+                proof_result_rx,
+                SparseTrieTaskMetrics::default(),
+                trie,
+                EMPTY_ROOT_HASH,
+                TrieNodeEpoch::new(1),
+                chunk_size,
+            );
+
+            updates_tx.send(StateRootMessage::HashedStateUpdate(update.clone())).unwrap();
+            updates_tx.send(StateRootMessage::FinishedStateUpdates).unwrap();
+            drop(updates_tx);
+            let outcome = task.run().expect("sparse trie task");
+            let (trie, deferred) = task.into_trie_for_reuse();
+            drop(deferred);
+            drain_sparse_trie_tasks(&runtime);
+            (provider_factory, anchor_hash, outcome, trie)
+        };
+
+        let (control_factory, control_anchor, control, control_trie) = run(5);
+        let (grouped_factory, grouped_anchor, grouped, grouped_trie) =
+            run(PROOF_BACKLOG_GROUP_SIZE);
+        assert_eq!(control.state_root, grouped.state_root);
+        assert_eq!(control.trie_updates, grouped.trie_updates);
+
+        let deleted_address = keccak256(U256::from(10_000).to_be_bytes::<32>());
+        let mut child_update = HashedPostState::default();
+        child_update.accounts.insert(
+            shared_address,
+            Some(Account { nonce: 2, balance: U256::from(2_000), bytecode_hash: None }),
+        );
+        child_update.accounts.insert(deleted_address, None);
+        let mut child_storage = reth_trie::HashedStorage::default();
+        child_storage.storage.insert(keccak256(U256::ZERO.to_be_bytes::<32>()), U256::from(9_999));
+        child_storage.storage.insert(keccak256(U256::from(1).to_be_bytes::<32>()), U256::ZERO);
+        child_update.storages.insert(shared_address, child_storage);
+
+        let run_child =
+            |provider_factory: reth_provider::ProviderFactory<
+                reth_provider::test_utils::MockNodeTypesWithDB,
+            >,
+             anchor_hash,
+             parent_root,
+             trie: SparseStateTrie<ArenaParallelSparseTrie, ArenaParallelSparseTrie>,
+             chunk_size| {
+                let runtime = reth_tasks::Runtime::test();
+                let state_provider_factory = OverlayStateProviderFactory::new(
+                    provider_factory.clone(),
+                    OverlayManager::<reth_chain_state::EthPrimitives>::default()
+                        .overlay_builder(anchor_hash),
+                );
+                let (proof_result_tx, proof_result_rx) = crossbeam_channel::unbounded();
+                let proof_worker_handle = ProofWorkerHandle::new(
+                    &runtime,
+                    ProofTaskCtx::new(state_provider_factory),
+                    false,
+                    proof_result_tx.clone(),
+                );
+                let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
+                let (_cancel_guard, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+                let (hashed_state_tx, _hashed_state_rx) = std::sync::mpsc::channel();
+                let mut task = SparseTrieCacheTask::new_with_trie(
+                    &runtime,
+                    updates_rx,
+                    cancel_rx,
+                    hashed_state_tx,
+                    proof_worker_handle,
+                    proof_result_tx,
+                    proof_result_rx,
+                    SparseTrieTaskMetrics::default(),
+                    trie,
+                    parent_root,
+                    TrieNodeEpoch::new(2),
+                    chunk_size,
+                );
+                updates_tx.send(StateRootMessage::HashedStateUpdate(child_update.clone())).unwrap();
+                updates_tx.send(StateRootMessage::FinishedStateUpdates).unwrap();
+                drop(updates_tx);
+                let outcome = task.run().expect("child sparse trie task");
+                drop(task);
+                drain_sparse_trie_tasks(&runtime);
+                (provider_factory, outcome)
+            };
+
+        let (control_factory, control_child) =
+            run_child(control_factory, control_anchor, control.state_root, control_trie, 5);
+        let (grouped_factory, grouped_child) = run_child(
+            grouped_factory,
+            grouped_anchor,
+            grouped.state_root,
+            grouped_trie,
+            PROOF_BACKLOG_GROUP_SIZE,
+        );
+        assert_eq!(control_child.state_root, grouped_child.state_root);
+        assert_eq!(control_child.trie_updates, grouped_child.trie_updates);
+
+        let mut storage_addresses = update.storages.keys().copied().collect::<Vec<_>>();
+        storage_addresses.sort_unstable();
+        let persist_and_snapshot = |factory: reth_provider::ProviderFactory<
+            reth_provider::test_utils::MockNodeTypesWithDB,
+        >,
+                                    updates: [&TrieUpdates; 2]| {
+            let provider = factory.provider_rw().expect("write provider");
+            for update in updates {
+                provider.write_trie_updates(update.clone()).expect("persist trie updates");
+            }
+            provider.commit().expect("commit trie updates");
+
+            let provider = factory.provider_rw().expect("read provider");
+            let mut account_cursor = provider
+                .tx_ref()
+                .cursor_read::<tables::PackedAccountsTrie>()
+                .expect("account cursor");
+            let accounts = account_cursor
+                .walk(None)
+                .expect("walk account trie")
+                .map(|entry| entry.expect("account trie entry"))
+                .collect::<Vec<_>>();
+            let mut storage_cursor = provider
+                .tx_ref()
+                .cursor_dup_read::<tables::PackedStoragesTrie>()
+                .expect("storage cursor");
+            let mut storages = Vec::new();
+            for address in &storage_addresses {
+                storages.extend(
+                    storage_cursor
+                        .walk_dup(Some(*address), None)
+                        .expect("walk storage trie")
+                        .map(|entry| entry.expect("storage trie entry")),
+                );
+            }
+            (accounts, storages)
+        };
+
+        let control_tables = persist_and_snapshot(
+            control_factory,
+            [control.trie_updates.as_ref(), control_child.trie_updates.as_ref()],
+        );
+        let grouped_tables = persist_and_snapshot(
+            grouped_factory,
+            [grouped.trie_updates.as_ref(), grouped_child.trie_updates.as_ref()],
+        );
+        assert_eq!(control_tables, grouped_tables);
+        assert!(!control_tables.0.is_empty());
+        assert!(!control_tables.1.is_empty());
+    }
+
+    #[test]
+    fn proof_dispatch_diagnostics_aggregate_queue_depths() {
+        let mut diagnostics = ProofDispatchDiagnostics::empty(tracing::Span::none(), true);
+
+        diagnostics.record_dispatch(ProofDispatchReason::Unsplit, 3, 1, 0, 8, 1, 8, 1, false, 5);
+        diagnostics.record_dispatch(
+            ProofDispatchReason::Force,
+            301,
+            10,
+            33,
+            9,
+            92,
+            10,
+            11,
+            true,
+            32,
+        );
+        diagnostics.record_dispatch(
+            ProofDispatchReason::AccountIdle,
+            10,
+            2,
+            2,
+            0,
+            92,
+            10,
+            3,
+            false,
+            5,
+        );
+        diagnostics.record_dispatch(
+            ProofDispatchReason::StorageIdle,
+            10,
+            2,
+            0,
+            4,
+            92,
+            10,
+            3,
+            false,
+            5,
+        );
 
         assert_eq!(diagnostics.dispatches, 4);
         assert_eq!(diagnostics.targets, 324);
-        assert_eq!(diagnostics.chunks, 66);
+        assert_eq!(diagnostics.chunks, 15);
         assert_eq!(diagnostics.reason_counts, [1, 1, 1, 1]);
         assert_eq!(diagnostics.account_queue_depth_bins, [2, 1, 0, 1]);
         assert_eq!(diagnostics.storage_queue_depth_bins, [1, 2, 1, 0]);
@@ -1647,12 +2045,16 @@ mod tests {
         assert_eq!(diagnostics.split_when_storage_queue_nonempty, 2);
         assert_eq!(diagnostics.split_reason_account_queue_nonempty, [1, 1, 0]);
         assert_eq!(diagnostics.split_reason_storage_queue_nonempty, [1, 0, 1]);
-        assert_eq!(diagnostics.outstanding_max, 62);
+        assert_eq!(diagnostics.outstanding_max, 11);
+        assert_eq!(diagnostics.grouped_dispatches, 1);
+        assert_eq!(diagnostics.grouped_chunks, 10);
+        assert_eq!(diagnostics.grouped_targets, 301);
+        assert_eq!(diagnostics.effective_group_size_max, 32);
     }
 
     #[test]
     fn proof_root_tail_diagnostics_track_post_finish_phases() {
-        let mut diagnostics = ProofDispatchDiagnostics::empty(tracing::Span::none());
+        let mut diagnostics = ProofDispatchDiagnostics::empty(tracing::Span::none(), false);
         diagnostics.start_root_tail();
         diagnostics.record_proof_wait(Duration::from_nanos(11));
         diagnostics.record_proof_wait(Duration::from_nanos(17));
@@ -1729,7 +2131,7 @@ mod tests {
         let capture = Capture::default();
         tracing::subscriber::with_default(capture.clone(), || {
             let root = tracing::info_span!("root_task");
-            let diagnostics = ProofDispatchDiagnostics::empty(root);
+            let diagnostics = ProofDispatchDiagnostics::empty(root, false);
             drop(diagnostics);
         });
         let captured = capture.0.lock().unwrap();
@@ -1790,7 +2192,8 @@ mod tests {
 
         let capture = Capture::default();
         tracing::subscriber::with_default(capture.clone(), || {
-            let diagnostics = ProofDispatchDiagnostics::empty(tracing::info_span!("root_task"));
+            let diagnostics =
+                ProofDispatchDiagnostics::empty(tracing::info_span!("root_task"), false);
             diagnostics.emit_updates_finished_snapshot(13, 3, 5, 7, 11, 2);
         });
 
@@ -2081,7 +2484,8 @@ mod tests {
             TrieNodeEpoch::UNMODIFIED,
             1,
         );
-        task.dispatch_diagnostics = Some(ProofDispatchDiagnostics::empty(tracing::Span::none()));
+        task.dispatch_diagnostics =
+            Some(ProofDispatchDiagnostics::empty(tracing::Span::none(), false));
 
         let relay = std::thread::spawn(move || {
             let result =
